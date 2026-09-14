@@ -23,7 +23,6 @@ import {
   Menu,
   Modal,
   Progress,
-  Steps,
   Tabs,
 } from 'antd';
 import {
@@ -64,6 +63,11 @@ import {
   runMermaid,
 } from './markdown-preview.js';
 import { NativeWorkflowPanel } from './native-workflow-panel.jsx';
+import { WorkflowPhaseTrack } from './phase-progress-indicator.jsx';
+import {
+  classicChangeStatusPresentation,
+  isClassicPhaseRunning,
+} from './classic-status-presentation.js';
 import {
   DashboardModal,
   DashboardPortalProvider,
@@ -81,6 +85,10 @@ import {
   shouldAutoLoadDashboardDetail,
   shouldShowDashboardDetailLoading,
 } from './dashboard-web-state.js';
+import {
+  createDashboardRequestCoordinator,
+  resolveDashboardProjectWorkflow,
+} from './dashboard-data.js';
 import './styles.css';
 
 const AUTO_REFRESH_MS = 30_000;
@@ -459,7 +467,8 @@ function DashboardApp({
   const useDemo = forceDemo || new URLSearchParams(window.location.search).has('demo');
   const [snapshot, setSnapshot] = useState(null);
   const [activeProjectId, setActiveProjectId] = useState(null);
-  const [workflow, setWorkflow] = useState('classic');
+  const [workflow, setWorkflow] = useState(() => (useDemo ? 'classic' : null));
+  const [workflowSource, setWorkflowSource] = useState(null);
   const [pluginSelection, setPluginSelection] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState('comet.personal-memory');
@@ -479,9 +488,15 @@ function DashboardApp({
   const settingsOpenRef = useRef(settingsOpen);
   const pluginProjectRef = useRef(null);
   const pluginPageCacheRef = useRef(new Map());
-  const pluginPageRequestRef = useRef(new Map());
   const projectConfigCacheRef = useRef(new Map());
-  const projectConfigRequestRef = useRef(new Map());
+  const pluginPageCoordinatorRef = useRef(null);
+  const projectConfigCoordinatorRef = useRef(null);
+  if (pluginPageCoordinatorRef.current === null) {
+    pluginPageCoordinatorRef.current = createDashboardRequestCoordinator();
+  }
+  if (projectConfigCoordinatorRef.current === null) {
+    projectConfigCoordinatorRef.current = createDashboardRequestCoordinator();
+  }
   const [projects, setProjects] = useState([]);
   const [projectsReady, setProjectsReady] = useState(false);
   const [pages, setPages] = useState({ active: null, archived: null, all: null });
@@ -658,6 +673,9 @@ function DashboardApp({
 
     const timer = window.setInterval(() => {
       void refresh(false);
+      if (!useDemo && (pluginSelectionRef.current || settingsOpenRef.current)) {
+        setPluginRefreshToken((value) => value + 1);
+      }
     }, AUTO_REFRESH_MS);
 
     return () => window.clearInterval(timer);
@@ -685,10 +703,15 @@ function DashboardApp({
         const available = (directory.projects ?? []).filter(
           (project) => project.availability === 'available',
         );
-        const remembered = localStorage.getItem('comet-dashboard-project');
         const next =
-          available.find((project) => project.id === remembered)?.id ?? directory.currentProjectId;
+          available.find((project) => project.id === directory.currentProjectId)?.id ??
+          available[0]?.id ??
+          null;
         setActiveProjectId((previous) => previous ?? next);
+        const initialProject = available.find((project) => project.id === next) ?? null;
+        const initialWorkflow = resolveDashboardProjectWorkflow(initialProject);
+        setWorkflow(initialWorkflow.workflow);
+        setWorkflowSource(initialWorkflow.source);
         setProjectsReady(true);
       })
       .catch((error) => {
@@ -701,7 +724,7 @@ function DashboardApp({
     };
   }, [useDemo]);
 
-  const loadCachedPluginPage = useCallback(async (projectId, pluginId, force = false) => {
+  const loadCachedPluginPage = useCallback(async (projectId, pluginId, force = false, owner) => {
     const cacheKey = `${projectId}:${pluginId}`;
     let cached = pluginPageCacheRef.current.get(cacheKey);
     if (!cached) {
@@ -709,21 +732,19 @@ function DashboardApp({
       if (cached) pluginPageCacheRef.current.set(cacheKey, cached);
     }
     if (!force && cached) return cached;
-    const pending = pluginPageRequestRef.current.get(cacheKey);
-    if (pending) return pending;
-    const request = fetchDashboardPluginPage(projectId, pluginId)
-      .then((page) => {
-        pluginPageCacheRef.current.set(cacheKey, page);
-        writeDashboardCache(pluginPageStorageKey(projectId, pluginId), page);
-        return page;
-      })
-      .finally(() => {
-        if (pluginPageRequestRef.current.get(cacheKey) === request) {
-          pluginPageRequestRef.current.delete(cacheKey);
-        }
-      });
-    pluginPageRequestRef.current.set(cacheKey, request);
-    return request;
+    return pluginPageCoordinatorRef.current.load(
+      cacheKey,
+      (signal) => fetchDashboardPluginPage(projectId, pluginId, signal),
+      {
+        force,
+        owner,
+        readPersisted: () => readDashboardCache(pluginPageStorageKey(projectId, pluginId)),
+        writePersisted: (page) => {
+          pluginPageCacheRef.current.set(cacheKey, page);
+          writeDashboardCache(pluginPageStorageKey(projectId, pluginId), page);
+        },
+      },
+    );
   }, []);
 
   const readCachedPluginPage = useCallback((projectId, pluginId) => {
@@ -735,28 +756,34 @@ function DashboardApp({
     return persisted;
   }, []);
 
-  const loadCachedProjectConfig = useCallback(async (projectId, force = false) => {
+  const readCachedProjectConfig = useCallback((projectId) => {
+    const memory = projectConfigCacheRef.current.get(projectId);
+    if (memory) return memory;
+    const persisted = readDashboardCache(projectConfigStorageKey(projectId));
+    if (persisted) projectConfigCacheRef.current.set(projectId, persisted);
+    return persisted;
+  }, []);
+
+  const loadCachedProjectConfig = useCallback(async (projectId, force = false, owner) => {
     let cached = projectConfigCacheRef.current.get(projectId);
     if (!cached) {
       cached = readDashboardCache(projectConfigStorageKey(projectId));
       if (cached) projectConfigCacheRef.current.set(projectId, cached);
     }
     if (!force && cached) return cached;
-    const pending = projectConfigRequestRef.current.get(projectId);
-    if (pending) return pending;
-    const request = fetchDashboardProjectConfig(projectId)
-      .then((config) => {
-        projectConfigCacheRef.current.set(projectId, config);
-        writeDashboardCache(projectConfigStorageKey(projectId), config);
-        return config;
-      })
-      .finally(() => {
-        if (projectConfigRequestRef.current.get(projectId) === request) {
-          projectConfigRequestRef.current.delete(projectId);
-        }
-      });
-    projectConfigRequestRef.current.set(projectId, request);
-    return request;
+    return projectConfigCoordinatorRef.current.load(
+      projectId,
+      (signal) => fetchDashboardProjectConfig(projectId, signal),
+      {
+        force,
+        owner,
+        readPersisted: () => readDashboardCache(projectConfigStorageKey(projectId)),
+        writePersisted: (config) => {
+          projectConfigCacheRef.current.set(projectId, config);
+          writeDashboardCache(projectConfigStorageKey(projectId), config);
+        },
+      },
+    );
   }, []);
 
   const preloadDashboardSettings = useCallback(
@@ -819,17 +846,18 @@ function DashboardApp({
   useEffect(() => {
     if (useDemo || !activeProjectId || !pluginSelection) return undefined;
     let cancelled = false;
+    const owner = `plugin-page:${activeProjectId}:${pluginSelection}`;
     const cachedPage = readCachedPluginPage(activeProjectId, pluginSelection);
     if (cachedPage) setPluginPage(cachedPage);
-    setPluginLoading(!cachedPage);
+    setPluginLoading(true);
     setPluginError(null);
-    void loadCachedPluginPage(activeProjectId, pluginSelection, Boolean(cachedPage))
+    void loadCachedPluginPage(activeProjectId, pluginSelection, Boolean(cachedPage), owner)
       .then((page) => {
         if (!cancelled) setPluginPage(page);
       })
       .catch((error) => {
         if (!cancelled) {
-          setPluginPage(null);
+          if (!cachedPage) setPluginPage(null);
           setPluginError(error instanceof Error ? error.message : String(error));
         }
       })
@@ -838,6 +866,7 @@ function DashboardApp({
       });
     return () => {
       cancelled = true;
+      pluginPageCoordinatorRef.current.release(`${activeProjectId}:${pluginSelection}`, owner);
     };
   }, [
     activeProjectId,
@@ -926,21 +955,22 @@ function DashboardApp({
   useEffect(() => {
     if (useDemo || !activeProjectId || !settingsOpen || !settingsSection) return undefined;
     let cancelled = false;
+    const owner = `settings:${activeProjectId}:${settingsSection}`;
     const cached =
       settingsSection === 'comet.config'
-        ? (projectConfigCacheRef.current.get(activeProjectId) ?? null)
+        ? readCachedProjectConfig(activeProjectId)
         : readCachedPluginPage(activeProjectId, settingsSection);
     if (settingsSection === 'comet.config') {
       if (cached) setSettingsConfig(cached);
     } else if (cached) {
       setSettingsPage(cached);
     }
-    setSettingsLoading(!cached);
+    setSettingsLoading(true);
     setSettingsError(null);
     const request =
       settingsSection === 'comet.config'
-        ? loadCachedProjectConfig(activeProjectId, Boolean(cached))
-        : loadCachedPluginPage(activeProjectId, settingsSection, Boolean(cached));
+        ? loadCachedProjectConfig(activeProjectId, Boolean(cached), owner)
+        : loadCachedPluginPage(activeProjectId, settingsSection, Boolean(cached), owner);
     void request
       .then((result) => {
         if (cancelled) return;
@@ -949,8 +979,11 @@ function DashboardApp({
       })
       .catch((error) => {
         if (!cancelled) {
-          if (settingsSection === 'comet.config') setSettingsConfig(null);
-          else setSettingsPage(null);
+          if (settingsSection === 'comet.config') {
+            if (!cached) setSettingsConfig(null);
+          } else if (!cached) {
+            setSettingsPage(null);
+          }
           setSettingsError(error instanceof Error ? error.message : String(error));
         }
       })
@@ -959,6 +992,11 @@ function DashboardApp({
       });
     return () => {
       cancelled = true;
+      if (settingsSection === 'comet.config') {
+        projectConfigCoordinatorRef.current.release(activeProjectId, owner);
+      } else {
+        pluginPageCoordinatorRef.current.release(`${activeProjectId}:${settingsSection}`, owner);
+      }
     };
   }, [
     activeProjectId,
@@ -966,6 +1004,7 @@ function DashboardApp({
     loadCachedProjectConfig,
     pluginRefreshToken,
     readCachedPluginPage,
+    readCachedProjectConfig,
     settingsOpen,
     settingsSection,
     useDemo,
@@ -1275,6 +1314,10 @@ function DashboardApp({
   const nativeVisibleTotal = useDemo
     ? (snapshot?.native?.changes?.length ?? 0)
     : (nativePage?.total ?? nativeOverviewTotal);
+  const activeProject = projects.find((project) => project.id === activeProjectId) ?? null;
+  const activeWorkflowSource = useDemo
+    ? null
+    : (activeProject?.workflowSource ?? workflowSource ?? 'fallback');
 
   useEffect(() => {
     if (
@@ -1373,6 +1416,7 @@ function DashboardApp({
           if (nextWorkflow !== workflow) setTab('active');
           setWorkflow(nextWorkflow);
         }}
+        workflowSource={activeWorkflowSource}
         pluginPages={pluginPages}
         pluginSelection={pluginSelection}
         settingsOpen={settingsOpen}
@@ -1395,7 +1439,7 @@ function DashboardApp({
             useDemo
               ? settingsConfig
               : activeProjectId
-                ? (projectConfigCacheRef.current.get(activeProjectId) ?? null)
+                ? (readCachedProjectConfig(activeProjectId) ?? null)
                 : null,
           );
           setSettingsError(null);
@@ -1431,7 +1475,6 @@ function DashboardApp({
           projects={projects}
           activeProjectId={activeProjectId}
           onProjectSelect={(nextProjectId) => {
-            localStorage.setItem('comet-dashboard-project', nextProjectId);
             snapshotRequestRef.current?.abort();
             pageRequestRef.current?.abort();
             nativePageRequestRef.current?.abort();
@@ -1458,6 +1501,10 @@ function DashboardApp({
             setPluginError(null);
             setSettingsConfig(null);
             setRailOpen(false);
+            const nextProject = projects.find((project) => project.id === nextProjectId) ?? null;
+            const nextWorkflow = resolveDashboardProjectWorkflow(nextProject);
+            setWorkflow(nextWorkflow.workflow);
+            setWorkflowSource(nextWorkflow.source);
           }}
           loading={loading}
           query={query}
@@ -1466,7 +1513,7 @@ function DashboardApp({
           onRefresh={async () => {
             await refresh(true);
             await reloadPluginPages();
-            if (activePluginPageId) setPluginRefreshToken((value) => value + 1);
+            if (activePluginPageId || settingsOpen) setPluginRefreshToken((value) => value + 1);
           }}
           theme={theme}
           onToggleTheme={onToggleTheme}
@@ -1486,7 +1533,9 @@ function DashboardApp({
                 : ''
             }`}
           >
-            {!snapshot ? (
+            {!useDemo && projectsReady && !activeProjectId ? (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可用项目" />
+            ) : !snapshot ? (
               <LoadingState />
             ) : pluginSelection ? (
               <PluginCenterPage
@@ -1495,7 +1544,6 @@ function DashboardApp({
                 error={pluginError}
                 readOnly={embedded}
                 onRetry={() => {
-                  setPluginPage(null);
                   setPluginError(null);
                   setPluginRefreshToken((value) => value + 1);
                 }}
@@ -1531,7 +1579,7 @@ function DashboardApp({
                     .catch(() => toast('复制 Change 名称失败', 'error'))
                 }
               />
-            ) : (
+            ) : workflow === 'classic' ? (
               <Dashboard
                 snapshot={snapshot}
                 visible={visible}
@@ -1549,6 +1597,8 @@ function DashboardApp({
                 onRetryDetail={() => selectedId && selectChange(selectedId)}
                 onPreview={setArtifact}
               />
+            ) : (
+              <LoadingState />
             )}
           </div>
         </div>
@@ -1575,21 +1625,12 @@ function DashboardApp({
               useDemo && pluginId === 'comet.config'
                 ? settingsConfig
                 : activeProjectId && pluginId === 'comet.config'
-                  ? (projectConfigCacheRef.current.get(activeProjectId) ?? null)
+                  ? readCachedProjectConfig(activeProjectId)
                   : null,
             );
             setSettingsError(null);
           }}
           onRetry={() => {
-            if (activeProjectId) {
-              if (settingsSection === 'comet.config') {
-                projectConfigCacheRef.current.delete(activeProjectId);
-              } else if (settingsSection) {
-                pluginPageCacheRef.current.delete(`${activeProjectId}:${settingsSection}`);
-              }
-            }
-            setSettingsPage(null);
-            setSettingsConfig(null);
             setSettingsError(null);
             setPluginRefreshToken((value) => value + 1);
           }}
@@ -1622,6 +1663,24 @@ function DashboardApp({
                 config,
               });
               projectConfigCacheRef.current.set(activeProjectId, next);
+              projectConfigCoordinatorRef.current.set(activeProjectId, next);
+              const nextWorkflow = resolveDashboardProjectWorkflow({
+                defaultWorkflow: next.defaultWorkflow,
+                workflowSource: 'configured',
+              });
+              setWorkflow(nextWorkflow.workflow);
+              setWorkflowSource(nextWorkflow.source);
+              setProjects((current) =>
+                current.map((project) =>
+                  project.id === activeProjectId
+                    ? {
+                        ...project,
+                        defaultWorkflow: next.defaultWorkflow,
+                        workflowSource: 'configured',
+                      }
+                    : project,
+                ),
+              );
               writeDashboardCache(projectConfigStorageKey(activeProjectId), next);
               setSettingsConfig(next);
               if (knowledgePathsChanged) {
@@ -1958,40 +2017,16 @@ function PhaseStepper({ phase, archived, next }) {
           {archived ? `归档 ${phase}` : `下一步 ${next?.command ?? '—'}`}
         </span>
       </div>
-      <div className="flex">
-        {PHASES.map(([key, label], index) => {
-          const state =
-            index < currentIndex || archived
-              ? 'done'
-              : index === currentIndex
-                ? 'current'
-                : 'pending';
-          return (
-            <div key={key} className="relative flex flex-1 flex-col items-center gap-2 text-center">
-              {index > 0 && (
-                <span
-                  className={`absolute left-0 right-1/2 top-4 h-px ${index <= currentIndex || archived ? 'bg-accent' : 'bg-border'}`}
-                />
-              )}
-              {index < PHASES.length - 1 && (
-                <span
-                  className={`absolute left-1/2 right-0 top-4 h-px ${index < currentIndex || archived ? 'bg-accent' : 'bg-border'}`}
-                />
-              )}
-              <span
-                className={`relative z-10 grid size-8 place-items-center rounded-full border text-sm font-bold ${state === 'done' ? 'border-accent bg-accent text-white' : state === 'current' ? 'border-accent bg-bg text-accent' : 'border-border bg-bg text-fg-2'}`}
-              >
-                {state === 'done' ? '✓' : index + 1}
-              </span>
-              <span
-                className={`text-[13px] font-semibold ${state === 'current' ? 'text-accent' : state === 'done' ? 'text-accent' : 'text-fg-2'}`}
-              >
-                {label}
-              </span>
-            </div>
-          );
+      <WorkflowPhaseTrack
+        phases={PHASES}
+        currentIndex={currentIndex}
+        archived={archived}
+        currentPhaseRunning={isClassicPhaseRunning({
+          status: archived ? 'archived' : 'active',
+          phase,
         })}
-      </div>
+        ariaLabel="Classic 生命周期阶段"
+      />
     </article>
   );
 }
@@ -2618,7 +2653,7 @@ function ArtifactDrawer({ artifact, embedded = false, onClose }) {
                   <path
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m-4.5 0L15 9m5.25 11.25h-4.5m4.5 0v-4.5m4.5 4.5L15 15"
+                    d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m-4.5 0L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15"
                   />
                 </svg>
               )}
@@ -3577,18 +3612,19 @@ async function fetchDashboardPluginPages(projectId) {
   return res.json();
 }
 
-async function fetchDashboardPluginPage(projectId, pluginId) {
+async function fetchDashboardPluginPage(projectId, pluginId, signal) {
   const res = await fetch(
     `/api/dashboard/projects/${encodeURIComponent(projectId)}/plugins/${encodeURIComponent(pluginId)}`,
-    { cache: 'no-store' },
+    { cache: 'no-store', signal },
   );
   if (!res.ok) throw await dashboardResponseError(res);
   return res.json();
 }
 
-async function fetchDashboardProjectConfig(projectId) {
+async function fetchDashboardProjectConfig(projectId, signal) {
   const res = await fetch(`/api/dashboard/projects/${encodeURIComponent(projectId)}/config`, {
     cache: 'no-store',
+    signal,
   });
   if (!res.ok) throw await dashboardResponseError(res);
   return res.json();
@@ -3957,6 +3993,7 @@ function AntSidebar({
   open,
   collapsed,
   workflow,
+  workflowSource,
   onWorkflow,
   pluginPages,
   pluginSelection,
@@ -3970,13 +4007,23 @@ function AntSidebar({
   const navigation = (
     <>
       <div className="dashboard-sidebar-group">
-        <div className="dashboard-sidebar-label">工作流</div>
+        <div
+          className="dashboard-sidebar-label"
+          aria-label={workflowSource ? `项目默认工作流来源：${workflowSource}` : undefined}
+        >
+          <span>工作流</span>
+          {workflowSource ? (
+            <Tag color={workflowSource === 'configured' ? 'success' : 'warning'}>
+              {workflowSource}
+            </Tag>
+          ) : null}
+        </div>
         <Menu
           className="dashboard-sidebar-menu dashboard-workflow-menu"
           mode="inline"
           inlineCollapsed={collapsed}
           inlineIndent={12}
-          selectedKeys={pluginSelection ? [] : [workflow]}
+          selectedKeys={pluginSelection || !workflow ? [] : [workflow]}
           items={[
             { key: 'classic', icon: <BranchesOutlined />, label: 'Classic 工作流' },
             { key: 'native', icon: <FileTextOutlined />, label: 'Native 工作流' },
@@ -4121,14 +4168,27 @@ function PluginCenterPage({ page, loading, error, readOnly = false, onRetry, onI
     );
   }
   if (!page) return <LoadingState />;
+  const syncError = error ? (
+    <Alert
+      className="mb-3"
+      type="warning"
+      showIcon
+      message="最新数据同步失败，当前显示缓存"
+      description={error}
+      action={<Button onClick={onRetry}>重试</Button>}
+    />
+  ) : null;
   if (page.pluginId === 'comet.project-knowledge') {
     return (
-      <ProjectKnowledgeCenter
-        page={page}
-        data={page.data}
-        readOnly={readOnly}
-        onInvoke={onInvoke}
-      />
+      <>
+        {syncError}
+        <ProjectKnowledgeCenter
+          page={page}
+          data={page.data}
+          readOnly={readOnly}
+          onInvoke={onInvoke}
+        />
+      </>
     );
   }
   if (page.status === 'disabled') {
@@ -4148,13 +4208,21 @@ function PluginCenterPage({ page, loading, error, readOnly = false, onRetry, onI
     );
   }
   if (page.pluginId === 'comet.personal-memory') {
-    return <PersonalMemoryCenter data={page.data} readOnly={readOnly} onInvoke={onInvoke} />;
+    return (
+      <>
+        {syncError}
+        <PersonalMemoryCenter data={page.data} readOnly={readOnly} onInvoke={onInvoke} />
+      </>
+    );
   }
   return (
-    <div className="mx-auto max-w-dashboard">
-      <SectionHead title={page.label} hint="插件中心" />
-      <AntCard size="small">该插件暂未提供可视化中心页。</AntCard>
-    </div>
+    <>
+      {syncError}
+      <div className="mx-auto max-w-dashboard">
+        <SectionHead title={page.label} hint="插件中心" />
+        <AntCard size="small">该插件暂未提供可视化中心页。</AntCard>
+      </div>
+    </>
   );
 }
 
@@ -4261,6 +4329,16 @@ function DashboardSettingsPage({
           aria-disabled={readOnly || undefined}
         >
           <div className="dashboard-settings-content">
+            {error && currentData ? (
+              <Alert
+                className="mb-3"
+                type="warning"
+                showIcon
+                message="最新数据同步失败，当前显示缓存"
+                description={error}
+                action={<Button onClick={onRetry}>重试</Button>}
+              />
+            ) : null}
             {loading && !currentData ? (
               <LoadingState />
             ) : error && !currentData ? (
@@ -4829,11 +4907,23 @@ function PersonalMemorySettings({ page, data, readOnly = false, onInvoke }) {
             <div className="dashboard-memory-setting">
               <div className="dashboard-memory-setting-copy">
                 <strong>自动学习</strong>
-                <span>{status.learningEnabled ? '会沉淀稳定偏好' : '已暂停自动沉淀'}</span>
+                <span>
+                  {personalMemoryCapabilityLabel(
+                    status,
+                    'learningEnabled',
+                    '会沉淀稳定偏好',
+                    '已暂停自动沉淀',
+                  )}
+                </span>
               </div>
               <Switch
                 size="small"
-                checked={Boolean(status.learningEnabled)}
+                checked={status.learningEnabled === true}
+                disabled={
+                  readOnly ||
+                  status.availability === 'unavailable' ||
+                  status.learningEnabled === undefined
+                }
                 aria-label="切换自动学习"
                 onChange={(enabled) => onInvoke('set-learning', { enabled })}
               />
@@ -4841,11 +4931,23 @@ function PersonalMemorySettings({ page, data, readOnly = false, onInvoke }) {
             <div className="dashboard-memory-setting">
               <div className="dashboard-memory-setting-copy">
                 <strong>记忆注入</strong>
-                <span>{status.retrievalEnabled ? '任务中可使用已保存内容' : '已暂停任务注入'}</span>
+                <span>
+                  {personalMemoryCapabilityLabel(
+                    status,
+                    'retrievalEnabled',
+                    '任务中可使用已保存内容',
+                    '已暂停任务注入',
+                  )}
+                </span>
               </div>
               <Switch
                 size="small"
-                checked={Boolean(status.retrievalEnabled)}
+                checked={status.retrievalEnabled === true}
+                disabled={
+                  readOnly ||
+                  status.availability === 'unavailable' ||
+                  status.retrievalEnabled === undefined
+                }
                 aria-label="切换记忆注入"
                 onChange={(enabled) => onInvoke('set-retrieval', { enabled })}
               />
@@ -6968,6 +7070,8 @@ function PersonalMemoryCenter({ data, readOnly = false, onInvoke }) {
   const projectKey = data?.projectKey;
   const memoryFileCount = status.files?.length ?? 0;
   const provider = status.provider?.provider ?? 'local';
+  const learningDiagnostic = personalMemoryLearningDiagnostic(status.learning, status);
+  const learningDetails = personalMemoryLearningDetails(status.learning, status);
   const profileUsage = status.profile
     ? `个人偏好与事实 ${status.profile.usedChars} 字符 · 单次注入预算 ${status.profile.maxChars}`
     : provider === 'remote'
@@ -7275,17 +7379,32 @@ function PersonalMemoryCenter({ data, readOnly = false, onInvoke }) {
             })}
           </nav>
           <div className="dashboard-memory-filter-summary">
-            <div>
-              <span
-                className={`dashboard-tool-state-dot ${status.learningEnabled ? 'is-success' : 'is-muted'}`}
-              />
-              自动学习{status.learningEnabled ? '已开启' : '已暂停'}
+            <div className="dashboard-memory-learning-diagnostic" role="status">
+              <span>最近学习检查</span>
+              <strong>{learningDiagnostic}</strong>
+              {learningDetails && <small>{learningDetails}</small>}
             </div>
             <div>
               <span
-                className={`dashboard-tool-state-dot ${status.retrievalEnabled ? 'is-accent' : 'is-muted'}`}
+                className={`dashboard-tool-state-dot ${
+                  status.learningEnabled === true && status.availability !== 'unavailable'
+                    ? 'is-success'
+                    : 'is-muted'
+                }`}
               />
-              任务注入{status.retrievalEnabled ? '已开启' : '已暂停'}
+              自动学习
+              {personalMemoryCapabilityLabel(status, 'learningEnabled', '已开启', '已暂停')}
+            </div>
+            <div>
+              <span
+                className={`dashboard-tool-state-dot ${
+                  status.retrievalEnabled === true && status.availability !== 'unavailable'
+                    ? 'is-accent'
+                    : 'is-muted'
+                }`}
+              />
+              任务注入
+              {personalMemoryCapabilityLabel(status, 'retrievalEnabled', '已开启', '已暂停')}
             </div>
             <span>{profileUsage}</span>
             <span>
@@ -7654,6 +7773,56 @@ function PersonalMemoryCenter({ data, readOnly = false, onInvoke }) {
   );
 }
 
+function personalMemoryCapabilityLabel(status = {}, field, enabledLabel, disabledLabel) {
+  if (status.availability === 'unavailable') {
+    return `状态不可用${status.availabilityReason ? `：${status.availabilityReason}` : ''}`;
+  }
+  if (status[field] === undefined) return '状态未知（Provider 未确认）';
+  return status[field] ? enabledLabel : disabledLabel;
+}
+
+function personalMemoryLearningDiagnostic(learning = {}, status = {}) {
+  if (status.learningAvailability === 'unavailable') {
+    return `不可用${status.learningAvailabilityReason ? `：${status.learningAvailabilityReason}` : ''}`;
+  }
+  if (status.availability === 'unavailable') {
+    return `不可用${status.availabilityReason ? `：${status.availabilityReason}` : ''}`;
+  }
+  if (learning.lastCheck === 'not-run' || learning.lastCheck === undefined) return '尚未检查';
+  if (learning.lastCheck === 'no-observation') return '本次没有合格观察';
+  if (learning.submissionVerified === false) return '当前 change 没有对应观察';
+  switch (learning.lastResult) {
+    case 'candidate-created':
+      return '已形成候选，等待独立证据';
+    case 'candidate-promoted':
+      return '已晋级为可复用记忆';
+    case 'deduplicated':
+      return '已去重，未重复计数';
+    case 'deferred':
+      return '评审待重试';
+    case 'ignored':
+      return '当前项目已跳过学习';
+    case 'skipped':
+      return '本次观察已跳过';
+    default:
+      return '已提交，等待结果';
+  }
+}
+
+function personalMemoryLearningDetails(learning = {}, status = {}) {
+  if (status.learningAvailability === 'unavailable' || learning === undefined) return '';
+  const details = [];
+  if (learning.lastCheckedAt) details.push(`时间：${learning.lastCheckedAt}`);
+  const ownership = [
+    learning.lastProjectKey ? `项目 ${learning.lastProjectKey}` : '',
+    learning.lastWorkflow ? `workflow ${learning.lastWorkflow}` : '',
+    learning.lastChangeId ? `change ${learning.lastChangeId}` : '',
+  ].filter(Boolean);
+  if (ownership.length > 0) details.push(`归属：${ownership.join(' · ')}`);
+  if (learning.lastReason?.trim()) details.push(`原因：${learning.lastReason.trim()}`);
+  return details.join(' · ');
+}
+
 function AntSummaryCards({ snapshot }) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const cards = [
@@ -7852,46 +8021,47 @@ function DashboardChangeList({ visible, selectedId, onSelect, hasMore, pageLoadi
           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无变更" />
         )
       ) : (
-        visible.map((change) => (
-          <div
-            key={dashboardChangeKey(change)}
-            className={`dashboard-change-list-item ${dashboardChangeKey(change) === selectedId ? 'selected' : ''} px-2`}
-          >
-            <Button
-              className={`dashboard-change-row ${dashboardChangeKey(change) === selectedId ? 'dashboard-change-row-selected' : ''}`}
-              type="text"
-              block
-              onClick={() => onSelect(dashboardChangeKey(change))}
+        visible.map((change) => {
+          const statusPresentation = classicChangeStatusPresentation(change);
+          return (
+            <div
+              key={dashboardChangeKey(change)}
+              className={`dashboard-change-list-item ${dashboardChangeKey(change) === selectedId ? 'selected' : ''} px-2`}
             >
-              <div className="flex w-full items-center gap-2.5 text-left">
-                <div className="min-w-0 flex-1">
-                  <strong className="block truncate">{change.displayName}</strong>
-                  <span className="mt-0.5 block text-xs text-meta">
-                    {phaseLabel(change.phase)} · {change.tasks.completed}/{change.tasks.total}
-                  </span>
-                  {change.workspace && !change.workspace.current ? (
-                    <span className="dashboard-workspace-label mt-1 inline-flex max-w-full truncate">
-                      {change.workspace.label}
+              <Button
+                className={`dashboard-change-row ${dashboardChangeKey(change) === selectedId ? 'dashboard-change-row-selected' : ''}`}
+                type="text"
+                block
+                onClick={() => onSelect(dashboardChangeKey(change))}
+              >
+                <div className="flex w-full items-center gap-2.5 text-left">
+                  <div className="min-w-0 flex-1">
+                    <strong className="block truncate">{change.displayName}</strong>
+                    <span className="mt-0.5 block text-xs text-meta">
+                      {phaseLabel(change.phase)} · {change.tasks.completed}/{change.tasks.total}
                     </span>
-                  ) : null}
-                  <Progress
-                    percent={
-                      change.tasks.total
-                        ? Math.round((change.tasks.completed / change.tasks.total) * 100)
-                        : 0
-                    }
-                    className="mt-1"
-                    size="small"
-                    showInfo={false}
-                  />
+                    {change.workspace && !change.workspace.current ? (
+                      <span className="dashboard-workspace-label mt-1 inline-flex max-w-full truncate">
+                        {change.workspace.label}
+                      </span>
+                    ) : null}
+                    <Progress
+                      percent={
+                        change.tasks.total
+                          ? Math.round((change.tasks.completed / change.tasks.total) * 100)
+                          : 0
+                      }
+                      className="mt-1"
+                      size="small"
+                      showInfo={false}
+                    />
+                  </div>
+                  <Pill tone={statusPresentation.tone}>{statusPresentation.label}</Pill>
                 </div>
-                <Pill tone={VERIFY_TONE[change.verify.result] ?? 'neutral'}>
-                  {VERIFY_LABEL[change.verify.result] ?? '未知'}
-                </Pill>
-              </div>
-            </Button>
-          </div>
-        ))
+              </Button>
+            </div>
+          );
+        })
       )}
       <div ref={sentinelRef} className="py-2 text-center text-xs text-meta" aria-live="polite">
         {pageLoading && visible.length > 0 ? (
@@ -7910,6 +8080,7 @@ function DashboardChangeList({ visible, selectedId, onSelect, hasMore, pageLoadi
 
 function AntChangeDetail({ change, onPreview }) {
   const [copied, setCopied] = useState(false);
+  const statusPresentation = classicChangeStatusPresentation(change);
   const current = change.status === 'archived' ? 'archive' : change.phase;
   const currentIndex = Math.max(
     0,
@@ -7940,17 +8111,19 @@ function AntChangeDetail({ change, onPreview }) {
           </Tooltip>
         </div>
       }
-      extra={
-        <Pill tone={change.status === 'archived' ? 'neutral' : VERIFY_TONE[change.verify.result]}>
-          {change.status === 'archived' ? '已归档' : VERIFY_LABEL[change.verify.result]}
-        </Pill>
-      }
+      extra={<Pill tone={statusPresentation.tone}>{statusPresentation.label}</Pill>}
     >
       <div className="mb-4 text-xs text-meta">
         {change.workflow ?? '—'} · 更新于 {formatTimestamp(change.updatedAt)} ·{' '}
         {relativeChangePath(change)}
       </div>
-      <Steps size="small" current={currentIndex} items={PHASES.map(([, title]) => ({ title }))} />
+      <WorkflowPhaseTrack
+        phases={PHASES}
+        currentIndex={currentIndex}
+        archived={change.status === 'archived'}
+        currentPhaseRunning={isClassicPhaseRunning(change)}
+        ariaLabel="Classic 生命周期阶段"
+      />
       <Alert
         className="dashboard-next-step-alert"
         type="info"

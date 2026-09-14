@@ -20,7 +20,7 @@ const LANGUAGE_CASES = [
     ruleFiles: ['comet-phase-guard.md', 'comet-workflow-guard.md'],
     allowedLayoutDescriptionLines: new Set([
       '- 新 Classic 项目默认使用 `docs/openspec/`。',
-      '- 缺少 `classic.artifact_layout` 时默认使用 `docs/openspec/`；`comet update` 检测到已有根目录 `openspec/` 产物时会显式补为 `legacy`，不会移动产物。',
+      '- 为兼容旧项目，缺少 `classic.artifact_layout` 时使用项目根下的 `openspec/`（legacy）；新项目 init 会明确写入 docs。`comet update` 检测到已有 `openspec/` 产物时，会把配置补为 `legacy`，不会移动产物。',
     ]),
   },
   {
@@ -29,7 +29,7 @@ const LANGUAGE_CASES = [
     ruleFiles: ['comet-phase-guard.en.md', 'comet-workflow-guard.en.md'],
     allowedLayoutDescriptionLines: new Set([
       '- New Classic projects default to `docs/openspec/`.',
-      '- A missing `classic.artifact_layout` defaults to `docs/openspec/`. When `comet update` detects existing root-level `openspec/` artifacts, it explicitly backfills `legacy` without moving them.',
+      '- For backward compatibility, a project without `classic.artifact_layout` uses root-level `openspec/` (legacy). New-project init explicitly writes docs. If `comet update` finds existing `openspec/` artifacts, it records `legacy` without moving them.',
     ]),
   },
 ] as const;
@@ -67,6 +67,64 @@ async function classicGuidanceFiles(
 }
 
 describe('Classic layout Skill contract', () => {
+  it.each(LANGUAGE_CASES)(
+    'keeps $label entry layout bindings and commands aligned',
+    async ({ languageRoot }) => {
+      const reference = await fs.readFile(
+        path.resolve('assets', languageRoot, 'comet-classic/reference/classic-layout.md'),
+        'utf8',
+      );
+      const entry = reference.indexOf('comet state check <change-name> <phase> --json');
+      expect(entry).toBeGreaterThanOrEqual(0);
+      expect(reference.indexOf('comet classic root show')).toBeGreaterThan(entry);
+      for (const field of [
+        'comet.classic-layout.v1',
+        'openSpecRoot',
+        'changesRoot',
+        'archiveRoot',
+        'specsRoot',
+        'superpowersRoot',
+        'changeDir',
+      ]) {
+        expect(reference, field).toContain(field);
+      }
+      for (const phase of ['design', 'build', 'verify', 'archive']) {
+        const source = await fs.readFile(
+          path.resolve('assets', languageRoot, `comet-${phase}/SKILL.md`),
+          'utf8',
+        );
+        expect(source, phase).toContain('comet-classic/reference/classic-layout.md');
+        expect(source, phase).toMatch(
+          new RegExp(`comet state check <(?:change-name|name)> ${phase} --json`, 'u'),
+        );
+      }
+    },
+  );
+
+  it('uses the Chinese entry layout without duplicate root probes and resolves archived change paths', async () => {
+    const reference = await fs.readFile(
+      path.resolve('assets/skills-zh/comet-classic/reference/classic-layout.md'),
+      'utf8',
+    );
+    expect(reference).toContain('state check <change-name> <phase> --json');
+    expect(reference).toContain('无需再单独查询布局');
+    expect(reference).toContain('尚未选择 change、入口未提供 layout');
+    expect(reference).toContain('使用入口返回的 changeDir');
+    expect(reference).toContain('对于已归档的 change，不要使用未归档 change 的目录规则拼接路径');
+    expect(reference).toContain('恢复会话时若缺少上下文，或工作区发生变化，应重新查询');
+    for (const skill of ['comet-design', 'comet-build', 'comet-verify', 'comet-archive']) {
+      const content = await fs.readFile(
+        path.resolve('assets/skills-zh', skill, 'SKILL.md'),
+        'utf8',
+      );
+      expect(content, skill).toContain('收到入口返回的 layout 后');
+      expect(content, skill).toContain('无需先额外运行 root show');
+      expect(content, skill).toMatch(
+        /comet state check <(?:change-name|name)> (?:design|build|verify|archive) --json/u,
+      );
+    }
+  });
+
   it.each(['skills-zh', 'skills'])(
     'ships the layout resolver and adapter protocol in %s',
     async (languageRoot) => {

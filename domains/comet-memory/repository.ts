@@ -78,6 +78,12 @@ export function emptyMemoryState(): MemoryRuntimeState {
     applicationOutcomes: {},
     feedbackState: {},
     pendingFileProjections: {},
+    learning: {
+      lastCheck: 'not-run',
+      observedCount: 0,
+      validObservationCount: 0,
+    },
+    learningByProject: {},
   };
 }
 
@@ -470,5 +476,12 @@ function validateState(value: unknown): MemoryRuntimeState {
     applicationOutcomes: { ...(candidate.applicationOutcomes ?? {}) },
     feedbackState: { ...(candidate.feedbackState ?? {}) },
     pendingFileProjections: { ...(candidate.pendingFileProjections ?? {}) },
+    learningByProject: { ...(candidate.learningByProject ?? {}) },
+    learning: {
+      ...(candidate.learning ?? {}),
+      lastCheck: candidate.learning?.lastCheck ?? 'not-run',
+      observedCount: candidate.learning?.observedCount ?? 0,
+      validObservationCount: candidate.learning?.validObservationCount ?? 0,
+    },
   };
 }

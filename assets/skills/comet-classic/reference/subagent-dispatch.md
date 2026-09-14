@@ -1,166 +1,71 @@
-# Comet Extensions for Subagent-Driven Development
+# Comet Subagent Development Rules
 
 Canonical path: `comet-classic/reference/subagent-dispatch.md`
 
-This document provides Comet-specific extensions applied **on top of** the Superpowers `subagent-driven-development` skill. The Superpowers `subagent-driven-development` skill provides the base continuous dispatch loop (a fresh implementer for each task, including the default task reviewer node) and enforces continuous execution. This document adds Comet-specific subagent dispatch, task tracking, state verification, context recovery, and task-level review/fix budgets; Comet's `review_mode` takes over the reviewer stage to decide which tasks need reviewers and how many fix rounds are allowed. `comet-verify` owns the final integrated review for the whole change. If the Superpowers skill conflicts with this document, the more specific Comet constraints here take precedence.
+Read for `build_mode: subagent-driven-development`, or when autonomous needs delegation or review. The former loads the matching Superpowers Skill before applying these rules; autonomous applies them directly without an external execution Skill. Classic defines the execution method, task acceptance, recheck limits, and five-phase completion. External Skills return to comet-build after execution, without adding final review or invoking finishing-a-development-branch.
 
-> **⚠️ CRITICAL — No Pause Between Tasks**
->
-> After a task passes `review_mode` validation and is checked off, **immediately dispatch the next task** without stopping, summarizing, or asking the user whether to continue. The user expects all tasks to execute in sequence without manual intervention. Pausing between tasks breaks the workflow and requires the user to manually resume each time.
->
-> Only stop and wait for user input when:
-> - A task is **BLOCKED** (review-fix rounds exhausted: `review_mode: standard` — 1 round of risk-task review-fix not passed; `review_mode: thorough` — 2 rounds of task-level review-fix not passed)
-> - There is irreducible ambiguity that cannot be resolved from the repository, plan, or existing context
-> - The user **explicitly** asks to pause
->
-> A subagent-dispatch failure is a runtime stop condition, not automatically a new user decision point. Record the current task as `BLOCKED` with the failure reason, stop the dispatch loop, and follow the current change's blocked/recovery flow; the main session must not take over implementation.
->
-> This rule applies to the ENTIRE dispatch loop, not just individual tasks.
+## Check Tasks Before Starting
 
-## Before Starting
+1. Read the plan, confirmed design, and configuration from `comet state check <name> build --json` once. Refresh relevant material after scope, file, or configuration changes.
+2. Perform one plan preflight: the plan must not contradict specifications, acceptance, or global constraints. Investigate questions answerable from the repository; batch user questions for conflicts affecting goals or authorization.
+3. Use the entry task summary first. Run `comet state tasks <name> --json` only for individual requirements and IDs. `tasks.md` is the sole completion authority; select task IDs by dependency, not line number, order, or mutable title.
+4. For `needsIds: true`, run `comet state tasks <name> --assign-ids --json` and refresh affected handoff and mappings. Preserve existing IDs. Reconcile legacy checkboxes with actual implementation, checks, and review under context-recovery.md, then synchronize explicit ID mappings. Unchecked items do not trigger reimplementation; genuine extra tasks are not silently discarded.
 
-1. Before dispatching the first task, complete the Superpowers `subagent-driven-development` skill pre-flight plan review: scan the plan and global constraints for contradictions or plan-mandated defects a reviewer would flag. If found, ask one batched question with the conflicting plan text before implementation starts; if clean, proceed without ceremony.
-2. Read the plan once, extracting the full text of all unchecked tasks in order.
-3. Save a unique identifier for each task: the full task text after the checkbox in the plan, and the full OpenSpec task text it maps to (if any). If the text is not unique, stop and fix the plan first; never rely on "first match."
-4. Respect dependencies; do not dispatch a task whose dependencies are not yet complete.
+The main session coordinates dispatch, integration, and acceptance without concurrently editing an active implementer's scope. Under subagent-driven-development it does not implement tasks itself. Autonomous may implement after explicitly withdrawing delegation, inspecting existing work, and saving a checkpoint. Continue after work is visible in the current workspace and accepted, without asking between tasks. Stop affected work for a user-requested pause, unclear authorization, or the blockers below.
 
-## Per-Task Comet Extensions
+## Grouping and Assigning Tasks
 
-Apply these on every task, in addition to the Superpowers skill's dispatch loop:
+Assign tasks by independently acceptable outcomes. Related tasks in the same module, with shared local context and known dependencies, may form a clearly scoped group completed consecutively by one implementer. Specify taskIds, allowed scope, execution order, acceptance requirements, and reporting times when assigning it. Do not mechanically limit groups to 2–3 small tasks or add tasks to one session indefinitely.
 
-### 0. Dispatch Enforcement (Critical)
+A task group does not change task IDs. Report, accept, and check off each ID; one passing task does not complete the whole group. thorough permits implementer reuse but retains independent per-task review. Pause affected tasks on scope changes, dependency conflicts, or new risks. Reconcile completed work before adjusting subsequent assignments; do not silently add tasks.
 
-The main session is the **coordinator only** and must NOT execute tasks directly or modify source code. The coordinator may modify only the plan, OpenSpec task, and subagent progress checkpoint for durable tracking. Never bundle multiple tasks into one agent. Through the loaded Superpowers `subagent-driven-development` skill, dispatch a fresh background implementer agent for every task; when `review_mode` requires review or fixes, dispatch a fresh task reviewer and fix agent for each required role:
+Reuse an implementer within its assigned group; return fixes to the original session first. Save a checkpoint and end reuse when tasks cross modules or scope changes substantially, context pressure prevents reliable retention of constraints, the session cannot be recovered, or two consecutive reports repeat the same blocker without new implementation/evidence. Investigate before recovery and hand off only unfinished tasks and feedback. Do not create unlimited new sessions for repeated review. Reviewers remain independent of implementers; an implementer cannot review its own code. Subagents do not nest dispatch; the main session coordinates it.
 
-- **Never** reuse implementers, reviewers, or fix agents across tasks or roles. Each agent gets a fresh, isolated context containing only the single task and role-specific context it needs.
-- If subagent dispatch fails, stop dispatching and do not let the main session implement the task. Record the current task as `BLOCKED` with the failure reason and follow the current change's blocked/recovery flow.
+## Handoff and Evidence
 
-### 1. Dispatch Prompt and Return Contract
+Send only what the current task needs: task ID and full requirement, plan/design references, allowed scope, dependency interfaces, configured artifact language, required checks, and the report format. Use file handoff supported by the external Skill for long requirements, reports, and feedback. Retain paths and necessary summaries in the main session rather than repeatedly pasting accumulated history. Follow user/platform model configuration and assign roles by available capabilities, not fixed model names.
 
-Every implementer or fix-agent prompt must include:
+Implementers report `DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT`, with files, commit references, check commands and actual results, unfinished work, and risk signals per task ID. They implement and self-test, but do not check off tasks. The main session confirms files and commits are visible in the current workspace before acceptance; integrate isolated copies first.
 
-- The full text of the single current task, architecture background, and dependency context
-- `Language: Use the configured Comet artifact language from comet state get <name> language`
-- The allowed file scope and prohibited modification scope
-- The required test commands and commit requirements
-- For a fix agent, the corresponding reviewer's complete feedback
+With `tdd_mode: tdd`, implementers and fix agents provide genuine, cause-matched RED failure and GREEN success commands and summaries. Autonomous does not require an external TDD Skill; other strategies load test-driven-development in the independent context. Do not reload intact context. Complete verifiable missing checks and honestly report historical gaps; never revert code to fabricate RED. Direct does not require per-task RED/GREEN, but still requires relevant checks and bug-regression evidence.
 
-Large task text, implementation reports, and review material must move through the file-handoff mechanism exposed by the loaded Superpowers `subagent-driven-development` skill, not be pasted wholesale into the main session. The dispatch prompt should point agents to those handoff artifacts while still naming the role, allowed scope, required tests, report contract, and any Comet-specific constraints. Comet may record returned artifact paths or short summaries for recovery, but must not depend on the internal names or directory layout of those artifacts.
+## Risk and Recheck Limits
 
-The agent return status must be `DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT` and include or point to implementation details, test results, commit hash, changed files, and concerns. **The implementer/fix agent must also report whether this task hits any risk signal** (see the list below); if so, list each one hit. This is the first signal source for whether a per-task reviewer is dispatched under `review_mode: standard`. Before review, the coordinator must verify that the commit and changed files are visible in the current worktree; on isolated-copy platforms, pull or merge the changes first.
+Assess risk further for cross-module coordination; authentication, authorization, cryptography, SQL, external input or credentials; concurrency, locks, shared mutable state; data/schema migration; public API changes; or DONE_WITH_CONCERNS. The main session checks actual diff against self-report. More than 200 lines prompts complexity inspection but does not determine risk alone. Mechanical/generated changes do not automatically escalate; their source logic, installation behavior, and runtime interface requirements still require review.
 
-**Risk signal list** (hitting any one marks the task as a risk task):
+| `review_mode` | Build Task Review                                                                              | Rereview Limit After Fixes |
+| ------------- | ---------------------------------------------------------------------------------------------- | -------------------------- |
+| `off`         | No automatic reviewer                                                                          | 0                          |
+| `standard`    | Risk tasks only; one reviewer checks specification compliance and code quality                 | 1 round                    |
+| `thorough`    | Independent review of specification compliance and code quality for each task, accepted per ID | 2 rounds                   |
 
-- Cross-module / cross-subsystem coordinated change
-- Security-sensitive surface: auth, authorization, crypto, SQL, external input handling, secrets/credentials
-- Concurrency, locks, shared mutable state
-- Data or schema migration
-- Public API contract or external interface change
-- Implementer returns `DONE_WITH_CONCERNS`
-- Single-task diff exceeds 200 lines
+These arrangements replace the external Skill's default review steps rather than adding another review process. Initial review reads actual requirements, diff, and evidence, not just implementation summaries. Rechecks cover unresolved findings, fixes, and new risks without repeating all requirement analysis or resetting rounds already used. Check whether trustworthy existing results still apply; add checks only for insufficient evidence, changed inputs, or new risks.
 
-When `review_mode` requires a reviewer, each reviewer prompt must include or point to the full task requirements, the implementation commit or diff, and the RED/GREEN evidence (when `tdd_mode: tdd`). A reviewer must not review from the implementer's summary alone.
+Reviewers remain neutral; do not prohibit findings in advance. Resolve CRITICAL/IMPORTANT issues; after exhausting rereview rounds, record `BLOCKED` and return the decision to the user. `off` does not waive test failures, the Debug Gate, or explicit user requests. Close a finding as already satisfied only after actual inspection, recording rationale rather than optimistic inference.
 
-Reviewer prompts must stay neutral:
+## Accept Tasks and Save Progress
 
-- Do not ask a reviewer to re-run the same tests the implementer already ran and reported; the reviewer verifies the reported evidence and the code/diff.
-- Do not pre-judge, suppress, or down-rank findings in the reviewer prompt. If a likely finding conflicts with the plan, let the reviewer report it, then ask the user which requirement governs.
-- Do not paste accumulated prior-task history into later dispatches. Give only the current task, the relevant interfaces/constraints, and the handoff artifacts exposed by the loaded Superpowers `subagent-driven-development` skill.
+Follow the schemaVersion:1 JSON example in context-recovery.md and save coordination with `comet state checkpoint <name> --file <json-path>`. Runtime validates and generates Markdown; do not manually maintain subagent-progress.md. Read `{checkpoint, stale}` and inspect actual work when stale. Persist before dispatch, after receiving the session ID, and at review/acceptance/blocked boundaries. Ordinary reports may be coalesced; never redispatch accepted members. Checkpoints are not a second completion list.
 
-**Model selection**: Follow the Superpowers `subagent-driven-development` Model Selection rules and choose an appropriate model for each role:
+Reversible implementation decisions within specifications may be made autonomously. Save decisions affecting subsequent work, their rationale, and task IDs in `<classic-change-dir>/.comet/rulings.md`; preserve necessary conclusions and evidence references before upstream temporary files are cleaned. Expanding scope, changing specifications or acceptance, accepting important defects, security exceptions, and external side effects still require user authorization. Temporary sessions or upstream internal directories cannot be the sole recovery source.
 
-- **Implementer / fix agent**: prose-described implementation work uses at least the standard tier; multi-file integration, pattern matching, or debugging → standard tier; requires design judgment or broad codebase understanding → most capable tier. Use the cheapest tier only when the plan text already contains the complete code to write (transcription + testing) or for a single-file mechanical fix.
-- **Reviewer (task-level / final)**: scale to the diff's size, complexity, and risk. A small mechanical diff does not need the most capable model; a subtle concurrency change does.
-- **Final whole-branch review**: use the most capable available model, not the session default.
-
-
-### 2. Implementer Scope Restriction
-
-The implementer is only responsible for implementation, testing, and committing code. **The implementer must not check off plan or OpenSpec tasks**, nor update only the built-in Todo or in-chat checklists.
-
-### 3. TDD Hard Constraint
-
-If `tdd_mode: tdd`, every implementer and fix agent must first use the Skill tool to load the Superpowers `test-driven-development` skill, and its prompt must also inject:
-
-```text
-You MUST follow TDD: write a failing test first, watch it fail, then write minimal code to pass. No production code without a failing test first.
-```
-
-The implementer or fix-agent return must provide **RED failure command and failure summary**, **GREEN pass command and pass summary**; missing either piece of evidence blocks entry into review. When `review_mode` requires a task reviewer, that reviewer must verify RED/GREEN evidence and test coverage while checking both spec compliance and code quality.
-
-### 4. Durable Progress Checkpoint
-
-The coordinator must maintain `<classic-change-dir>/.comet/subagent-progress.md` and update it immediately after every dispatch, agent return, review result, review-fix round change, and task checkoff. The checkpoint must record at least:
-
-- The unique current plan task text and mapped OpenSpec task text
-- Current stage: `implementing | task-review | checkoff | done | blocked`
-- Model used for the current dispatch, when it can be identified
-- Implementation commit hash, changed files, and RED/GREEN evidence
-- The selected `review_mode`
-- Review stages already passed and unresolved reviewer feedback
-- The current task review-fix round (`standard`: max 1, `thorough`: max 2, `off`: 0)
-- Under `review_mode: standard`, whether this task has already triggered a risk task-level review and which risk signals it hit (on recovery, do not re-dispatch an already-completed task-level review)
-
-This file stores only coordinator recovery state and does not replace plan or OpenSpec checkboxes. Retain the final record when a task completes, then replace it with the next task's record when that task begins.
-
-Comet does not read, write, or require any Superpowers `subagent-driven-development` internal scripts or workspace paths. If the installed Superpowers `subagent-driven-development` skill maintains its own scratch artifacts, review material, task requirement files, or progress records, those remain owned by Superpowers. Comet's durable source of truth is limited to Comet workflow state, the plan/OpenSpec checkboxes, and this coordinator checkpoint.
-
-### 5. Review Mode Behavior
-
-> **⚠️ CRITICAL — review_mode takes over the Superpowers default flow, no double review**
->
-> The Superpowers `subagent-driven-development` Process flowchart makes "dispatch a task reviewer after every task" a mandatory node. **Comet's `review_mode` takes over this stage, deciding which tasks get a per-task reviewer** (see the per-task reviewer column in the table below). **Do not dispatch additional reviewers beyond what `review_mode` prescribes.** Tasks that do not get a reviewer (`off`: all; `standard`: non-risk tasks) must go straight to task checkoff and dispatch of the next task.
->
-> The total review count for a change is decided solely by the table below — do not add more.
-
-**Build-phase task-review budget** (these only — do not add more):
-
-| `review_mode` | per-task reviewer (build) |
-|---------------|---------------------------|
-| `off` | 0 |
-| `standard` | risk tasks only (see rules below) |
-| `thorough` | every task (spec + quality) |
-
-After all tasks complete, return directly to `comet-build`; do not append a final reviewer. `comet-verify` runs the only final integrated code review for the whole change under `review_mode`.
-
-**When `review_mode: standard`**: By default no per-task reviewer is dispatched; instead, a **risk trigger** decides: after the implementer self-tests, commits, and reports evidence (including the risk-signal self-report), the coordinator reads the self-report and reviews the task's diff. **Only when the implementer's self-report hits any risk signal, or the coordinator's diff review finds any risk signal**, dispatch one per-task reviewer for that task, checking both spec compliance and code quality; CRITICAL/IMPORTANT findings enter one review-fix round (max 1), and a failed re-review marks it **BLOCKED**. Tasks that hit no risk signal go straight through targeted checkoff verification.
-
-**When `review_mode: thorough`**: **Dispatch one per-task reviewer per task, checking both spec compliance and code quality**: after the implementer self-tests, commits, and reports evidence, the coordinator dispatches a fresh background reviewer for that task. CRITICAL/IMPORTANT findings enter review-fix (max 2 rounds); if still not passed, mark **BLOCKED** and pause, handing feedback to the user. Thorough does not run batched review — a high-risk change demands immediate, focused review on every task.
-
-When a reviewer returns an item that cannot be verified from review material alone, the coordinator must resolve it before task checkoff. If direct repository inspection confirms a real gap, treat it as a failed spec/quality review and send it through the appropriate fix and re-review loop. If it is satisfied by unchanged code or a cross-task constraint, record the rationale in the checkpoint and continue.
-
-**When `review_mode: off`**: No automatic task reviewer or review-fix agent is dispatched. Task completion is determined by implementer test/build evidence, current worktree confirmation, targeted task text checkoff verification, and explicit user request. If test failures, build failures, or abnormal behavior occur during execution, the debug gate protocol must still be followed - `off` does not skip real issues.
-
-### 6. Task Checkoff and Verification
-
-**After `review_mode` validation**, the main session:
-
-1. Changes the saved unique task text from `- [ ]` to `- [x]` in the plan
-2. If a mapping exists, also checks off the OpenSpec task
-3. Commits this progress update
-4. Runs targeted verification:
+After per-task acceptance under the configuration, use the inspected revision to record completion:
 
 ```bash
-comet state task-checkoff "<plan-file>" "<plan-task-text>"
-comet state task-checkoff "<classic-change-dir>/tasks.md" "<openspec-task-text>"
+comet state task-complete <name> <task-id> --expect <revision> --json
 ```
 
-Run the second command only when the corresponding mapping exists. The script requires the task text to appear exactly once and be checked; verification failure blocks moving to the next task.
+This command records completion; it does not replace acceptance. If changed requirements cause rejection, reread tasks and affected design and reassess, rather than blindly retrying with a new revision. Completion-only changes do not alter revision; the command may be retried idempotently. Follow existing commit policy without mechanical per-microtask progress commits.
 
-## Wrap-up
+After all tasks are accepted, immediately return to `comet-build` exit checks. Build does not add a whole-branch reviewer; `comet-verify` performs the only final integrated review under review_mode, then Archive closes the workflow.
 
-- **AUTO-CONTINUE**: After `review_mode` validation and the task is checked off, immediately dispatch the next unchecked task. Do NOT summarize, do NOT ask the user whether to continue, do NOT wait for user input between tasks. This is non-negotiable — the Superpowers skill enforces continuous execution, and the CRITICAL warning at the top of this document reinforces it.
-- After all tasks complete, return directly to `comet-build` without entering `final-review` / `final-fix` or appending a final reviewer. Only the subagent dispatch loop is complete, not the Comet workflow; `comet-verify` performs the final integrated review.
-- The coordinator must not load `finishing-a-development-branch` or pause to ask what comes next; return control to `comet-build` for exit checks, the phase guard, and phase handoff.
+## Interrupted Recovery
 
-## Context Recovery
+Obtain current entry state through context-recovery.md. Read `comet state checkpoint <name>` only when coordination summaries are insufficient; load referenced rulings as needed. Reconcile revision, actual commits, files, and evidence, then resume the original step with valid reviews and previously used recheck rounds intact.
 
-Reload the Superpowers `subagent-driven-development` skill and re-read this document. Read `<classic-change-dir>/.comet/subagent-progress.md`, then compare it with the first unchecked task and the current worktree:
-
-- When the checkpoint matches the unchecked task, resume from its exact recorded stage while preserving the implementation commit, RED/GREEN evidence, `review_mode`, review stages already passed, unresolved feedback, and current review-fix round. Never reset the round or repeat an already passed stage.
-- If the loaded Superpowers `subagent-driven-development` skill reports a task complete through its own progress record, reconcile that report against git history and Comet plan/OpenSpec checkboxes before dispatching. When the commits and task identity match, update Comet's checkpoint/checkoff state instead of re-dispatching completed work.
-- When the checkpoint is missing or does not match the unchecked task, create a new checkpoint for the first unchecked task and begin with implementer dispatch.
-- When a recorded commit or file is not visible in the current worktree, pull, merge, or recover the corresponding changes before proceeding; never assume the implementation exists.
-- When all tasks are checked, return directly to `comet-build`; do not resume or create a Build-phase final-review stage.
-
-Tasks committed without passing `review_mode` validation remain unchecked and re-enter the corresponding validation, review, or fix loop according to the checkpoint.
+- For unchecked but implemented tasks, verify acceptance without reimplementing; committed but unaccepted tasks remain incomplete.
+- Restore only unaccepted tasks in the assigned group. tasks.md remains authoritative; mapped legacy plan checkboxes only display its completion state.
+- Reconcile mapping and impact when tasks are deleted, renamed, or changed. Missing mapping cannot be guessed as the first unchecked task.
+- If checkpoints are missing, inspect the working tree and history first. Dispatch implementation only for confirmed missing work; no checkpoint does not mean no implementation.
+- Record dispatch/session failures and stop the affected loop, then follow recovery without silently changing the selected strategy.
+- Return to comet-build when all tasks are complete; do not restore old Build final-review/final-fix states.

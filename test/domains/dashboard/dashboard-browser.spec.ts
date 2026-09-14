@@ -1,5 +1,502 @@
 import { expect, test } from '@playwright/test';
 
+test.describe('Dashboard project selection', () => {
+  const projects = Array.from({ length: 45 }, (_, index) => ({
+    id: `path-${index}`,
+    name: index < 2 ? 'same-repository' : `project-${index}`,
+    path: `/worktrees/project-${index}`,
+    lastSeenAt: null,
+    availability: 'available',
+    isCurrent: index === 0,
+  }));
+  const overview = (index: number) => ({
+    project: {
+      name: projects[index].name,
+      path: projects[index].path,
+      generatedAt: '2026-09-10T00:00:00.000Z',
+    },
+    summary: {
+      activeChanges: 0,
+      archivedChanges: 0,
+      verifyFailed: 0,
+      tasksIncomplete: 0,
+      dirtyFiles: index,
+    },
+    initialChanges: { status: 'active', items: [], total: 0, nextCursor: null },
+    git: {
+      branch: `branch-${index}`,
+      head: 'abc1234',
+      dirtyFiles: 0,
+      dirtyFileList: [],
+      recentCommits: [],
+    },
+    risks: [],
+    native: null,
+  });
+
+  test.beforeEach(async ({ page }) => {
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.addInitScript(() => localStorage.setItem('comet-dashboard-project', 'path-1'));
+    await page.route('**/api/dashboard/**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/api/dashboard/projects') {
+        await route.fulfill({ json: { currentProjectId: 'path-0', projects } });
+      } else if (url.pathname.endsWith('/overview')) {
+        const index = Number(url.pathname.split('/')[4].replace('path-', ''));
+        await route.fulfill({ json: overview(index) });
+      } else if (url.pathname.endsWith('/changes')) {
+        await route.fulfill({ json: { status: 'active', items: [], total: 0, nextCursor: null } });
+      } else if (url.pathname.endsWith('/plugins')) {
+        await route.fulfill({ json: { pages: [] } });
+      } else {
+        await route.fulfill({ json: {} });
+      }
+    });
+  });
+
+  test('prefers the launch project over remembered selection and resets on reload', async ({
+    page,
+  }) => {
+    await page.goto('/');
+    await expect(page.getByRole('button', { name: /^Git 未提交 0 / })).toBeVisible();
+    await page.locator('.comet-project-select').click();
+    const response = page.waitForResponse('**/projects/path-1/overview*');
+    await page
+      .locator('.comet-project-select-dropdown .comet-project-option')
+      .filter({ hasText: '/worktrees/project-1' })
+      .first()
+      .click();
+    expect((await (await response).json()).project.path).toBe('/worktrees/project-1');
+    await expect(page.getByRole('button', { name: /^Git 未提交 1 / })).toBeVisible();
+    const changes = page.waitForRequest('**/projects/path-1/changes*');
+    await page.getByRole('tab', { name: '已归档', exact: true }).click();
+    await changes;
+    await page.reload();
+    await expect(page.getByRole('button', { name: /^Git 未提交 0 / })).toBeVisible();
+    await expect(page.getByRole('button', { name: /^Git 未提交 1 / })).toHaveCount(0);
+  });
+
+  test('keeps option names and paths paired through scrolling and searching', async ({ page }) => {
+    await page.goto('/');
+    const selector = page.locator('.comet-project-select');
+    await selector.click();
+    const popup = page.locator('.comet-project-select-dropdown');
+    const scroller = popup.locator('.ant-select-dropdown-list-holder');
+    const assertLabels = async () => {
+      const visible = await popup.locator('.comet-project-option').evaluateAll((entries) =>
+        entries.map((entry) => ({
+          name: entry.querySelector('.comet-project-option-name')?.textContent,
+          path: entry.querySelector('.comet-project-option-path')?.textContent,
+        })),
+      );
+      expect(visible.length).toBeGreaterThan(1);
+      expect(new Set(visible.map((entry) => entry.path)).size).toBe(visible.length);
+      for (const entry of visible)
+        expect(projects.find((project) => project.path === entry.path)?.name).toBe(entry.name);
+    };
+    await assertLabels();
+    for (const fraction of [1, 0.5, 0]) {
+      await expect
+        .poll(async () => {
+          await scroller.evaluate((element, amount) => {
+            element.scrollTop = amount * element.scrollHeight;
+          }, fraction);
+          const target = fraction === 1 ? 44 : fraction === 0 ? 0 : 22;
+          return popup.getByText(`/worktrees/project-${target}`, { exact: true }).isVisible();
+        })
+        .toBe(true);
+      await assertLabels();
+    }
+    await selector.getByRole('combobox').fill('/worktrees/project-44');
+    await expect(popup.locator('.comet-project-option')).toHaveCount(1);
+    await popup.getByText('/worktrees/project-44', { exact: true }).click();
+    await expect(selector.locator('.comet-project-selected-label')).toHaveText('project-44');
+    await expect(page.getByRole('button', { name: /^Git 未提交 44 / })).toBeVisible();
+  });
+
+  test('ignores a slow overview response after switching back', async ({ page }) => {
+    let release!: () => void;
+    let finish!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const completed = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    await page.route('**/projects/path-1/overview*', async (route) => {
+      await held;
+      await route.fulfill({ json: overview(1) }).catch(() => undefined);
+      finish();
+    });
+    await page.goto('/');
+    await expect(page.getByRole('button', { name: /^Git 未提交 0 / })).toBeVisible();
+    const selector = page.locator('.comet-project-select');
+    await selector.click();
+    const started = page.waitForRequest('**/projects/path-1/overview*');
+    await page.getByText('/worktrees/project-1', { exact: true }).click();
+    await started;
+    await selector.click();
+    await page.getByText('/worktrees/project-0', { exact: true }).click();
+    await expect(page.getByRole('button', { name: /^Git 未提交 0 / })).toBeVisible();
+    release();
+    await completed;
+    await expect(page.getByRole('button', { name: /^Git 未提交 1 / })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Git 未提交 0 / })).toBeVisible();
+  });
+
+  for (const noAvailable of [false, true]) {
+    test(`handles unavailable launch projects with ${noAvailable ? 'an empty state' : 'an available fallback'}`, async ({
+      page,
+    }) => {
+      await page.route('**/api/dashboard/projects', (route) =>
+        route.fulfill({
+          json: {
+            currentProjectId: 'path-0',
+            projects: [
+              { ...projects[0], availability: 'missing' },
+              { ...projects[1], availability: noAvailable ? 'unreadable' : 'available' },
+            ],
+          },
+        }),
+      );
+      const overviewRequests: string[] = [];
+      page.on('request', (request) => {
+        if (request.url().includes('/overview')) overviewRequests.push(request.url());
+      });
+      await page.goto('/');
+      if (noAvailable) {
+        await expect(page.getByText('暂无可用项目', { exact: true })).toBeVisible();
+        expect(overviewRequests).toHaveLength(0);
+      } else {
+        await expect(page.getByRole('button', { name: /^Git 未提交 1 / })).toBeVisible();
+      }
+      await page.locator('.comet-project-select').click();
+      await expect(
+        page.locator('.comet-project-select-dropdown .ant-select-item-option-disabled'),
+      ).toHaveCount(noAvailable ? 2 : 1);
+    });
+  }
+});
+
+test('uses each project default workflow during startup and project switching', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1600, height: 900 });
+  const projects = [
+    {
+      id: 'native-project',
+      name: 'native-project',
+      path: '/worktrees/native-project',
+      lastSeenAt: null,
+      availability: 'available',
+      isCurrent: true,
+      defaultWorkflow: 'native',
+      workflowSource: 'configured',
+    },
+    {
+      id: 'classic-project',
+      name: 'classic-project',
+      path: '/worktrees/classic-project',
+      lastSeenAt: null,
+      availability: 'available',
+      isCurrent: false,
+      defaultWorkflow: 'classic',
+      workflowSource: 'configured',
+    },
+  ];
+  const overview = (project: (typeof projects)[number]) => ({
+    project: {
+      name: project.name,
+      path: project.path,
+      generatedAt: '2026-09-10T00:00:00.000Z',
+    },
+    summary: {
+      activeChanges: 0,
+      archivedChanges: 0,
+      verifyFailed: 0,
+      tasksIncomplete: 0,
+      dirtyFiles: 0,
+    },
+    initialChanges: { status: 'active', items: [], total: 0, nextCursor: null },
+    git: {
+      branch: project.name,
+      head: 'abc1234',
+      dirtyFiles: 0,
+      dirtyFileList: [],
+      recentCommits: [],
+    },
+    risks: [],
+    native: {
+      activeChangeCount: 0,
+      archivedChangeCount: 0,
+      totalChangeCount: 0,
+      changes: [],
+    },
+  });
+  await page.route('**/api/dashboard/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/api/dashboard/projects') {
+      await route.fulfill({ json: { currentProjectId: 'native-project', projects } });
+    } else if (url.pathname.endsWith('/overview')) {
+      const project = projects.find((entry) => url.pathname.includes(entry.id));
+      await route.fulfill({ json: overview(project ?? projects[0]) });
+    } else if (url.pathname.endsWith('/changes') || url.pathname.endsWith('/native-changes')) {
+      await route.fulfill({ json: { status: 'active', items: [], total: 0, nextCursor: null } });
+    } else if (url.pathname.endsWith('/plugins')) {
+      await route.fulfill({ json: { pages: [] } });
+    } else {
+      await route.fulfill({ json: {} });
+    }
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.dashboard-workflow-menu .ant-menu-item-selected')).toContainText(
+    'Native 工作流',
+  );
+  await expect(page.locator('[aria-label="项目默认工作流来源：configured"]')).toBeVisible();
+
+  await page.locator('.comet-project-select').click();
+  await page.getByText('/worktrees/classic-project', { exact: true }).click();
+  await expect(page.locator('.dashboard-workflow-menu .ant-menu-item-selected')).toContainText(
+    'Classic 工作流',
+  );
+});
+
+test('revalidates a cached plugin page when it is first entered', async ({ page }) => {
+  await page.setViewportSize({ width: 1600, height: 900 });
+  const project = {
+    id: 'fresh-project',
+    name: 'fresh-project',
+    path: '/worktrees/fresh-project',
+    lastSeenAt: null,
+    availability: 'available',
+    isCurrent: true,
+    defaultWorkflow: 'classic',
+    workflowSource: 'configured',
+  };
+  let pluginPageLoads = 0;
+  let pluginPageResponses = 0;
+  let releasePluginPageLoad: (() => void) | undefined;
+  const pluginPageLoadPending = new Promise<void>((resolve) => {
+    releasePluginPageLoad = resolve;
+  });
+  await page.addInitScript(
+    ({ cacheKey, cachedPage }) => {
+      localStorage.setItem(cacheKey, JSON.stringify({ version: 1, value: cachedPage }));
+    },
+    {
+      cacheKey: `comet-dashboard-plugin:${project.id}:test.plugin`,
+      cachedPage: {
+        pluginId: 'test.plugin',
+        label: '测试插件',
+        route: '/plugins/test',
+        status: 'enabled',
+        globallyDisabled: false,
+        projectPaused: false,
+        diagnostics: [],
+        data: { version: 'cached' },
+      },
+    },
+  );
+  await page.route('**/api/dashboard/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/api/dashboard/projects') {
+      await route.fulfill({ json: { currentProjectId: project.id, projects: [project] } });
+    } else if (url.pathname.endsWith('/overview')) {
+      await route.fulfill({
+        json: {
+          project: { name: project.name, path: project.path, generatedAt: '2026-09-10' },
+          summary: {
+            activeChanges: 0,
+            archivedChanges: 0,
+            verifyFailed: 0,
+            tasksIncomplete: 0,
+            dirtyFiles: 0,
+          },
+          initialChanges: { status: 'active', items: [], total: 0, nextCursor: null },
+          git: {
+            branch: 'main',
+            head: 'abc1234',
+            dirtyFiles: 0,
+            dirtyFileList: [],
+            recentCommits: [],
+          },
+          risks: [],
+          native: null,
+        },
+      });
+    } else if (url.pathname.endsWith('/changes')) {
+      await route.fulfill({ json: { status: 'active', items: [], total: 0, nextCursor: null } });
+    } else if (url.pathname.endsWith('/plugins')) {
+      await route.fulfill({
+        json: {
+          pages: [
+            {
+              pluginId: 'test.plugin',
+              label: '测试插件',
+              route: '/plugins/test',
+              status: 'enabled',
+              globallyDisabled: false,
+              projectPaused: false,
+              diagnostics: [],
+            },
+          ],
+        },
+      });
+    } else if (url.pathname.endsWith('/plugins/test.plugin')) {
+      pluginPageLoads += 1;
+      await pluginPageLoadPending;
+      await route.fulfill({
+        json: {
+          pluginId: 'test.plugin',
+          label: '测试插件',
+          route: '/plugins/test',
+          status: 'enabled',
+          globallyDisabled: false,
+          projectPaused: false,
+          diagnostics: [],
+          data: { version: 'fresh' },
+        },
+      });
+      pluginPageResponses += 1;
+    } else {
+      await route.fulfill({ json: {} });
+    }
+  });
+
+  await page.goto('/');
+  await expect(page.getByRole('menuitem', { name: '测试插件' })).toBeVisible();
+  await page.getByRole('menuitem', { name: '测试插件' }).click();
+  await expect(page.getByText('该插件暂未提供可视化中心页。')).toBeVisible();
+  await expect.poll(() => pluginPageLoads).toBe(1);
+  const cachedContent = page.getByText('该插件暂未提供可视化中心页。');
+  const topWhileRefreshing = await cachedContent.evaluate(
+    (element) => element.getBoundingClientRect().top,
+  );
+  await expect(page.getByText('正在同步最新数据…', { exact: true })).toHaveCount(0);
+  releasePluginPageLoad?.();
+  await expect.poll(() => pluginPageResponses).toBe(1);
+  await expect
+    .poll(async () => cachedContent.evaluate((element) => element.getBoundingClientRect().top))
+    .toBe(topWhileRefreshing);
+});
+
+test('keeps cached settings visible when fresh revalidation fails', async ({ page }) => {
+  await page.setViewportSize({ width: 1600, height: 900 });
+  const project = {
+    id: 'settings-fresh-project',
+    name: 'settings-fresh-project',
+    path: '/worktrees/settings-fresh-project',
+    lastSeenAt: null,
+    availability: 'available',
+    isCurrent: true,
+    defaultWorkflow: 'native',
+    workflowSource: 'configured',
+  };
+  const cachedConfig = {
+    path: '.comet/config.yaml',
+    revision: 'cached-revision',
+    schema: 'comet.project.v1',
+    defaultWorkflow: 'native',
+    workflows: ['native', 'classic'],
+    ambientResume: true,
+    hookAllowPaths: [],
+    knowledge: { provider: 'local', localInclude: [] },
+    native: {
+      artifactRoot: 'docs',
+      language: 'zh-CN',
+      clarificationMode: 'sequential',
+      archiveConfirmation: 'required',
+      maxVerifyFailures: 3,
+    },
+    classic: {
+      artifactLayout: 'docs',
+      language: 'zh-CN',
+      contextCompression: 'off',
+      reviewMode: 'standard',
+      autoTransition: false,
+    },
+  };
+  let configLoads = 0;
+  let releaseSettingsRefresh: (() => void) | undefined;
+  const settingsRefreshPending = new Promise<void>((resolve) => {
+    releaseSettingsRefresh = resolve;
+  });
+  await page.route('**/api/dashboard/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/api/dashboard/projects') {
+      await route.fulfill({ json: { currentProjectId: project.id, projects: [project] } });
+    } else if (url.pathname.endsWith('/overview')) {
+      await route.fulfill({
+        json: {
+          project: { name: project.name, path: project.path, generatedAt: '2026-09-10' },
+          summary: {
+            activeChanges: 0,
+            archivedChanges: 0,
+            verifyFailed: 0,
+            tasksIncomplete: 0,
+            dirtyFiles: 0,
+          },
+          initialChanges: { status: 'active', items: [], total: 0, nextCursor: null },
+          git: {
+            branch: 'main',
+            head: 'abc1234',
+            dirtyFiles: 0,
+            dirtyFileList: [],
+            recentCommits: [],
+          },
+          risks: [],
+          native: null,
+        },
+      });
+    } else if (url.pathname.endsWith('/changes')) {
+      await route.fulfill({ json: { status: 'active', items: [], total: 0, nextCursor: null } });
+    } else if (url.pathname.endsWith('/plugins')) {
+      await route.fulfill({ json: { pages: [] } });
+    } else if (url.pathname.endsWith('/config')) {
+      configLoads += 1;
+      if (configLoads === 1) await route.fulfill({ json: cachedConfig });
+      else {
+        if (configLoads === 2) await settingsRefreshPending;
+        await route.fulfill({ status: 503, json: { message: 'fresh settings unavailable' } });
+      }
+    } else {
+      await route.fulfill({ json: {} });
+    }
+  });
+
+  await page.goto('/');
+  await expect(page.locator('.dashboard-workflow-menu .ant-menu-item-selected')).toContainText(
+    'Native 工作流',
+  );
+  await expect.poll(() => configLoads).toBe(1);
+  const settingsDialog = page.getByRole('dialog', { name: /Comet 设置/u });
+  await page.getByRole('button', { name: '设置' }).click();
+  await expect(
+    settingsDialog
+      .locator('.dashboard-config-control')
+      .first()
+      .getByText('Native', { exact: true }),
+  ).toBeVisible();
+  await expect.poll(() => configLoads).toBe(2);
+  await expect(settingsDialog.getByText('正在同步最新数据…', { exact: true })).toHaveCount(0);
+  releaseSettingsRefresh?.();
+  await expect(
+    settingsDialog.getByText('最新数据同步失败，当前显示缓存', { exact: true }),
+  ).toBeVisible();
+  await settingsDialog.getByRole('button', { name: /重\s*试/u }).click();
+  await expect.poll(() => configLoads).toBe(3);
+  await expect(
+    settingsDialog
+      .locator('.dashboard-config-control')
+      .first()
+      .getByText('Native', { exact: true }),
+  ).toBeVisible();
+  await expect(
+    settingsDialog.getByText('最新数据同步失败，当前显示缓存', { exact: true }),
+  ).toBeVisible();
+});
+
 test('shows Project Knowledge status and project pause transitions', async ({ page }) => {
   test.setTimeout(60_000);
   await page.setViewportSize({ width: 1600, height: 900 });
@@ -976,6 +1473,17 @@ test('adds global or project memory, explains application, and permanently delet
         pausedRetrievalProjects: [],
         profile: { usedChars: 18, maxChars: 2000 },
         provider: { provider: 'local', configured: true },
+        learning: {
+          lastCheckedAt: '2026-08-23T00:00:00.000Z',
+          lastCheck: 'submitted',
+          lastResult: 'candidate-created',
+          lastReason: '等待另一个独立成功 change 的证据',
+          lastProjectKey: 'fixture-project',
+          lastWorkflow: 'native',
+          lastChangeId: 'change-learning-1',
+          observedCount: 1,
+          validObservationCount: 1,
+        },
       },
       retrieval: { records: projectRecords, profileRecords },
       management: { records: managedRecords, conflicts: [] },
@@ -1129,6 +1637,13 @@ test('adds global or project memory, explains application, and permanently delet
 
   await page.goto('/');
   await page.getByRole('menuitem', { name: '个人记忆' }).click();
+  const learningStatus = page.locator('.dashboard-memory-learning-diagnostic');
+  await expect(learningStatus).toContainText('已形成候选，等待独立证据');
+  await expect(learningStatus).toContainText('时间：2026-08-23T00:00:00.000Z');
+  await expect(learningStatus).toContainText(
+    '归属：项目 fixture-project · workflow native · change change-learning-1',
+  );
+  await expect(learningStatus).toContainText('原因：等待另一个独立成功 change 的证据');
   await expect(page.getByRole('button', { name: '个人偏好与事实 1' })).toBeVisible();
   await expect(page.getByRole('button', { name: '协作约定 0' })).toBeVisible();
   await expect(page.getByRole('button', { name: '任务经验 0' })).toBeVisible();
@@ -1685,6 +2200,85 @@ test('loads the demo dashboard and previews an artifact', async ({ page }) => {
   await expect(page.getByRole('tab', { name: '已归档', exact: true })).toBeVisible();
   await expect(page.getByRole('tab', { name: '全部', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'ship-native-dashboard' })).toBeVisible();
+  const nativeSelectedRow = page
+    .locator('.native-change-row')
+    .filter({ hasText: 'ship-native-dashboard' });
+  await expect(nativeSelectedRow).toContainText('构建中');
+  await expect(nativeSelectedRow).not.toContainText('待验证');
+  const nativePhaseTrack = page.getByRole('list', { name: 'Native 生命周期阶段' });
+  await expect(nativePhaseTrack.locator('.dashboard-phase-item')).toHaveCount(4);
+  const nativeCurrentPhase = nativePhaseTrack.locator('.dashboard-phase-item.is-current');
+  await expect(nativeCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS('width', '32px');
+  await expect(nativeCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS('height', '32px');
+  await expect(nativeCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS(
+    'border-width',
+    '0px',
+  );
+  await expect(nativeCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS(
+    'background-color',
+    'rgb(255, 255, 255)',
+  );
+  const nativeOriginWave = nativeCurrentPhase.getByRole('status', { name: 'Build 正在进行' });
+  const nativeOriginWaveDots = nativeOriginWave.locator('.dashboard-phase-origin-wave-dot');
+  await expect(nativeOriginWave).toHaveClass(/dashboard-phase-origin-wave/);
+  await expect(nativeOriginWaveDots).toHaveCount(25);
+  await expect(nativeOriginWave).toHaveCSS('width', '28px');
+  await expect(nativeOriginWaveDots.first()).toHaveCSS(
+    'animation-name',
+    'comet-phase-origin-wave, comet-phase-origin-wave-spectrum-start',
+  );
+  await expect(nativeOriginWaveDots.first()).toHaveCSS('animation-duration', '1.2s, 8.4s');
+  const samplePhasePalette = (currentTime) =>
+    nativeOriginWaveDots.first().evaluate((element, time) => {
+      for (const animation of element.getAnimations({ subtree: true })) {
+        if (!animation.animationName.includes('spectrum')) continue;
+        animation.currentTime = time;
+        animation.pause();
+      }
+      return {
+        start: getComputedStyle(element).backgroundColor,
+        middle: getComputedStyle(element, '::before').backgroundColor,
+        end: getComputedStyle(element, '::after').backgroundColor,
+      };
+    }, currentTime);
+  await expect
+    .poll(() => samplePhasePalette(2_900))
+    .toEqual({
+      start: 'rgb(198, 93, 14)',
+      middle: 'rgb(249, 115, 22)',
+      end: 'rgb(245, 185, 66)',
+    });
+  await expect
+    .poll(() => samplePhasePalette(6_500))
+    .toEqual({
+      start: 'rgb(255, 77, 109)',
+      middle: 'rgb(255, 209, 102)',
+      end: 'rgb(6, 214, 160)',
+    });
+  await expect
+    .poll(() =>
+      nativeOriginWaveDots
+        .first()
+        .evaluate((element) => getComputedStyle(element, '::before').animationName),
+    )
+    .toBe('comet-phase-origin-wave-middle, comet-phase-origin-wave-spectrum-middle');
+  await expect
+    .poll(() =>
+      nativeOriginWaveDots
+        .first()
+        .evaluate((element) => getComputedStyle(element, '::after').animationName),
+    )
+    .toBe('comet-phase-origin-wave-end, comet-phase-origin-wave-spectrum-end');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(nativeOriginWaveDots.first()).toHaveCSS('animation-name', 'none');
+  await expect
+    .poll(() =>
+      nativeOriginWaveDots
+        .first()
+        .evaluate((element) => getComputedStyle(element, '::before').animationName),
+    )
+    .toBe('none');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
   const nativeCopyChangeName = page.getByRole('button', { name: '复制 Change 名称' });
   await expect(nativeCopyChangeName).toHaveCount(1);
   await nativeCopyChangeName.click();
@@ -1713,6 +2307,9 @@ test('loads the demo dashboard and previews an artifact', async ({ page }) => {
   await page.getByRole('tab', { name: '已归档', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'document-native-resume' })).toBeVisible();
   await expect(page.getByLabel('Archive 已完成')).toHaveText('✓');
+  await expect(
+    page.getByRole('list', { name: 'Native 生命周期阶段' }).locator('.dashboard-phase-origin-wave'),
+  ).toHaveCount(0);
   await expect(page.getByText(/Build ↔ Verify Loop · 已完成/u)).toBeVisible();
   await expect(page.getByText('你已确认接受不完整验证结果', { exact: true })).toBeVisible();
   await expect(page.getByText('归档只读', { exact: true }).first()).toBeVisible();
@@ -1721,6 +2318,25 @@ test('loads the demo dashboard and previews an artifact', async ({ page }) => {
   await classicWorkflow.click();
   await expect(classicWorkflow).toHaveClass(/ant-menu-item-selected/);
   await expect(page.getByRole('heading', { name: 'Native 变更工作区' })).toBeHidden();
+  const classicSelectedRow = page
+    .locator('.dashboard-change-row')
+    .filter({ hasText: 'add-auth-rate-limiting' });
+  await expect(classicSelectedRow).toContainText('构建中');
+  await expect(classicSelectedRow).not.toContainText('待验证');
+  const classicPhaseTrack = page.getByRole('list', { name: 'Classic 生命周期阶段' });
+  await expect(classicPhaseTrack.locator('.dashboard-phase-item')).toHaveCount(5);
+  const classicCurrentPhase = classicPhaseTrack.locator('.dashboard-phase-item.is-current');
+  await expect(classicCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS('width', '32px');
+  await expect(classicCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS('height', '32px');
+  await expect(classicCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS(
+    'border-width',
+    '0px',
+  );
+  await expect(classicCurrentPhase.locator('.dashboard-phase-node')).toHaveCSS(
+    'background-color',
+    'rgb(255, 255, 255)',
+  );
+  await expect(classicCurrentPhase.locator('.dashboard-phase-origin-wave-dot')).toHaveCount(25);
 
   const proposal = page.getByRole('button').filter({ hasText: 'proposal' }).first();
   await expect(proposal).toBeVisible();
@@ -2346,10 +2962,9 @@ test('fully applies dark surfaces without page-wide color-transition jank', asyn
   );
 
   await expect(page.locator('.ant-card').first()).toHaveCSS('background-color', 'rgb(21, 25, 35)');
-  await expect(page.locator('.ant-steps-item-wait .ant-steps-item-title').first()).toHaveCSS(
-    'color',
-    'rgb(165, 180, 200)',
-  );
+  await expect(
+    page.locator('.dashboard-phase-item.is-pending .dashboard-phase-label').first(),
+  ).toHaveCSS('color', 'rgb(165, 180, 200)');
   await expect(page.locator('.dashboard-priority-title svg')).toHaveCSS(
     'background-color',
     'rgb(29, 59, 101)',
@@ -2366,10 +2981,9 @@ test('fully applies dark surfaces without page-wide color-transition jank', asyn
     'rgb(32, 42, 58)',
   );
   await expect(page.locator('.comet-workbench-header')).toHaveCSS('box-shadow', 'none');
-  await expect(page.locator('.ant-steps-item-rail-wait').first()).toHaveCSS(
-    'background-color',
-    'rgb(58, 70, 88)',
-  );
+  await expect(
+    page.locator('.dashboard-phase-item.is-pending .dashboard-phase-rail').first(),
+  ).toHaveCSS('background-color', 'rgb(58, 70, 88)');
 
   await page.getByRole('menuitem', { name: 'Native 工作流' }).click();
   const nativeSelectedItem = page.locator('.native-change-list-item.selected');
@@ -2612,7 +3226,7 @@ test('keeps the next-step alert clear of its neighboring detail sections', async
   await page.goto('/?demo');
 
   const [stepsBox, alertBox, panelsBox] = await Promise.all([
-    page.locator('.ant-steps').boundingBox(),
+    page.locator('.dashboard-phase-track').boundingBox(),
     page.getByRole('alert').boundingBox(),
     page.locator('.change-detail-panels').boundingBox(),
   ]);
@@ -2766,6 +3380,17 @@ test('pins the desktop workbench frame while rich content scrolls in the center 
 }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/?demo');
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const shell = document.querySelector('.dashboard-content-shell');
+          if (!(shell instanceof HTMLElement)) return 0;
+          return shell.scrollHeight - shell.clientHeight;
+        }),
+      { message: 'Expected the workbench shell to render scrollable content' },
+    )
+    .toBeGreaterThan(0);
 
   const metrics = await page.evaluate(() => {
     const workbench = document.querySelector('.dashboard-workbench');
@@ -3644,18 +4269,17 @@ test('keeps Classic and Native side panels within the center panel height', asyn
       const nativeList = workspace.locator('.native-change-list');
       const nativeDetail = workspace.locator('.native-change-detail');
       const rightPanel = workspace.locator('.dashboard-workspace-right');
-      const nativeCount = nativeExplorer.locator('.native-changes-count');
+      const nativeCount = nativeExplorer.locator('.native-changes-count .ant-badge-count');
       await expect(nativeCount).toHaveText(/^\d+$/);
+      await expect(nativeCount).toHaveClass(/ant-scroll-number/u);
+      await expect
+        .poll(() => nativeCount.locator('.ant-scroll-number-only').count())
+        .toBeGreaterThan(0);
       await expect(nativeCount).toHaveCSS('background-color', 'rgb(11, 24, 51)');
       await expect(nativeCount).toHaveCSS('color', 'rgb(255, 255, 255)');
       await expect(nativeCount).toHaveCSS('min-width', '20px');
       await expect(nativeCount).toHaveCSS('padding', '0px 8px');
       await expect(nativeCount).toHaveCSS('font-weight', '400');
-      await expect(nativeCount).toHaveCSS(
-        'font-family',
-        '"Segoe UI Variable", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif',
-      );
-      await expect(nativeCount).toHaveCSS('letter-spacing', '-0.182px');
       await expect(nativeCount).toHaveCSS('white-space', 'nowrap');
       await expect(nativeExplorer).toHaveCSS('font-size', '14px');
       const nativeHeader = nativeExplorer.locator('.native-changes-explorer-header');
@@ -3703,7 +4327,7 @@ test('keeps Classic and Native side panels within the center panel height', asyn
       await expect(selectedNativeRow).toHaveCSS('border-radius', '10px');
       await expect(selectedNativeRow.locator('.truncate')).toHaveCSS('font-size', '14px');
       await expect(selectedNativeRow.getByText('◇', { exact: true })).toHaveCount(0);
-      await expect(selectedNativeRow).toContainText('Build · 1/3 子变更待验证');
+      await expect(selectedNativeRow).toContainText('Build · 1/3 子变更构建中');
       const nativeProgress = selectedNativeRow.getByRole('progressbar');
       await expect(nativeProgress).toHaveCount(1);
       await expect(nativeProgress).toHaveAttribute('aria-valuenow', '33');

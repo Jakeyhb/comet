@@ -4,6 +4,8 @@ import type {
   ClassicCommandResult,
 } from './classic-cli.js';
 import { classicCommandHelp } from './classic-cli-help.js';
+import { projectCliAgentObservation } from '../workflow-contract/output-envelope.js';
+import { classicIssue } from './classic-issues.js';
 
 function jsonResult(
   command: ClassicCommandName,
@@ -15,6 +17,7 @@ function jsonResult(
       JSON.stringify({
         command,
         exitCode: result.exitCode,
+        agent: projectCliAgentObservation(result.data),
         ...(result.data === undefined ? {} : { data: result.data }),
         ...(result.envelope === undefined
           ? {}
@@ -37,8 +40,10 @@ export async function runClassicScript(
   handler: ClassicCommandHandler,
   argv: readonly string[] = process.argv.slice(2),
 ): Promise<number> {
-  const json = argv.includes('--json');
-  const args = argv.filter((argument) => argument !== '--json');
+  const boundary = argv.indexOf('--');
+  const owns = (index: number) => boundary < 0 || index < boundary;
+  const json = argv.some((arg, index) => owns(index) && arg === '--json');
+  const args = argv.filter((argument, index) => !owns(index) || argument !== '--json');
   let result: ClassicCommandResult;
   try {
     const help = classicCommandHelp(command, args);
@@ -47,6 +52,7 @@ export async function runClassicScript(
     result = {
       exitCode: 70,
       stderr: error instanceof Error ? error.message : String(error),
+      data: { issues: [classicIssue(error)] },
     };
   }
 

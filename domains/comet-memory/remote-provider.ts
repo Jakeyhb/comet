@@ -6,6 +6,10 @@ import type {
   MemoryCorrection,
   MemoryApplicationFeedback,
   MemoryInput,
+  MemoryLearningCheckKind,
+  MemoryLearningCheckContext,
+  MemoryLearningStatus,
+  MemoryObservationResultKind,
   MemoryManagementRecord,
   MemoryManagementView,
   MemoryManifestView,
@@ -31,6 +35,7 @@ import { runBoundedHttpRequest } from '../../platform/http/bounded-request.js';
 
 const MAX_REMOTE_RESPONSE_BYTES = 1024 * 1024;
 const MAX_REMOTE_REQUEST_BYTES = 512 * 1024;
+const MAX_LEARNING_REASON_CHARS = 240;
 
 export interface RemotePersonalMemoryServiceOptions extends Partial<
   Pick<MemoryProviderConfig, 'profileCharLimit' | 'taskContextCharLimit'>
@@ -64,9 +69,9 @@ export class RemotePersonalMemoryService
   }
 
   public async status(): Promise<PersonalMemoryStatus> {
-    return {
-      learningEnabled: true,
-      retrievalEnabled: true,
+    const base: PersonalMemoryStatus = {
+      learningEnabled: undefined,
+      retrievalEnabled: undefined,
       pausedProjects: [],
       pausedLearningProjects: [],
       pausedRetrievalProjects: [],
@@ -82,6 +87,26 @@ export class RemotePersonalMemoryService
         timeoutMs: this.timeoutMs,
       },
     };
+    try {
+      const result = await this.request<unknown>('status', {
+        projectKey: this.projectKey,
+      });
+      return { ...base, ...normalizeRemoteStatus(result) };
+    } catch (error) {
+      const reason = `Remote learning status unavailable: ${errorMessage(error)}`;
+      return {
+        ...base,
+        availability: 'unavailable',
+        availabilityReason: reason,
+        learningAvailability: 'unavailable',
+        learningAvailabilityReason: reason,
+        sync: {
+          status: 'failed',
+          retryable: true,
+          message: reason,
+        },
+      };
+    }
   }
 
   public async query(request: MemoryProviderQuery): Promise<MemoryProviderQueryResult> {
@@ -173,6 +198,27 @@ export class RemotePersonalMemoryService
       input: observation,
     });
     return normalizeObservationResult(result, this.projectKey);
+  }
+
+  public async markLearningCheck(
+    check: MemoryLearningCheckKind,
+    result?: MemoryObservationResultKind,
+    context?: MemoryLearningCheckContext,
+    reason?: string,
+  ): Promise<MemoryLearningStatus | void> {
+    const response = await this.request<unknown>('apply', {
+      operation: 'learning-check',
+      input: {
+        check,
+        ...(result === undefined ? {} : { result }),
+        ...(context === undefined ? {} : { context }),
+        ...(reason === undefined ? {} : { reason }),
+      },
+      ...(this.projectKey === undefined ? {} : { projectKey: this.projectKey }),
+    });
+    normalizeAcknowledgement(response);
+    if (isRecord(response) && isRecord(response.learning)) return normalizeLearningStatus(response);
+    return;
   }
 
   public async reviewAndApply(
@@ -331,6 +377,117 @@ function normalizeMutationResult(
   }
 }
 
+function normalizeLearningStatus(value: unknown): MemoryLearningStatus {
+  if (!isRecord(value) || !isRecord(value.learning)) {
+    throw new Error('Remote Provider returned no learning status');
+  }
+  const learning = value.learning;
+  const lastCheck = learning.lastCheck;
+  const lastResult = learning.lastResult;
+  if (
+    (lastCheck !== undefined &&
+      lastCheck !== 'submitted' &&
+      lastCheck !== 'no-observation' &&
+      lastCheck !== 'not-run') ||
+    (lastResult !== undefined && !isObservationResultKind(lastResult)) ||
+    (learning.lastReason !== undefined && typeof learning.lastReason !== 'string') ||
+    typeof learning.observedCount !== 'number' ||
+    typeof learning.validObservationCount !== 'number'
+  ) {
+    throw new Error('Remote Provider returned an invalid learning status');
+  }
+  return {
+    ...(typeof learning.lastCheckedAt === 'string'
+      ? { lastCheckedAt: learning.lastCheckedAt }
+      : {}),
+    ...(lastCheck === undefined ? {} : { lastCheck }),
+    ...(lastResult === undefined ? {} : { lastResult }),
+    ...(learning.lastReason === undefined
+      ? {}
+      : { lastReason: normalizeLearningReason(learning.lastReason) }),
+    ...(typeof learning.lastProjectKey === 'string'
+      ? { lastProjectKey: learning.lastProjectKey }
+      : {}),
+    ...(typeof learning.lastWorkflow === 'string' ? { lastWorkflow: learning.lastWorkflow } : {}),
+    ...(typeof learning.lastChangeId === 'string' ? { lastChangeId: learning.lastChangeId } : {}),
+    ...(typeof learning.submissionVerified === 'boolean'
+      ? { submissionVerified: learning.submissionVerified }
+      : {}),
+    observedCount: learning.observedCount,
+    validObservationCount: learning.validObservationCount,
+  };
+}
+
+function normalizeRemoteStatus(value: unknown): Pick<
+  PersonalMemoryStatus,
+  | 'availability'
+  | 'learningEnabled'
+  | 'retrievalEnabled'
+  | 'pausedProjects'
+  | 'pausedLearningProjects'
+  | 'pausedRetrievalProjects'
+> & {
+  readonly learning?: MemoryLearningStatus;
+  readonly learningAvailability: 'available' | 'unavailable';
+  readonly learningAvailabilityReason?: string;
+} {
+  if (!isRecord(value)) throw new Error('Remote Provider returned an invalid status');
+  const settings = isRecord(value.settings) ? value.settings : undefined;
+  const capabilities = isRecord(value.capabilities) ? value.capabilities : undefined;
+  const sources = [value, settings, capabilities].filter(
+    (entry): entry is Record<string, unknown> => entry !== undefined,
+  );
+  const readBoolean = (key: string): boolean | undefined => {
+    const source = sources.find((entry) => entry[key] !== undefined);
+    if (source === undefined) return undefined;
+    if (typeof source[key] !== 'boolean') {
+      throw new Error(`Remote Provider returned an invalid ${key} capability`);
+    }
+    return source[key] as boolean;
+  };
+  const readStringArray = (key: string): string[] | undefined => {
+    const source = sources.find((entry) => entry[key] !== undefined);
+    if (source === undefined) return undefined;
+    if (!stringArray(source[key])) {
+      throw new Error(`Remote Provider returned an invalid ${key} list`);
+    }
+    return [...(source[key] as string[])];
+  };
+  const learningEnabled = readBoolean('learningEnabled');
+  const retrievalEnabled = readBoolean('retrievalEnabled');
+  const pausedProjects = readStringArray('pausedProjects');
+  const pausedLearningProjects = readStringArray('pausedLearningProjects');
+  const pausedRetrievalProjects = readStringArray('pausedRetrievalProjects');
+  const capabilitiesStatus = {
+    availability: 'available' as const,
+    learningEnabled,
+    retrievalEnabled,
+    pausedProjects: pausedProjects ?? [],
+    pausedLearningProjects: pausedLearningProjects ?? [],
+    pausedRetrievalProjects: pausedRetrievalProjects ?? [],
+  };
+  try {
+    return {
+      ...capabilitiesStatus,
+      learningAvailability: 'available',
+      learning: normalizeLearningStatus(value),
+    };
+  } catch (error) {
+    return {
+      ...capabilitiesStatus,
+      learningAvailability: 'unavailable',
+      learningAvailabilityReason: `Remote learning diagnostics unavailable: ${errorMessage(error)}`,
+    };
+  }
+}
+
+function normalizeLearningReason(reason: string): string {
+  const normalized = reason.trim();
+  return normalized.length > MAX_LEARNING_REASON_CHARS
+    ? `${normalized.slice(0, MAX_LEARNING_REASON_CHARS - 1)}…`
+    : normalized;
+}
+
 function normalizeManifest(value: unknown, projectKey?: string): MemoryManifestView {
   if (!isRecord(value) || value.kind !== 'manifest' || !Array.isArray(value.items)) {
     throw new Error('Remote Provider returned an invalid memory manifest');
@@ -409,7 +566,19 @@ function normalizeObservationResult(value: unknown, projectKey?: string): Memory
       value.record === null || value.record === undefined
         ? null
         : normalizeMemoryRecord(value.record, projectKey, false),
+    ...(isObservationResultKind(value.result) ? { result: value.result } : {}),
   };
+}
+
+function isObservationResultKind(value: unknown): value is MemoryObservationResult['result'] {
+  return (
+    value === 'candidate-created' ||
+    value === 'candidate-promoted' ||
+    value === 'deduplicated' ||
+    value === 'ignored' ||
+    value === 'skipped' ||
+    value === 'deferred'
+  );
 }
 
 function normalizeReviewResult(value: unknown, projectKey?: string): MemoryReviewResult {
@@ -420,6 +589,7 @@ function normalizeReviewResult(value: unknown, projectKey?: string): MemoryRevie
       value.action !== 'forget' &&
       value.action !== 'skip') ||
     typeof value.persisted !== 'boolean' ||
+    (value.deferred !== undefined && typeof value.deferred !== 'boolean') ||
     (value.reason !== undefined && typeof value.reason !== 'string') ||
     (value.notification !== undefined && typeof value.notification !== 'string') ||
     (value.observation !== undefined && !isRecord(value.observation)) ||
@@ -431,6 +601,7 @@ function normalizeReviewResult(value: unknown, projectKey?: string): MemoryRevie
   return {
     action: value.action,
     persisted: value.persisted,
+    ...(value.deferred === undefined ? {} : { deferred: value.deferred }),
     ...(value.reason === undefined ? {} : { reason: value.reason }),
     ...(value.notification === undefined ? {} : { notification: value.notification }),
     ...(value.observation === undefined
@@ -682,4 +853,8 @@ function redactEndpoint(value: string): string {
   } catch {
     return value.replace(/(\/\/)[^/@]+@/u, '$1***@');
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

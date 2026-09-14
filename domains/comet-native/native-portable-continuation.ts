@@ -12,6 +12,8 @@ type NativePortableContinuationInputOption = {
   required: boolean;
   template: unknown | null;
   choices?: string[];
+  exclusiveGroup?: string;
+  description?: string;
 };
 
 type NativePortableCommandAlternative = {
@@ -25,7 +27,13 @@ type NativePortableCommandAlternative = {
 };
 
 export interface NativePortableRunnerAction {
-  kind: 'builder-handoff' | 'dispatch-verifier' | 'await-verifier' | 'retry-verifier' | 'none';
+  kind:
+    | 'builder-handoff'
+    | 'dispatch-verifier'
+    | 'retry-checks'
+    | 'await-verifier'
+    | 'retry-verifier'
+    | 'none';
   candidateId: string | null;
   iteration: number;
   attempt: number;
@@ -58,6 +66,7 @@ export interface NativePortableContinuation {
     | 'advance-parent'
     | 'builder-handoff'
     | 'dispatch-verifier'
+    | 'retry-checks'
     | 'await-verifier'
     | 'repair'
     | 'retry-verifier'
@@ -74,6 +83,9 @@ export interface NativePortableContinuation {
 export type NativePortableArchiveContinuationMode = 'archive-ready' | 'preview' | 'blocked';
 
 export interface NativePortableContinuationOptions {
+  verifierExecutionRef?: string;
+  retryCheckIds?: readonly string[];
+  supervisorIntegrationRetryIds?: readonly string[];
   archiveMode?: NativePortableArchiveContinuationMode;
   archiveBlockers?: readonly string[];
 }
@@ -157,8 +169,8 @@ function nativePortableUserCommunication(
     return noUserUpdate(
       localized(
         state,
-        'Wait only while the dispatched Verifier task is still active. If the task did not start, failed, timed out, ended without a response, or was lost, immediately submit verifier-execution-error. Submit verifier-unavailable only when the current platform truly has no usable subagent capability. Do not ask the user to recover files or processes, and do not expose attempt or requestCheckRounds.',
-        '仅在已派发的独立验收任务仍在运行时等待。如果任务未启动、执行失败、超时、结束后没有返回结果或已经丢失，立即提交 verifier-execution-error；只有当前平台确实没有可用的 subagent 能力时才提交 verifier-unavailable。不要让用户恢复文件或进程，也不要向用户展示 attempt、requestCheckRounds 等机器状态。',
+        'Keep the same dispatched Verifier while it is active. A wait-tool timeout is not an execution timeout: check task progress and continue waiting; do not cancel, interrupt, or spawn a replacement just because a wait returned without a result. Request progress without telling the Verifier to stop inspecting. Only after confirmed task failure, a host-reported execution timeout, loss, or termination without a usable result, immediately submit verifier-execution-error. Preserve completed evidence and explain the failure and changed recovery approach before retrying. Submit verifier-unavailable only when the current platform truly has no usable subagent capability. Forward the actual report, including risks and incomplete checks; never turn an uninspected candidate into pass. Do not ask the user to recover files or processes, and do not expose attempt or requestCheckRounds.',
+        '已派发的验收任务仍在运行时，继续使用同一个 Verifier。等待工具超时不等于执行超时：检查任务进度并继续等待，不得仅因一次等待没有结果就取消、中断或重新派发。询问进度时不要要求停止核查。仅在确认任务失败、宿主报告执行超时、任务丢失或结束后没有可用结果时，立即提交 verifier-execution-error；保留已完成证据，重试前说明失败原因及恢复方式的变化。只有当前平台确实没有可用的 subagent 能力时才提交 verifier-unavailable。忠实传递原始报告，包括风险和未完成检查；没有核查当前候选不能判定通过。不要让用户恢复文件或进程，也不要向用户展示 attempt、requestCheckRounds 等机器状态。',
       ),
     );
   }
@@ -287,6 +299,16 @@ function nativePortableUserCommunication(
         '简要说明交付结果和验收证据，转述 message，并等待用户明确选择后再执行对应的 commandAlternative。不要替用户接受结果。',
       ),
     };
+  }
+
+  if (state.phase === 'build' && state.status === 'active') {
+    return noUserUpdate(
+      localized(
+        state,
+        'Implement the confirmed scope and run focused checks. A separate pre-review is optional, not a prerequisite for Builder handoff. If review is useful, retain the same Reviewer for focused repair follow-ups rather than starting repeated full reviews. Submit the stable candidate for one complete independent verification; release completed helper tasks.',
+        '实现已确认范围并运行相关检查。额外预审是可选项，不是 Builder 交接的前置条件。确有必要审查时，保留同一个 Reviewer 复核修复及受影响范围，避免反复启动完整审查。候选稳定后提交一次完整独立验收，及时释放已完成的辅助任务。',
+      ),
+    );
   }
 
   return noUserUpdate(
@@ -502,6 +524,33 @@ function nativeNextRevisionAlternatives(options: {
       confirmationInput: 'user-decision',
     }),
   ];
+}
+
+function individualRunnerInputs(
+  options: NativePortableContinuationInputOption[],
+): NativePortableContinuationInputOption[] {
+  const descriptions: Record<string, string> = {
+    'request-checks': 'Choose when the Verifier needs additional Runtime checks.',
+    'final-result': 'Choose when the Verifier has a result for every current scope ID.',
+    'verifier-execution-error':
+      'Choose when a dispatched Verifier failed, was lost, or ended without a result.',
+    'verifier-unavailable':
+      'Choose only when the platform has no usable independent Verifier capability.',
+  };
+  return options.flatMap((option) => {
+    if (!Array.isArray(option.template)) return [option];
+    return option.template.map((template: { kind: string; response?: { kind: string } }) => {
+      const name = template.response?.kind ?? template.kind;
+      return {
+        ...option,
+        name,
+        required: false,
+        exclusiveGroup: 'runner-input',
+        description: descriptions[name],
+        template,
+      };
+    });
+  });
 }
 
 export function nativePortableContinuation(
@@ -793,11 +842,6 @@ export function nativePortableContinuation(
                 addressed_acceptance_ids: ['<acceptance-id>'],
                 checks: [{ name: '<check-name>', result: 'not-run', note: null }],
                 known_limits: [],
-                review: {
-                  status: 'passed',
-                  summary: '<review-summary>',
-                  reviewer_execution_ref: '<reviewer-execution-ref>',
-                },
               },
             },
           ],
@@ -806,6 +850,7 @@ export function nativePortableContinuation(
       }
       const verified = children.children.find(({ status }) => status === 'verified');
       if (verified) {
+        const retryCheckIds = options.supervisorIntegrationRetryIds;
         return {
           ...base,
           disposition: 'continue',
@@ -839,6 +884,9 @@ export function nativePortableContinuation(
                     repeatable: true,
                   },
                 ],
+                ...(retryCheckIds && retryCheckIds.length > 0
+                  ? { retry_check_ids: [...retryCheckIds] }
+                  : {}),
               },
             },
           ],
@@ -894,11 +942,6 @@ export function nativePortableContinuation(
             addressed_acceptance_ids: ['<acceptance-id>'],
             checks: [{ name: '<check-name>', result: 'not-run', note: null }],
             known_limits: [],
-            review: {
-              status: 'passed',
-              summary: '<review-summary>',
-              reviewer_execution_ref: '<reviewer-execution-ref>',
-            },
           },
         },
       ],
@@ -917,6 +960,35 @@ export function nativePortableContinuation(
       timeoutMs: 120000,
       repeatable: true,
     };
+    if (!awaiting && options.retryCheckIds && options.retryCheckIds.length > 0) {
+      return {
+        ...base,
+        disposition: 'continue',
+        action: 'retry-checks',
+        commandArgs: [
+          'comet',
+          'native',
+          'next',
+          state.name,
+          '--runner-input',
+          '<temporary-json-file>',
+        ],
+        requiredInputs: ['retry-checks-json-file'],
+        inputOptions: [
+          {
+            name: 'runner-input',
+            flag: '--runner-input',
+            valueKind: 'json-file',
+            required: true,
+            template: {
+              kind: 'retry-checks',
+              check_ids: [...options.retryCheckIds],
+            },
+          },
+        ],
+        runnerAction: runner('retry-checks'),
+      };
+    }
     return {
       ...base,
       userCommunication:
@@ -943,7 +1015,7 @@ export function nativePortableContinuation(
       requiredInputs: [
         awaiting ? 'verifier-response-or-error-json-file' : 'resolved-check-plan-json-file',
       ],
-      inputOptions: [
+      inputOptions: individualRunnerInputs([
         {
           name: 'runner-input',
           flag: '--runner-input',
@@ -953,6 +1025,8 @@ export function nativePortableContinuation(
             ? [
                 {
                   kind: 'verifier-response',
+                  candidateId: state.builder_handoff?.candidate_id ?? '<candidate-id>',
+                  verifierExecutionRef: options.verifierExecutionRef ?? '<from verifierDispatch>',
                   response: {
                     kind: 'request-checks',
                     iteration: state.loop.iteration,
@@ -962,16 +1036,18 @@ export function nativePortableContinuation(
                 },
                 {
                   kind: 'verifier-response',
+                  candidateId: state.builder_handoff?.candidate_id ?? '<candidate-id>',
+                  verifierExecutionRef: options.verifierExecutionRef ?? '<from verifierDispatch>',
                   response: {
                     kind: 'final-result',
                     result: {
                       iteration: state.loop.iteration,
                       attempt: state.loop.attempt,
-                      verdict: '<pass|fail|blocked>',
+                      verdict: 'blocked',
                       acceptance: [
                         {
                           id: '<acceptance-id>',
-                          result: '<passed|failed|blocked>',
+                          result: 'blocked',
                           reason: '<reason>',
                         },
                       ],
@@ -986,7 +1062,7 @@ export function nativePortableContinuation(
                   stateVersion: state.state_version,
                   iteration: state.loop.iteration,
                   attempt: state.loop.attempt,
-                  verifierExecutionRef: '<from verifierDispatch>',
+                  verifierExecutionRef: options.verifierExecutionRef ?? '<from verifierDispatch>',
                 },
                 {
                   kind: 'verifier-unavailable',
@@ -994,12 +1070,12 @@ export function nativePortableContinuation(
                   stateVersion: state.state_version,
                   iteration: state.loop.iteration,
                   attempt: state.loop.attempt,
-                  verifierExecutionRef: '<from verifierDispatch>',
+                  verifierExecutionRef: options.verifierExecutionRef ?? '<from verifierDispatch>',
                 },
               ]
             : { kind: 'dispatch-verifier', checks: supervisor ? [checkTemplate] : [] },
         },
-      ],
+      ]),
       runnerAction: runner(awaiting ? 'await-verifier' : 'dispatch-verifier'),
     };
   }

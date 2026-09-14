@@ -9,7 +9,7 @@ import { COMET_TAGLINE } from './comet-banner.js';
 
 // The public Classic facade commands are stable names inlined here to avoid
 // importing the Classic CLI graph at module load time.
-const PUBLIC_CLASSIC_COMMANDS = ['state', 'guard', 'handoff', 'archive'] as const;
+const PUBLIC_CLASSIC_COMMANDS = ['state', 'guard', 'handoff', 'archive', 'check'] as const;
 type PublicClassicCommand = (typeof PUBLIC_CLASSIC_COMMANDS)[number];
 
 const program = new Command();
@@ -88,6 +88,13 @@ program
     ]),
   )
   .option('--complete', '记录成功任务')
+  .addOption(
+    new Option('--learning-check <state>', '任务结束时个人记忆学习检查结果').choices([
+      'submitted',
+      'no-observation',
+      'not-run',
+    ]),
+  )
   .option('--workflow <workflow>', '工作流类型')
   .option('--change <id>', '当前 change ID')
   .option('--json', 'Output as JSON')
@@ -444,7 +451,10 @@ program
   )
   .addOption(new Option('--scope <scope>', 'Install scope').choices(['global', 'project']))
   .option('--all-projects', 'Update all indexed project-scope Comet installs')
-  .option('--current-project', 'Update only the current project')
+  .option(
+    '--current-project',
+    'Refresh only this project; the Comet npm package is also updated by default',
+  )
   .option(
     '--self-update',
     'Update the Comet npm package and installed Classic dependencies before refreshing project assets',
@@ -511,9 +521,10 @@ program
 
 const classicDescriptions: Record<PublicClassicCommand, string> = {
   state: 'Read and update Classic workflow state',
-  guard: 'Check Classic workflow phase guards',
+  guard: 'Validate Classic phase requirements (may execute checks); --apply advances',
   handoff: 'Create and inspect Classic workflow handoffs',
   archive: 'Archive completed Classic workflow changes',
+  check: 'Execute and record Classic build or verification checks',
 };
 
 for (const command of PUBLIC_CLASSIC_COMMANDS) {
@@ -954,6 +965,13 @@ function classicGroupArgs(argv: readonly string[]): string[] | null {
 
 async function runCli(): Promise<void> {
   try {
+    // Check owns every argument after --, including flags Commander would consume.
+    const raw = process.argv.slice(process.argv[2] === '--' ? 3 : 2);
+    if (raw[0] === 'check') {
+      const { runClassicFacade } = await import('../commands/classic.js');
+      process.exitCode = await runClassicFacade('check', raw.slice(1));
+      return;
+    }
     const classicArgs = classicGroupArgs(process.argv);
     if (classicArgs) {
       const { runClassicGroupFacade } = await import('../commands/classic.js');

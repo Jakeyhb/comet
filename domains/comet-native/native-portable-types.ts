@@ -27,6 +27,10 @@ export interface NativePortableSpecChange {
   capability: string;
   operation: 'create' | 'modify' | 'remove';
   source: string | null;
+  /** Optional v1 delta manifest for cumulative capability Specs. */
+  delta_source?: string;
+  /** The canonical total-Spec hash bound by the delta manifest at Shape. */
+  base_hash?: string | null;
 }
 
 export interface NativePortableWorkspace {
@@ -178,10 +182,16 @@ export interface NativeLocalExecutionState {
   schema: typeof NATIVE_LOCAL_EXECUTION_SCHEMA;
   change: string;
   basedOnStateVersion: number;
+  /** Candidate identity is local evidence metadata; absent on legacy overlays. */
+  candidateId?: string | null;
+  /** Fingerprint of the candidate, workspace inputs and tool environment. */
+  inputFingerprint?: string | null;
   workspace: {
     projectRoot: string;
     worktreeRoot: string;
     branch: string | null;
+    /** Host binding is required before a completed check can be reused. */
+    machineId?: string;
   };
   execution: null | {
     operationId: string;
@@ -209,6 +219,10 @@ export interface NativeLocalCheckState {
   startedAt: string | null;
   completedAt: string | null;
   log: string;
+  /** Set only by the Runtime after a real process completion. */
+  evidence?: 'runtime';
+  /** Digest tying the Runtime result fields to the captured log content. */
+  evidenceDigest?: string;
 }
 
 export function emptyNativePortableHistoryOverflow(): NativePortableHistoryOverflow {

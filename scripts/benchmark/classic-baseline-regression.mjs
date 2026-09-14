@@ -299,9 +299,7 @@ async function fakeOpenSpec(directory) {
     ].join('\n'),
   );
   if (process.platform === 'win32') {
-    const command = path.join(directory, 'fake-openspec.cmd');
-    await fs.writeFile(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
-    return command;
+    return script;
   }
   const command = path.join(directory, 'fake-openspec');
   await fs.writeFile(command, `#!/usr/bin/env node\nimport ${JSON.stringify(script)};\n`, {
@@ -315,6 +313,10 @@ async function archiveRecoveryScenario(workspace) {
   const startedAt = Date.now();
   const directory = await resetScenario(workspace, name);
   state(directory, 'init', name, 'full');
+  const changeDir = path.join(directory, 'openspec', 'changes', name);
+  await fs.writeFile(path.join(changeDir, 'proposal.md'), 'Archive recovery regression.\n');
+  await fs.writeFile(path.join(changeDir, 'design.md'), 'Exercise interrupted archive recovery.\n');
+  await fs.writeFile(path.join(changeDir, 'tasks.md'), '- [x] Verify archive recovery\n');
   state(directory, 'set', name, 'phase', 'archive');
   state(directory, 'set', name, 'verify_result', 'pass');
   state(directory, 'transition', name, 'archive-confirm');

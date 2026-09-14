@@ -294,17 +294,12 @@ export async function readNativeProposedSpecs(
 ): Promise<Record<string, string>> {
   const changeDir = nativeChangeDir(paths, name);
   const result: Record<string, string> = {};
-  let totalBytes = 0;
   for (const capability of await proposedCapabilities(paths, name)) {
     const source = await readNativeBoundedTextFile({
       root: changeDir,
       ref: `specs/${capability}/spec.md`,
-      maxBytes: NATIVE_CONTRACT_FILE_LIMITS.maxFileBytes,
+      maxBytes: null,
     });
-    totalBytes += source.size;
-    if (totalBytes > NATIVE_CONTRACT_FILE_LIMITS.maxTotalBytes) {
-      throw new Error('Native proposed specs exceed the total byte budget');
-    }
     result[capability] = source.text;
   }
   return result;

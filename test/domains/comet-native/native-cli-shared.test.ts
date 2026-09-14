@@ -153,9 +153,19 @@ describe('Native CLI shared helpers', () => {
 
     expect(success('ok', { value: 1 })).toMatchObject({ text: '{\n  "value": 1\n}\n' });
     expect(success('ok', { value: 1 }, 'done\n')).toMatchObject({ text: 'done\n' });
-    expect(render({ command: 'ok', exitCode: 0, data: { value: 1 } }, true)).toMatchObject({
+    const rendered = render({ command: 'ok', exitCode: 0, data: { value: 1 } }, true);
+    expect(rendered.exitCode).toBe(0);
+    expect(JSON.parse(rendered.stdout!)).toEqual({
+      command: 'ok',
       exitCode: 0,
-      stdout: '{"command":"ok","exitCode":0,"data":{"value":1}}\n',
+      data: { value: 1 },
+      agent: {
+        phase: null,
+        status: null,
+        stateVersion: null,
+        workspace: { cwd: null },
+        continuation: null,
+      },
     });
     expect(
       render(
@@ -170,5 +180,51 @@ describe('Native CLI shared helpers', () => {
       exitCode: 0,
       stdout: 'done\n',
     });
+  });
+
+  it('reports structured data visibility exactly as the public renderer exposes it', async () => {
+    const shared = (await import('../../../domains/comet-native/native-cli-shared.js')) as {
+      renderNativeCommandDetailed?: (
+        result: {
+          command: string;
+          exitCode: number;
+          data: unknown;
+          text?: string;
+          envelope?: { summary: string };
+        },
+        json: boolean,
+        verbose?: boolean,
+      ) => {
+        output: { exitCode: number; stdout?: string };
+        structuredDataVisible: boolean;
+      };
+    };
+    const data = { state: { phase: 'archive', verification_result: 'pass' } };
+
+    expect(
+      shared.renderNativeCommandDetailed?.(
+        { command: 'next', exitCode: 0, data, envelope: { summary: 'Complete.' } },
+        false,
+      ),
+    ).toEqual({ output: { exitCode: 0, stdout: 'Complete.\n' }, structuredDataVisible: false });
+    expect(
+      shared.renderNativeCommandDetailed?.(
+        { command: 'next', exitCode: 0, data, envelope: { summary: 'Complete.' } },
+        false,
+        true,
+      )?.structuredDataVisible,
+    ).toBe(false);
+    expect(
+      shared.renderNativeCommandDetailed?.(
+        { command: 'next', exitCode: 0, data, envelope: { summary: 'Complete.' } },
+        true,
+      )?.structuredDataVisible,
+    ).toBe(true);
+    expect(
+      shared.renderNativeCommandDetailed?.(
+        { command: 'status', exitCode: 0, data, text: `${JSON.stringify(data)}\n` },
+        false,
+      )?.structuredDataVisible,
+    ).toBe(true);
   });
 });

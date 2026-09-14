@@ -7,10 +7,15 @@ import {
   type NativePortableRecoveryResult,
 } from './native-portable-recovery.js';
 import { nativePortableStateSummary } from './native-portable-summary.js';
-import { applyNativeRunnerInput, readNativeRunnerInput } from './native-runner-input.js';
+import {
+  applyNativeRunnerInput,
+  readNativeRunnerInput,
+  validateNativeRunnerInputBoundary,
+} from './native-runner-input.js';
 import { NATIVE_SKILL_COORDINATION } from './native-runner-protocol.js';
 import {
   dispatchNativeSupervisorReadyTasks,
+  projectNativeSupervisorTask,
   readNativeSupervisorState,
 } from './native-supervisor.js';
 import {
@@ -38,6 +43,7 @@ import {
 import {
   assertNoArguments,
   configuredPaths,
+  errorResult,
   NativeUsageError,
   requiredPositional,
   success,
@@ -81,12 +87,23 @@ function expectedContinuationOption(
   };
 }
 
-async function portableParentView(paths: NativeProjectPaths, state: NativePortableState) {
+async function portableParentView(
+  paths: NativeProjectPaths,
+  state: NativePortableState,
+  verifierExecutionRef?: string,
+) {
   const children = await inspectNativeChildren({ paths, state });
   const supervisor = children?.confirmed
     ? await readNativeSupervisorState(paths, state.name, { diagnostics: true })
     : null;
   const activeTasks = supervisor?.children.flatMap(({ task }) => (task ? [task.child] : [])) ?? [];
+  const integrationExecution = supervisor?.integration.checkExecution;
+  const supervisorIntegrationRetryIds =
+    integrationExecution?.status === 'interrupted'
+      ? (integrationExecution.checkStates ?? [])
+          .filter(({ status }) => status === 'interrupted')
+          .map(({ id }) => id)
+      : undefined;
   return {
     ...(children
       ? {
@@ -97,7 +114,10 @@ async function portableParentView(paths: NativeProjectPaths, state: NativePortab
           readyChildren: activeTasks.length > 0 ? activeTasks : children.readyChildren,
         }
       : {}),
-    continuation: nativePortableContinuation(state, children),
+    continuation: nativePortableContinuation(state, children, {
+      verifierExecutionRef,
+      supervisorIntegrationRetryIds,
+    }),
   };
 }
 
@@ -124,6 +144,7 @@ export async function nativeNextCommand(
   const name = requiredPositional(args, 'change name');
   const summary = takeOption(args, '--summary');
   const runnerInputFile = takeOption(args, '--runner-input');
+  const validateOnly = takeFlag(args, '--validate-only');
   const confirmed = takeFlag(args, '--confirmed');
   const acceptResult = takeFlag(args, '--accept-result');
   const reviseImplementation = takeFlag(args, '--revise-implementation');
@@ -137,6 +158,9 @@ export async function nativeNextCommand(
     !(NATIVE_SUPERVISOR_COORDINATION_MODES as readonly string[]).includes(coordinationModeText)
   ) {
     throw new NativeUsageError('--coordination-mode must be multi-session or single-session');
+  }
+  if (validateOnly && runnerInputFile === undefined) {
+    throw new NativeUsageError('--validate-only requires --runner-input');
   }
   const maxParallelText = takeOption(args, '--max-parallel');
   const maxParallel = maxParallelText === undefined ? 2 : Number(maxParallelText);
@@ -197,39 +221,81 @@ export async function nativeNextCommand(
   }
 
   const initialState = await readNativePortableChange(configured.paths, name);
-  const initialWorkspaceMismatch = nativePortableWorkspaceMismatch(configured.paths, initialState);
-  if (initialWorkspaceMismatch) {
-    const continuation = nativePortableContinuation(initialState);
-    const instruction =
-      initialState.language === 'zh-CN'
-        ? `先恢复此需求绑定的工作区和分支，再运行 comet native status ${name} --json 获取下一步；当前操作未推进状态，不要重复请求验收确认。`
-        : `Restore the workspace and branch bound to this change, then run comet native status ${name} --json for the next action. No transition occurred; do not request acceptance again.`;
-    return success('next', {
-      state: nativePortableStateSummary(initialState, configured.paths),
-      ...(await portableParentView(configured.paths, initialState)),
-      recovery: {
-        action: 'await-user',
-        reason: 'workspace-mismatch',
-        message: initialWorkspaceMismatch,
-      },
-      continuation: {
-        ...continuation,
-        disposition: 'blocked',
-        requiresUserDecision: false,
-        action: 'repair',
-        commandArgs: null,
-        commandAlternatives: [],
-        requiredInputs: [],
-        inputOptions: [],
-        runnerAction: { ...continuation.runnerAction, kind: 'none' },
-        userCommunication: {
-          required: true,
-          message: `${initialWorkspaceMismatch}. ${instruction}`,
-          suggestedReply: null,
-          agentInstruction: instruction,
+  if (validateOnly) {
+    if (
+      summary ||
+      confirmed ||
+      acceptResult ||
+      reviseImplementation ||
+      reviseRequirements ||
+      retryVerifier ||
+      resolveVerifierBlocker ||
+      expectedContinuation ||
+      coordinationMode !== undefined
+    ) {
+      throw new NativeUsageError(
+        '--validate-only cannot be combined with --summary, continuation expectations, or coordination mode',
+      );
+    }
+    let input;
+    try {
+      input = await readNativeRunnerInput(runnerInputFile!, projectRoot);
+    } catch (error) {
+      return {
+        ...errorResult('next', error),
+        data: {
+          state: nativePortableStateSummary(initialState, configured.paths),
+          continuation: nativePortableContinuation(initialState),
         },
-      },
+      };
+    }
+    try {
+      await validateNativeRunnerInputBoundary({
+        paths: configured.paths,
+        name,
+        state: initialState,
+        input,
+        projectRoot,
+      });
+    } catch (error) {
+      return {
+        ...errorResult('next', error),
+        data: {
+          state: nativePortableStateSummary(initialState, configured.paths),
+          continuation: nativePortableContinuation(initialState),
+        },
+      };
+    }
+    return success('next', {
+      validation: { valid: true, kind: input.kind },
+      state: nativePortableStateSummary(initialState, configured.paths),
+      continuation: nativePortableContinuation(initialState),
     });
+  }
+  // Runner input must be rejected before recovery can mutate a confirmed
+  // change. Final verification recovery also runs before portable recovery and
+  // may repair state, so retain the preflight for those boundaries. Ordinary
+  // Shape/Build continuation is guarded by the authoritative lock-held
+  // recovery below, so do not inspect the same worktree twice.
+  const mustPreflightWorkspace =
+    runnerInputFile !== undefined ||
+    !summary ||
+    initialState.phase === 'verify' ||
+    initialState.phase === 'archive' ||
+    initialState.verification_result === 'pass';
+  if (mustPreflightWorkspace) {
+    const initialWorkspaceMismatch = nativePortableWorkspaceMismatch(
+      configured.paths,
+      initialState,
+    );
+    if (initialWorkspaceMismatch) {
+      return nativeWorkspaceMismatchResult(
+        configured.paths,
+        initialState,
+        name,
+        initialWorkspaceMismatch,
+      );
+    }
   }
 
   if (runnerInputFile) {
@@ -247,6 +313,27 @@ export async function nativeNextCommand(
       throw new NativeUsageError(
         '--runner-input cannot be combined with --summary, continuation expectations, or Agent transition flags',
       );
+    }
+    // Reject incompatible input before recovery can mutate the confirmed Shape
+    // or invalidate an active candidate. Application still rechecks its boundary.
+    let input;
+    try {
+      input = await readNativeRunnerInput(runnerInputFile, projectRoot);
+      await validateNativeRunnerInputBoundary({
+        paths: configured.paths,
+        name,
+        state: initialState,
+        input,
+        projectRoot,
+      });
+    } catch (error) {
+      return {
+        ...errorResult('next', error),
+        data: {
+          state: nativePortableStateSummary(initialState, configured.paths),
+          continuation: nativePortableContinuation(initialState),
+        },
+      };
     }
     const supervisorRecovery = await recoverNativeSupervisorFinalVerificationOnResume({
       paths: configured.paths,
@@ -299,7 +386,6 @@ export async function nativeNextCommand(
         );
       }
     }
-    const input = await readNativeRunnerInput(runnerInputFile, projectRoot);
     const result = await applyNativeRunnerInput({
       paths: configured.paths,
       name,
@@ -309,10 +395,15 @@ export async function nativeNextCommand(
     return success('next', {
       ...compactRunnerResult(result),
       state: nativePortableStateSummary(result.state, configured.paths),
-      ...(await portableParentView(configured.paths, result.state)),
+      ...(await portableParentView(
+        configured.paths,
+        result.state,
+        result.verifierDispatch?.verifierExecutionRef,
+      )),
       coordination: NATIVE_SKILL_COORDINATION,
     });
   }
+  if (!summary) throw new NativeUsageError('--summary is required');
   const supervisorRecovery = await recoverNativeSupervisorFinalVerificationOnResume({
     paths: configured.paths,
     name,
@@ -325,10 +416,12 @@ export async function nativeNextCommand(
   }
   const recovery = await recoverNativePortableChange({ paths: configured.paths, name });
   const current = recovery.state;
+  if (recovery.reason === 'workspace-mismatch') {
+    return nativeWorkspaceMismatchResult(configured.paths, current, name, recovery.message);
+  }
   if (coordinationMode !== undefined && current.phase !== 'shape') {
     throw new NativeUsageError('--coordination-mode is only valid when confirming Shape');
   }
-  if (!summary) throw new NativeUsageError('--summary is required');
   let state;
   let parentAdvance: Awaited<
     ReturnType<typeof inspectNativeSupervisorParentReviewReadiness>
@@ -454,7 +547,9 @@ export async function nativeNextCommand(
               parent: name,
               maxParallel: current.coordination_mode === 'single-session' ? 1 : maxParallel,
             });
-            supervisorTasks = dispatched.state.children.flatMap(({ task }) => (task ? [task] : []));
+            supervisorTasks = dispatched.state.children.flatMap(({ task }) =>
+              task ? [projectNativeSupervisorTask(task, name, configured.paths.projectRoot)] : [],
+            );
             readySupervisorChildren = dispatched.tasks.map(({ child }) => child);
             supervisorBlockers = dispatched.state.children.flatMap(({ name: child, blocker }) =>
               blocker ? [{ child, message: blocker }] : [],
@@ -534,5 +629,44 @@ export async function nativeNextCommand(
     state: nativePortableStateSummary(state, configured.paths),
     ...(coordinationMode === undefined ? {} : { coordinationMode }),
     ...(await portableParentView(configured.paths, state)),
+  });
+}
+
+async function nativeWorkspaceMismatchResult(
+  paths: NativeProjectPaths,
+  state: NativePortableState,
+  name: string,
+  message: string,
+): Promise<DispatchResult> {
+  const continuation = nativePortableContinuation(state);
+  const instruction =
+    state.language === 'zh-CN'
+      ? `先恢复此需求绑定的工作区和分支，再运行 comet native status ${name} --json 获取下一步；当前操作未推进状态，不要重复请求验收确认。`
+      : `Restore the workspace and branch bound to this change, then run comet native status ${name} --json for the next action. No transition occurred; do not request acceptance again.`;
+  return success('next', {
+    state: nativePortableStateSummary(state, paths),
+    ...(await portableParentView(paths, state)),
+    recovery: {
+      action: 'await-user',
+      reason: 'workspace-mismatch',
+      message,
+    },
+    continuation: {
+      ...continuation,
+      disposition: 'blocked',
+      requiresUserDecision: false,
+      action: 'repair',
+      commandArgs: null,
+      commandAlternatives: [],
+      requiredInputs: [],
+      inputOptions: [],
+      runnerAction: { ...continuation.runnerAction, kind: 'none' },
+      userCommunication: {
+        required: true,
+        message: `${message}. ${instruction}`,
+        suggestedReply: null,
+        agentInstruction: instruction,
+      },
+    },
   });
 }

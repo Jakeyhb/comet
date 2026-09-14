@@ -17,6 +17,28 @@ describe('ordinary Comet task host', () => {
     vi.clearAllMocks();
   });
 
+  it('shares identity during the task request and refreshes it on the next invocation', async () => {
+    const { resolveProjectName, resolveStableProjectId } =
+      await import('../../platform/paths/project-identity.js');
+    const { cometTaskCommand } = await import('../../app/commands/comet-task.js');
+    let remote = 'https://example.com/first.git';
+    const runGit = vi.fn(() => remote);
+    const identities: string[] = [];
+    collectCometPluginContext.mockImplementation(async (root: string) => {
+      identities.push(resolveStableProjectId(root, { runGit }));
+      await Promise.resolve();
+      expect(resolveProjectName(root, { runGit })).toBe(
+        remote.includes('first') ? 'first' : 'second',
+      );
+      return [];
+    });
+    await cometTaskCommand('D:/repo', { task: 'Inspect the project' });
+    remote = 'https://example.com/second.git';
+    await cometTaskCommand('D:/repo', { task: 'Inspect the project' });
+    expect(identities[0]).not.toBe(identities[1]);
+    expect(runGit).toHaveBeenCalledTimes(2);
+  });
+
   it('records a completion checkpoint without selecting fresh context', async () => {
     collectCometPluginContext.mockResolvedValue([
       { pluginId: 'comet.personal-memory', text: '使用中文' },
@@ -40,11 +62,51 @@ describe('ordinary Comet task host', () => {
         workflow: 'native',
         changeId: 'change-1',
         command: 'task',
+        learningCheck: 'not-run',
       }),
     );
     expect(recordCometWorkflowResult.mock.calls[0]?.[0]).not.toHaveProperty('summary');
     expect(recordCometWorkflowResult.mock.calls[0]?.[0]).not.toHaveProperty('userEvidence');
     expect(result.context).toEqual([]);
+  });
+
+  it('records an explicit task-end learning check in the completion checkpoint', async () => {
+    const { cometTaskCommand } = await import('../../app/commands/comet-task.js');
+    recordCometWorkflowResult.mockResolvedValueOnce({ submissionVerified: false });
+    const first = await cometTaskCommand('D:/repo', {
+      task: '完成变更',
+      complete: true,
+      workflow: 'native',
+      change: 'change-learning-check',
+      learningCheck: 'submitted',
+      json: true,
+    });
+    expect(first.learningCheckVerified).toBe(false);
+
+    await cometTaskCommand('D:/repo', {
+      task: '完成变更',
+      complete: true,
+      workflow: 'native',
+      change: 'change-learning-check',
+      learningCheck: 'no-observation',
+      json: true,
+    });
+
+    expect(recordCometWorkflowResult).toHaveBeenCalledWith(
+      expect.objectContaining({ learningCheck: 'no-observation' }),
+    );
+    expect(
+      (
+        await cometTaskCommand('D:/repo', {
+          task: '完成变更',
+          complete: true,
+          workflow: 'native',
+          change: 'change-learning-check-2',
+          learningCheck: 'no-observation',
+          json: true,
+        })
+      ).learningCheck,
+    ).toBe('no-observation');
   });
 
   it('uses the shared progressive expansion and application outcome interfaces', async () => {

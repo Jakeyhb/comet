@@ -75,10 +75,12 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
   },
   new: {
     usage:
-      'comet native new <change-name> [--language en|zh-CN] [--isolation current|branch|worktree] [--change-branch <branch>] [--target-branch <branch>] [--worktree-path <path>]',
+      'comet native new <change-name> [--language en|zh-CN] [--task <text>] [--capability <id>] [--isolation current|branch|worktree] [--change-branch <branch>] [--target-branch <branch>] [--worktree-path <path>]',
     purpose: 'Create a portable Native change and prepare the requested branch or linked worktree.',
     options: [
       '--language en|zh-CN          Artifact language; defaults to project configuration.',
+      '--task <text>                Search Project Knowledge for an existing capability and save a revocable association draft.',
+      '--capability <id>            Directly validate and associate an existing capability without retrieval.',
       '--isolation <kind>           current, branch, or worktree; defaults to current.',
       '--change-branch <branch>     Change branch; defaults to comet/<change-name>.',
       '--target-branch <branch>     Local base branch; defaults to the current branch.',
@@ -88,6 +90,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       'The portable state, workspace preparation result, and continuation with the next Runner action.',
     examples: [
       'comet native new session-timeout --language zh-CN',
+      'comet native new add-sms-login --task "add SMS login to authentication"',
       'comet native new session-timeout --isolation branch --target-branch main',
       'comet native new session-timeout --isolation worktree --target-branch main',
     ],
@@ -152,7 +155,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
   },
   next: {
     usage:
-      'comet native next <change-name> --summary <text> [--coordination-mode multi-session|single-session] [--max-parallel <n>] [--expected-state-version <n>] [--expected-action <action>]\n       comet native next <change-name> --summary <text> [--confirmed|--accept-result|--revise-implementation|--revise-requirements|--retry-verifier|--resolve-verifier-blocker] [--expected-state-version <n>] [--expected-action <action>]\n       comet native next <change-name> --runner-input <json-file>',
+      'comet native next <change-name> --summary <text> [--coordination-mode multi-session|single-session] [--max-parallel <n>] [--expected-state-version <n>] [--expected-action <action>]\n       comet native next <change-name> --summary <text> [--confirmed|--accept-result|--revise-implementation|--revise-requirements|--retry-verifier|--resolve-verifier-blocker] [--expected-state-version <n>] [--expected-action <action>]\n       comet native next <change-name> --runner-input <json-file> [--validate-only]',
     purpose:
       'Confirm or recover an Agent boundary, advance parent child changes, handle Supervisor task operations, or use one skill-coordinated JSON bridge for Builder handoff, check-plan dispatch, and Verifier response/error.',
     options: [
@@ -167,14 +170,17 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       '--max-parallel <n>  Supervisor task concurrency cap; defaults to 2, use 1 for serial fallback.',
       '--expected-state-version <n>  Continuation-issued guard that rejects stale public transition decisions.',
       '--expected-action <action>    Continuation-issued guard that binds the public transition decision to its intended action.',
-      '--runner-input <file>  Skill-coordinated JSON: builder-handoff, dispatch-verifier, verifier-response, verifier-execution-error, or verifier-unavailable. Identity/provider/execution/candidate fields are rejected.',
-      '  builder-handoff fields: kind, summary, addressed_acceptance_ids, checks, known_limits, review. review fields: status=passed, summary, reviewer_execution_ref from a separate read-only review.',
+      '--runner-input <file>  Skill-coordinated JSON: builder-handoff, dispatch-verifier, retry-checks, verifier-response, verifier-execution-error, or verifier-unavailable. Builder/dispatch identity fields are rejected; verifier responses must echo the current candidateId and verifierExecutionRef from the Verifier dispatch.',
+      '--validate-only       Validate the Runner JSON shape and current boundary without writing state or starting a process; requires --runner-input.',
+      '  Choose one object template from an inputOptions exclusiveGroup and save it as UTF-8 JSON (BOM accepted). Field errors return issues with JSON pointer, missingFields and unknownFields. Execute agent.continuation in agent.workspace.cwd; Supervisor results use task.returnAction.',
+      '  builder-handoff fields: kind, summary, addressed_acceptance_ids, checks, known_limits, optional review. If review is supplied, its fields are status=passed, summary, reviewer_execution_ref from a separate read-only review.',
       '  dispatch-verifier fields: kind, checks (an explicitly resolved plan; [] is allowed).',
-      '  verifier-response fields: kind, response (request-checks or final-result).',
+      '  retry-checks fields: kind, check_ids for repeatable interrupted Runtime checks from the current candidate; each check can be retried at most three times.',
+      '  verifier-response fields: kind, candidateId, verifierExecutionRef, response (request-checks or final-result); copy the two binding fields from the current continuation.',
       '  verifier-execution-error fields: kind, summary, stateVersion, iteration, attempt, verifierExecutionRef copied from verifierDispatch.',
       '  verifier-unavailable fields: kind, summary, stateVersion, iteration, attempt, verifierExecutionRef copied from verifierDispatch; accepted only after the explicit Runtime check plan completed and passed.',
       '  Supervisor task fields: supervisor-builder-result (child, runId, candidateCommit), supervisor-builder-failure (child, runId, reason), supervisor-verifier-result (child, runId, verdict, verification data), supervisor-reconnect (child, runId), supervisor-cancel (child, runId, reason), or supervisor-integrate (child, checks).',
-      '  supervisor-checks fields: kind, child, runId, checks (non-empty repeatable Runtime check plans), materials [{name,content}]. Returns checkExecution with operationId, status and receiptRef. Repeated running plans return the same handle.',
+      '  supervisor-checks fields: kind, child, runId, checks (non-empty repeatable Runtime check plans), materials [{name,content}], and optional retry_check_ids for interrupted checks from the same candidate, machine and workspace. Returns per-check execution state plus operationId, status and receiptRef. Repeated running plans return the same handle.',
       '  supervisor-verifier-result evidence fields: summary, checks (informal notes), acceptance [{id,result,reason}], receiptRef. verdict is pass, fail or blocked; every task acceptance ID must appear exactly once. Runtime receipts determine formal check status; receiptRef may be null for fail or blocked.',
       '  supervisor-integrate checks are non-empty Runtime check plans executed after the merge in the integration worktree, not declared statuses.',
     ],

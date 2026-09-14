@@ -1,4 +1,7 @@
+import { assertNativeInputKeys as exactKeys } from './native-input-error.js';
+import { stripUtf8Bom } from '../../platform/fs/strip-bom.js';
 import { nativeWorkspaceIsClean } from './native-workspace-config.js';
+import { inspectNativeChildren } from './native-children.js';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -6,18 +9,23 @@ import path from 'node:path';
 import { runGitCommand } from '../../platform/process/git.js';
 import { inspectGitWorktree } from '../../platform/paths/git-worktree.js';
 
-import type { NativeCheckPlan } from './native-check-executor.js';
+import { preflightNativeCheckPlans, type NativeCheckPlan } from './native-check-executor.js';
 import {
   executeNativeSupervisorChecks,
   readNativeSupervisorCheckEvidence,
   type NativeSupervisorMaterial,
 } from './native-supervisor-evidence.js';
-import { parseNativeVerifierAcceptance } from './native-verifier-protocol.js';
+import {
+  parseNativeVerifierAcceptance,
+  parseNativeVerifierResponse,
+  type NativeVerifierResponse,
+} from './native-verifier-protocol.js';
 import { readNativeLocalExecution } from './native-local-execution.js';
 import { nativePortableContinuation } from './native-portable-continuation.js';
 import {
   dispatchNativePortableVerifier,
   executeNativePortableCheckPlan,
+  retryNativePortableCheckPlan,
   nativeLocalExecutionFile,
   nativePortableChangeDir,
   readNativePortableChange,
@@ -40,6 +48,7 @@ import {
   recordNativeSupervisorPortableFinalVerification,
   readNativeSupervisorState,
   reconnectNativeSupervisorTaskWithState,
+  projectNativeSupervisorTask,
   writeNativeSupervisorState,
   type NativeSupervisorState,
   type NativeSupervisorVerificationEvidence,
@@ -49,6 +58,7 @@ import { inspectNativeSupervisorOverlay } from './native-supervisor-overlay.js';
 import { createNativeRunnerChannel, NATIVE_SKILL_COORDINATION } from './native-runner-protocol.js';
 import type {
   NativeBuilderHandoff,
+  NativeLocalExecutionState,
   NativePortableCheckSummary,
   NativePortableState,
 } from './native-portable-types.js';
@@ -68,7 +78,7 @@ interface RunnerBuilderInput {
     status: 'passed';
     summary: string;
     reviewer_execution_ref: string;
-  };
+  } | null;
 }
 
 interface RunnerDispatchInput {
@@ -76,9 +86,16 @@ interface RunnerDispatchInput {
   checks: NativeCheckPlan[];
 }
 
+interface RunnerRetryChecksInput {
+  kind: 'retry-checks';
+  check_ids: string[];
+}
+
 interface RunnerVerifierInput {
   kind: 'verifier-response';
-  response: unknown;
+  candidateId: string;
+  verifierExecutionRef: string;
+  response: NativeVerifierResponse;
 }
 
 interface RunnerExecutionErrorInput {
@@ -140,17 +157,20 @@ interface RunnerSupervisorChecksInput {
   runId: string;
   checks: NativeCheckPlan[];
   materials: NativeSupervisorMaterial[];
+  retry_check_ids?: string[];
 }
 
 interface RunnerSupervisorIntegrateInput {
   kind: 'supervisor-integrate';
   child: string;
   checks: NativeCheckPlan[];
+  retry_check_ids?: string[];
 }
 
 export type NativeRunnerInput =
   | RunnerBuilderInput
   | RunnerDispatchInput
+  | RunnerRetryChecksInput
   | RunnerVerifierInput
   | RunnerExecutionErrorInput
   | RunnerVerifierUnavailableInput
@@ -169,14 +189,6 @@ function record(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function exactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new Error(`${label} fields are invalid`);
-  }
-}
-
 function text(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0 || value.includes('\u0000')) {
     throw new Error(`${label} must be non-empty text`);
@@ -193,7 +205,12 @@ function builderChecks(value: unknown): RunnerBuilderInput['checks'] {
   if (!Array.isArray(value)) throw new Error('Native Builder checks must be an array');
   return value.map((entry, index) => {
     const input = record(entry, `Native Builder check ${index}`);
-    exactKeys(input, ['name', 'result', 'note'], `Native Builder check ${index}`);
+    exactKeys(
+      input,
+      ['name', 'result', 'note'],
+      `Native Builder check ${index}`,
+      `/checks/${index}`,
+    );
     if (!['passed', 'failed', 'not-run'].includes(String(input.result))) {
       throw new Error(`Native Builder check ${index} result is invalid`);
     }
@@ -216,6 +233,7 @@ function checkPlans(value: unknown): NativeCheckPlan[] {
       input,
       ['id', 'name', 'executable', 'argv', 'cwdRef', 'timeoutMs', 'repeatable'],
       `Native Runtime check ${index}`,
+      `/checks/${index}`,
     );
     if (!Array.isArray(input.argv) || !input.argv.every((part) => typeof part === 'string')) {
       throw new Error(`Native Runtime check ${index} argv is invalid`);
@@ -267,11 +285,16 @@ function verifierAttemptBinding(
 
 function supervisorEvidence(value: unknown): NativeSupervisorVerificationEvidence {
   const input = record(value, 'Native Supervisor evidence');
-  exactKeys(input, ['summary', 'checks', 'acceptance', 'receiptRef'], 'Native Supervisor evidence');
+  exactKeys(
+    input,
+    ['summary', 'checks', 'acceptance', 'receiptRef'],
+    'Native Supervisor evidence',
+    '/evidence',
+  );
   return {
     summary: text(input.summary, 'Native Supervisor evidence summary'),
     checks: strings(input.checks, 'Native Supervisor evidence checks'),
-    acceptance: parseNativeVerifierAcceptance(input.acceptance),
+    acceptance: parseNativeVerifierAcceptance(input.acceptance, '/evidence/acceptance'),
     ...(input.receiptRef === null
       ? {}
       : { receiptRef: text(input.receiptRef, 'Native Supervisor receipt ref') }),
@@ -281,15 +304,32 @@ function supervisorEvidence(value: unknown): NativeSupervisorVerificationEvidenc
 export function parseNativeRunnerInput(value: unknown): NativeRunnerInput {
   const input = record(value, 'Native Runner input');
   if (input.kind === 'builder-handoff') {
+    const builderKeys = ['kind', 'summary', 'addressed_acceptance_ids', 'checks', 'known_limits'];
     exactKeys(
       input,
-      ['kind', 'summary', 'addressed_acceptance_ids', 'checks', 'known_limits', 'review'],
+      Object.hasOwn(input, 'review') ? [...builderKeys, 'review'] : builderKeys,
       'Native Runner Builder input',
     );
-    const review = record(input.review, 'Native Builder review');
-    exactKeys(review, ['status', 'summary', 'reviewer_execution_ref'], 'Native Builder review');
-    if (review.status !== 'passed') {
-      throw new Error('Native Builder review status must be passed');
+    let review: RunnerBuilderInput['review'] = null;
+    if (input.review !== undefined && input.review !== null) {
+      const reviewInput = record(input.review, 'Native Builder review');
+      exactKeys(
+        reviewInput,
+        ['status', 'summary', 'reviewer_execution_ref'],
+        'Native Builder review',
+        '/review',
+      );
+      if (reviewInput.status !== 'passed') {
+        throw new Error('Native Builder review status must be passed when supplied');
+      }
+      review = {
+        status: 'passed',
+        summary: text(reviewInput.summary, 'Native Builder review summary'),
+        reviewer_execution_ref: text(
+          reviewInput.reviewer_execution_ref,
+          'Native Builder reviewer execution ref',
+        ),
+      };
     }
     return {
       kind: 'builder-handoff',
@@ -300,25 +340,34 @@ export function parseNativeRunnerInput(value: unknown): NativeRunnerInput {
       ),
       checks: builderChecks(input.checks),
       known_limits: strings(input.known_limits, 'Native Builder known limits'),
-      review: {
-        status: 'passed',
-        summary: text(review.summary, 'Native Builder review summary'),
-        reviewer_execution_ref: text(
-          review.reviewer_execution_ref,
-          'Native Builder reviewer execution ref',
-        ),
-      },
+      review,
     };
   }
   if (input.kind === 'dispatch-verifier') {
     exactKeys(input, ['kind', 'checks'], 'Native Runner dispatch input');
     return { kind: 'dispatch-verifier', checks: checkPlans(input.checks) };
   }
+  if (input.kind === 'retry-checks') {
+    exactKeys(input, ['kind', 'check_ids'], 'Native Runner check retry input');
+    return {
+      kind: 'retry-checks',
+      check_ids: strings(input.check_ids, 'Native check retry IDs'),
+    };
+  }
   if (input.kind === 'verifier-response') {
-    exactKeys(input, ['kind', 'response'], 'Native Runner Verifier input');
+    exactKeys(
+      input,
+      ['kind', 'candidateId', 'verifierExecutionRef', 'response'],
+      'Native Runner Verifier input',
+    );
     return {
       kind: 'verifier-response',
-      response: input.response,
+      candidateId: text(input.candidateId, 'Native Runner Verifier candidateId'),
+      verifierExecutionRef: text(
+        input.verifierExecutionRef,
+        'Native Runner Verifier verifierExecutionRef',
+      ),
+      response: parseNativeVerifierResponse(input.response, '/response'),
     };
   }
   if (input.kind === 'verifier-execution-error') {
@@ -406,7 +455,12 @@ export function parseNativeRunnerInput(value: unknown): NativeRunnerInput {
     };
   }
   if (input.kind === 'supervisor-checks') {
-    exactKeys(input, ['kind', 'child', 'runId', 'checks', 'materials'], 'Native Supervisor checks');
+    const keys = ['kind', 'child', 'runId', 'checks', 'materials'];
+    exactKeys(
+      input,
+      Object.hasOwn(input, 'retry_check_ids') ? [...keys, 'retry_check_ids'] : keys,
+      'Native Supervisor checks',
+    );
     if (!Array.isArray(input.materials))
       throw new Error('Native Supervisor materials must be an array');
     return {
@@ -414,9 +468,17 @@ export function parseNativeRunnerInput(value: unknown): NativeRunnerInput {
       child: text(input.child, 'Native Supervisor child'),
       runId: text(input.runId, 'Native Supervisor runId'),
       checks: checkPlans(input.checks),
-      materials: input.materials.map((value) => {
+      ...(input.retry_check_ids === undefined
+        ? {}
+        : { retry_check_ids: strings(input.retry_check_ids, 'Native Supervisor retry IDs') }),
+      materials: input.materials.map((value, index) => {
         const material = record(value, 'Native Supervisor material');
-        exactKeys(material, ['name', 'content'], 'Native Supervisor material');
+        exactKeys(
+          material,
+          ['name', 'content'],
+          'Native Supervisor material',
+          `/materials/${index}`,
+        );
         return {
           name: text(material.name, 'Native Supervisor material name'),
           content: text(material.content, 'Native Supervisor material content'),
@@ -425,11 +487,19 @@ export function parseNativeRunnerInput(value: unknown): NativeRunnerInput {
     };
   }
   if (input.kind === 'supervisor-integrate') {
-    exactKeys(input, ['kind', 'child', 'checks'], 'Native Supervisor integration input');
+    const keys = ['kind', 'child', 'checks'];
+    exactKeys(
+      input,
+      Object.hasOwn(input, 'retry_check_ids') ? [...keys, 'retry_check_ids'] : keys,
+      'Native Supervisor integration input',
+    );
     return {
       kind: 'supervisor-integrate',
       child: text(input.child, 'Native Supervisor child'),
       checks: checkPlans(input.checks),
+      ...(input.retry_check_ids === undefined
+        ? {}
+        : { retry_check_ids: strings(input.retry_check_ids, 'Native Supervisor retry IDs') }),
     };
   }
   throw new Error('Native Runner input kind is invalid');
@@ -446,11 +516,282 @@ export async function readNativeRunnerInput(
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await fs.readFile(target, 'utf8'));
+    parsed = JSON.parse(stripUtf8Bom(await fs.readFile(target, 'utf8')));
   } catch (error) {
     throw new Error('Native Runner input must be valid JSON', { cause: error });
   }
   return parseNativeRunnerInput(parsed);
+}
+
+function isGenericPortableRunnerInput(input: NativeRunnerInput): boolean {
+  return (
+    input.kind === 'builder-handoff' ||
+    input.kind === 'dispatch-verifier' ||
+    input.kind === 'retry-checks' ||
+    input.kind === 'verifier-response' ||
+    input.kind === 'verifier-execution-error' ||
+    input.kind === 'verifier-unavailable'
+  );
+}
+
+function isSupervisorRunnerInput(input: NativeRunnerInput): boolean {
+  return input.kind.startsWith('supervisor-');
+}
+
+function verifierCheckPlans(input: Extract<NativeRunnerInput, { kind: 'verifier-response' }>) {
+  if (input.response.kind !== 'request-checks') return [];
+  return input.response.checks.map(
+    ({ id, name, executable, argv, cwdRef, timeoutMs, repeatable }) => ({
+      id,
+      name,
+      executable,
+      argv: [...argv],
+      cwdRef,
+      timeoutMs,
+      repeatable,
+    }),
+  );
+}
+
+function assertPortableVerifyReadyBoundary(state: NativePortableState): void {
+  if (
+    state.phase !== 'verify' ||
+    state.status !== 'active' ||
+    state.loop.stage !== 'verify-ready'
+  ) {
+    throw new Error('Native Runner check input requires an active Verify-ready candidate');
+  }
+}
+
+function assertPortableVerifierResultBoundary(state: NativePortableState): void {
+  if (
+    state.phase !== 'verify' ||
+    state.status !== 'active' ||
+    state.loop.next_action !== 'await-verifier-result'
+  ) {
+    throw new Error('Native Runner Verifier input requires an active Verifier attempt');
+  }
+}
+
+function assertBuilderAcceptanceIds(state: NativePortableState, ids: readonly string[]): void {
+  if (new Set(ids).size !== ids.length) {
+    throw new Error('Native Builder addressed acceptance IDs contain duplicates');
+  }
+  const known = new Set(state.acceptance.map(({ id }) => id));
+  const unknown = ids.filter((id) => !known.has(id));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Native Builder addressed acceptance IDs contain unknown IDs: ${unknown.join(', ')}`,
+    );
+  }
+}
+
+async function currentVerifierExecution(options: {
+  paths: NativeProjectPaths;
+  state: NativePortableState;
+}): Promise<NonNullable<NativeLocalExecutionState['execution']>> {
+  const local = await readNativeLocalExecution(
+    nativeLocalExecutionFile(options.paths, options.state.name),
+  );
+  const execution = local?.execution;
+  if (
+    local === null ||
+    local.basedOnStateVersion !== options.state.state_version ||
+    !execution ||
+    execution.stage !== 'verifying' ||
+    execution.actor !== 'verifier' ||
+    execution.status !== 'running' ||
+    execution.executionId === null
+  ) {
+    throw new Error('Native Runner Verifier input requires an active Runtime Verifier execution');
+  }
+  return execution;
+}
+
+/**
+ * Validate a parsed Runner input against the current persisted boundary
+ * without recovering, reserving, writing, or starting a process.
+ */
+export async function validateNativeRunnerInputBoundary(options: {
+  paths: NativeProjectPaths;
+  name: string;
+  state: NativePortableState;
+  input: NativeRunnerInput;
+  projectRoot: string;
+}): Promise<void> {
+  const overlay = await inspectNativeSupervisorOverlay({
+    paths: options.paths,
+    state: options.state,
+  });
+  if (overlay.status === 'incompatible') throw new Error(overlay.message);
+  const supervisor =
+    overlay.status === 'repairable-legacy-overlay'
+      ? null
+      : await readNativeSupervisorState(options.paths, options.name);
+  const supervisorParentVerification =
+    supervisor !== null &&
+    options.state.phase === 'verify' &&
+    supervisor.children.every(({ status }) => status === 'integrated' || status === 'archived');
+  const supervisorParentReview =
+    supervisor !== null &&
+    options.state.phase === 'build' &&
+    supervisor.children.every(({ status }) => status === 'integrated' || status === 'archived');
+  const children = await inspectNativeChildren({ paths: options.paths, state: options.state });
+
+  if (isSupervisorRunnerInput(options.input) && supervisor === null) {
+    throw new Error('Native Supervisor Runner input requires a current Supervisor state');
+  }
+  if (
+    supervisor &&
+    isGenericPortableRunnerInput(options.input) &&
+    !supervisorParentVerification &&
+    !(options.input.kind === 'builder-handoff' && supervisorParentReview)
+  ) {
+    throw new Error(
+      'Native Supervisor accepts only Supervisor task result inputs until every Child is integrated',
+    );
+  }
+
+  if (options.input.kind === 'builder-handoff') {
+    if (options.state.phase !== 'build' || options.state.status !== 'active') {
+      throw new Error('Native Builder input requires an active Build boundary');
+    }
+    assertBuilderAcceptanceIds(options.state, options.input.addressed_acceptance_ids);
+    if (children && (!children.confirmed || !children.allDone)) {
+      throw new Error(
+        'Native parent Build advances child changes and does not accept a Builder handoff',
+      );
+    }
+    if (
+      supervisorParentReview &&
+      options.state.loop.stage === 'repairing' &&
+      options.state.verification_result === 'fail'
+    ) {
+      throw new Error('Native parent verification failed; complete the repair child first');
+    }
+    return;
+  }
+
+  const executionRoot =
+    supervisorParentVerification && supervisor
+      ? supervisor.integration.worktree
+      : options.projectRoot;
+
+  if (options.input.kind === 'dispatch-verifier') {
+    assertPortableVerifyReadyBoundary(options.state);
+    if (supervisorParentVerification && options.input.checks.length === 0) {
+      throw new Error('Native Supervisor parent verification requires at least one check');
+    }
+    preflightNativeCheckPlans(executionRoot, options.input.checks);
+    return;
+  }
+  if (options.input.kind === 'retry-checks') {
+    assertPortableVerifyReadyBoundary(options.state);
+    if (
+      options.input.check_ids.length === 0 ||
+      new Set(options.input.check_ids).size !== options.input.check_ids.length
+    ) {
+      throw new Error('Native check retry list must contain unique IDs');
+    }
+    const local = await readNativeLocalExecution(
+      nativeLocalExecutionFile(options.paths, options.name),
+    );
+    for (const id of options.input.check_ids) {
+      const check = local?.checks.find((entry) => entry.id === id);
+      if (!check || check.status !== 'interrupted') {
+        throw new Error(`Native check retry ID is not an interrupted current check: ${id}`);
+      }
+      if (!check.repeatable) {
+        throw new Error(`Native check ${id} is not repeatable and cannot be retried`);
+      }
+      if (check.executionCount >= 3) {
+        throw new Error(`Native check retry limit (3) reached: ${id}`);
+      }
+    }
+    return;
+  }
+  if (options.input.kind === 'verifier-response') {
+    assertPortableVerifierResultBoundary(options.state);
+    const execution = await currentVerifierExecution({
+      paths: options.paths,
+      state: options.state,
+    });
+    if (
+      options.input.candidateId !== options.state.builder_handoff?.candidate_id ||
+      options.input.verifierExecutionRef !== execution.executionId
+    ) {
+      throw new Error(
+        'Native Runner Verifier input is stale for the current candidate or execution',
+      );
+    }
+    preflightNativeCheckPlans(executionRoot, verifierCheckPlans(options.input));
+    return;
+  }
+  if (
+    options.input.kind === 'verifier-execution-error' ||
+    options.input.kind === 'verifier-unavailable'
+  ) {
+    assertPortableVerifierResultBoundary(options.state);
+    const execution = await currentVerifierExecution({
+      paths: options.paths,
+      state: options.state,
+    });
+    if (
+      options.input.stateVersion !== options.state.state_version ||
+      options.input.iteration !== options.state.loop.iteration ||
+      options.input.attempt !== options.state.loop.attempt ||
+      options.input.verifierExecutionRef !== execution.executionId
+    ) {
+      throw new Error('Native Runner Verifier input is stale for the current attempt');
+    }
+    return;
+  }
+
+  if (options.input.kind === 'supervisor-checks') {
+    const input = options.input;
+    if (
+      input.checks.length === 0 ||
+      new Set(input.checks.map(({ id }) => id)).size !== input.checks.length
+    ) {
+      throw new Error('Native Supervisor checks require a non-empty plan with unique IDs');
+    }
+    if (input.checks.some(({ repeatable }) => !repeatable)) {
+      throw new Error('Native Supervisor checks must be repeatable for safe recovery');
+    }
+    const task = supervisor?.children.find(({ name }) => name === input.child)?.task;
+    if (!task || task.role !== 'verifier' || task.runId !== input.runId) {
+      throw new Error('Native Supervisor check runId is not current');
+    }
+    if (
+      input.retry_check_ids !== undefined &&
+      (input.retry_check_ids.length === 0 ||
+        new Set(input.retry_check_ids).size !== input.retry_check_ids.length)
+    ) {
+      throw new Error('Native Supervisor retry IDs must be non-empty and unique');
+    }
+    preflightNativeCheckPlans(task.projectRoot, input.checks);
+    return;
+  }
+  if (options.input.kind === 'supervisor-integrate') {
+    const input = options.input;
+    if (
+      input.checks.length === 0 ||
+      new Set(input.checks.map(({ id }) => id)).size !== input.checks.length
+    ) {
+      throw new Error('Native Supervisor integration requires non-empty checks with unique IDs');
+    }
+    if (input.checks.some(({ repeatable }) => !repeatable)) {
+      throw new Error('Native Supervisor integration checks must be repeatable for safe recovery');
+    }
+    if (
+      input.retry_check_ids !== undefined &&
+      (input.retry_check_ids.length === 0 ||
+        new Set(input.retry_check_ids).size !== input.retry_check_ids.length)
+    ) {
+      throw new Error('Native Supervisor retry IDs must be non-empty and unique');
+    }
+    preflightNativeCheckPlans(supervisor!.integration.worktree, input.checks);
+  }
 }
 
 function skillExecutionRef(role: 'builder' | 'verifier'): string {
@@ -524,9 +865,6 @@ function assertSkillCoordinatedCandidate(state: NativePortableState): NativeBuil
       'Native candidate is owned by a host identity adapter and cannot use the generic Skill coordination bridge',
     );
   }
-  if (!state.builder_handoff.review) {
-    throw new Error('Native Skill coordination requires a passed read-only review');
-  }
   return state.builder_handoff;
 }
 
@@ -543,9 +881,6 @@ function verifierDispatch(options: {
 }) {
   const { paths, state, checks, verifierExecutionRef, supervisor } = options;
   const handoff = assertSkillCoordinatedCandidate(state);
-  if (!handoff.review) {
-    throw new Error('Native Skill coordination requires a passed read-only review');
-  }
   const recoveryContext = latestRecoveryContext(state);
   const scopeIds = state.acceptance
     .filter(({ result }) => result === 'pending')
@@ -581,11 +916,17 @@ function verifierDispatch(options: {
       paths.projectRoot,
     ],
     ...(recoveryContext === undefined ? {} : { recoveryContext }),
-    builderReview: {
-      status: handoff.review.status,
-      summary: handoff.review.summary,
-    },
+    builderReview: handoff.review
+      ? {
+          status: handoff.review.status,
+          summary: handoff.review.summary,
+        }
+      : null,
     runtimeChecks: checks.map((check) => ({ ...check })),
+    builderReportedChecks: handoff.checks.map((check) => ({ ...check })),
+    builderKnownLimits: handoff.known_limits.map((limit) => ({ ...limit })),
+    evidenceInstruction:
+      'Independently inspect the current candidate against every acceptance criterion. Runtime checks are bound evidence; Builder-reported checks and review are claims to corroborate, not Runtime receipts. Reuse applicable completed evidence, request only missing or invalidated checks, and do not repeat full suites by default. Use one Verifier for this dispatch; keep it running across wait-tool timeouts. Return the actual per-criterion findings, risks, and incomplete checks without omitting limitations. Keep using the same CLI executable that produced this dispatch; do not switch to a different PATH installation.',
   };
 }
 
@@ -647,11 +988,17 @@ export async function applyNativeRunnerInput(options: {
       runId: input.runId,
       plans: input.checks,
       materials: input.materials,
+      ...(input.retry_check_ids === undefined ? {} : { retryCheckIds: input.retry_check_ids }),
     });
+    const updatedSupervisor = await readNativeSupervisorState(options.paths, options.name);
+    const updatedTask = updatedSupervisor?.children.find(({ name }) => name === input.child)?.task;
     return {
       state: portableBeforeInput,
-      supervisorState: await readNativeSupervisorState(options.paths, options.name),
-      supervisorTask: null,
+      supervisorState: updatedSupervisor,
+      supervisorTask:
+        updatedTask && updatedTask.runId === input.runId
+          ? projectNativeSupervisorTask(updatedTask, options.name, options.paths.projectRoot)
+          : null,
       checks: [],
       checkExecution: execution,
       requestChecks: null,
@@ -700,7 +1047,11 @@ export async function applyNativeRunnerInput(options: {
         const portableState = await readNativePortableChange(options.paths, options.name);
         return {
           state: portableState,
-          supervisorTask: verifier.task,
+          supervisorTask: projectNativeSupervisorTask(
+            verifier.task,
+            options.name,
+            options.paths.projectRoot,
+          ),
           checks: [],
           requestChecks: null,
           verifierDispatch: null,
@@ -775,7 +1126,11 @@ export async function applyNativeRunnerInput(options: {
         return {
           state: portableState,
           supervisorState: reconnected.state,
-          supervisorTask: reconnected.task,
+          supervisorTask: projectNativeSupervisorTask(
+            reconnected.task,
+            options.name,
+            options.paths.projectRoot,
+          ),
           checks: [],
           requestChecks: null,
           verifierDispatch: null,
@@ -885,6 +1240,7 @@ export async function applyNativeRunnerInput(options: {
       name: input.child,
       checks: [],
       checkPlans: input.checks,
+      ...(input.retry_check_ids === undefined ? {} : { retryCheckIds: input.retry_check_ids }),
     });
     const parentAdvance = await inspectNativeSupervisorParentReviewReadiness({
       paths: options.paths,
@@ -907,6 +1263,7 @@ export async function applyNativeRunnerInput(options: {
     supervisor &&
     (input.kind === 'builder-handoff' ||
       input.kind === 'dispatch-verifier' ||
+      input.kind === 'retry-checks' ||
       input.kind === 'verifier-response' ||
       input.kind === 'verifier-execution-error' ||
       input.kind === 'verifier-unavailable' ||
@@ -937,11 +1294,13 @@ export async function applyNativeRunnerInput(options: {
         addressedAcceptanceIds: input.addressed_acceptance_ids,
         checks: input.checks,
         knownLimits: input.known_limits,
-        review: {
-          status: input.review.status,
-          summary: input.review.summary,
-          reviewerExecutionRef: input.review.reviewer_execution_ref,
-        },
+        review: input.review
+          ? {
+              status: input.review.status,
+              summary: input.review.summary,
+              reviewerExecutionRef: input.review.reviewer_execution_ref,
+            }
+          : null,
       },
     });
     return {
@@ -950,6 +1309,35 @@ export async function applyNativeRunnerInput(options: {
       requestChecks: null,
       verifierDispatch: null,
       continuation: nativePortableContinuation(state),
+    };
+  }
+  if (input.kind === 'retry-checks') {
+    if (supervisor && !supervisorParentVerification) {
+      throw new Error(
+        'Native Supervisor check retry is only valid after every Child is integrated',
+      );
+    }
+    const ready = await readNativePortableChange(options.paths, options.name);
+    assertSkillCoordinatedCandidate(ready);
+    const result = await retryNativePortableCheckPlan({
+      paths: options.paths,
+      name: options.name,
+      checkIds: input.check_ids,
+      ...(supervisorParentVerification && supervisor
+        ? { projectRoot: supervisor.integration.worktree }
+        : {}),
+    });
+    const interrupted = result.checks
+      .filter(({ status }) => status === 'interrupted')
+      .map(({ id }) => id);
+    return {
+      state: result.state,
+      checks: result.checks,
+      requestChecks: null,
+      verifierDispatch: null,
+      continuation: nativePortableContinuation(result.state, undefined, {
+        retryCheckIds: interrupted.length > 0 ? interrupted : undefined,
+      }),
     };
   }
   if (input.kind === 'dispatch-verifier') {
@@ -976,24 +1364,39 @@ export async function applyNativeRunnerInput(options: {
       };
     }
     assertSkillCoordinatedCandidate(ready);
-    const reusableChecks =
-      ready.loop.next_action === 'run-final-full-verification' &&
-      ready.verification?.verdict === 'pass' &&
-      ready.verification.checks.every(({ status }) => status === 'passed')
-        ? ready.verification.checks
-        : null;
-    const executedChecks =
-      reusableChecks ??
-      (
-        await executeNativePortableCheckPlan({
-          paths: options.paths,
-          name: options.name,
-          plans: input.checks,
-          ...(supervisorParentVerification && supervisor
-            ? { projectRoot: supervisor.integration.worktree }
-            : {}),
-        })
-      ).checks;
+    const executedChecks = (
+      await executeNativePortableCheckPlan({
+        paths: options.paths,
+        name: options.name,
+        plans: input.checks,
+        ...(supervisorParentVerification && supervisor
+          ? { projectRoot: supervisor.integration.worktree }
+          : {}),
+      })
+    ).checks;
+    const interruptedIds = executedChecks
+      .filter(({ status }) => status === 'interrupted')
+      .map(({ id }) => id);
+    if (interruptedIds.length > 0) {
+      const nonRepeatable = input.checks
+        .filter(({ id, repeatable }) => interruptedIds.includes(id) && !repeatable)
+        .map(({ id }) => id);
+      if (nonRepeatable.length > 0) {
+        throw new Error(
+          `Native non-repeatable checks were interrupted and require a new Builder candidate: ${nonRepeatable.join(', ')}`,
+        );
+      }
+      const ready = await readNativePortableChange(options.paths, options.name);
+      return {
+        state: ready,
+        checks: executedChecks,
+        requestChecks: null,
+        verifierDispatch: null,
+        continuation: nativePortableContinuation(ready, undefined, {
+          retryCheckIds: interruptedIds,
+        }),
+      };
+    }
     const verifierExecutionRef = skillExecutionRef('verifier');
     const state = await dispatchNativePortableVerifier({
       paths: options.paths,
@@ -1015,7 +1418,7 @@ export async function applyNativeRunnerInput(options: {
         verifierExecutionRef,
         supervisor: supervisorParentVerification ? supervisor : null,
       }),
-      continuation: nativePortableContinuation(state),
+      continuation: nativePortableContinuation(state, undefined, { verifierExecutionRef }),
     };
   }
   if (input.kind === 'verifier-execution-error') {
@@ -1059,6 +1462,9 @@ export async function applyNativeRunnerInput(options: {
   const state = await readNativePortableChange(options.paths, options.name);
   const handoff = assertSkillCoordinatedCandidate(state);
   const executionRef = await currentSkillVerifierExecutionRef({ paths: options.paths, state });
+  if (input.candidateId !== handoff.candidate_id || input.verifierExecutionRef !== executionRef) {
+    throw new Error('Native Runner Verifier input is stale for the current candidate or execution');
+  }
   const runner = createNativeRunnerChannel();
   const verifierIdentity = runner.captureExecutionIdentity({
     identityProvider: NATIVE_SKILL_COORDINATION,
@@ -1131,6 +1537,8 @@ export async function applyNativeRunnerInput(options: {
             }),
             supervisor: supervisorParentVerification ? supervisor : null,
           }),
-    continuation: nativePortableContinuation(applied.state),
+    continuation: nativePortableContinuation(applied.state, undefined, {
+      verifierExecutionRef: executionRef,
+    }),
   };
 }

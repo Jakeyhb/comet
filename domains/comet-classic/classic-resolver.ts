@@ -2,6 +2,7 @@ import type { DeterministicResolver } from '../../domains/engine/resolver.js';
 import type { ClassicEvidence } from './classic-evidence.js';
 import { evidenceSatisfied } from './classic-evidence.js';
 import type { ClassicProfile, ClassicState } from './classic-state.js';
+import { classicConfigurationReady } from './classic-build-configuration.js';
 
 export interface ClassicResolverContext {
   classic: ClassicState;
@@ -13,19 +14,12 @@ function profileFor(classic: ClassicState): ClassicProfile {
 }
 
 function fullBuildConfigured(classic: ClassicState): boolean {
-  if (!classic.buildMode || !classic.tddMode || !classic.isolation || !classic.verifyMode) {
-    return false;
-  }
-  if (classic.buildMode === 'subagent-driven-development') {
-    return classic.subagentDispatch === 'confirmed';
-  }
-  if (classic.buildMode === 'direct') return classic.directOverride === true;
-  return true;
+  return classic.isolation !== null && classicConfigurationReady(classic);
 }
 
 function presetBuildConfigured(classic: ClassicState): boolean {
   return Boolean(
-    classic.buildMode === 'direct' &&
+    (classic.buildMode === 'direct' || classic.buildMode === 'autonomous') &&
     classic.tddMode === 'direct' &&
     classic.isolation !== null &&
     classic.verifyMode === 'light',
@@ -37,14 +31,16 @@ function resolveBuild(
   classic: ClassicState,
   evidence: readonly ClassicEvidence[],
 ): string {
-  if (classic.verifyResult === 'fail') {
-    return profile === 'full' ? 'full.build.fix' : `${profile}.build.execute`;
+  if (profile !== 'full' && classic.verifyResult === 'fail') {
+    return `${profile}.build.execute`;
   }
 
   if (profile === 'full') {
-    if (!evidenceSatisfied(evidence, 'build.plan')) return 'full.build.plan';
-    if (classic.buildPause === 'plan-ready') return 'full.build.plan-ready';
+    if (evidenceSatisfied(evidence, 'build.plan') && classic.buildPause === 'plan-ready')
+      return 'full.build.plan-ready';
     if (!fullBuildConfigured(classic)) return 'full.build.configure';
+    if (!evidenceSatisfied(evidence, 'build.plan')) return 'full.build.plan';
+    if (classic.verifyResult === 'fail') return 'full.build.fix';
   } else if (!presetBuildConfigured(classic)) {
     throw new Error(`${profile} build configuration is incomplete`);
   }

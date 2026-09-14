@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
 
@@ -6,9 +7,11 @@ import {
   readProjectRegistry,
   type ProjectRegistryEntry,
 } from '../../platform/install/project-registry.js';
-import { resolveStableProjectId, stableProjectId } from '../../platform/paths/project-identity.js';
+import { readWorkflowProjectConfig } from '../workflow-contract/project-config-reader.js';
+import type { CometProjectWorkflow } from '../workflow-contract/types.js';
 
 export type DashboardProjectAvailability = 'available' | 'missing' | 'unreadable';
+export type DashboardProjectWorkflowSource = 'configured' | 'fallback';
 
 export interface DashboardProjectEntry {
   id: string;
@@ -17,6 +20,8 @@ export interface DashboardProjectEntry {
   lastSeenAt: string | null;
   availability: DashboardProjectAvailability;
   isCurrent: boolean;
+  defaultWorkflow: CometProjectWorkflow;
+  workflowSource: DashboardProjectWorkflowSource;
 }
 
 export interface DashboardProjectDirectory {
@@ -34,8 +39,9 @@ function canonicalKey(projectPath: string): string {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
-function projectId(projectPath: string): string {
-  return resolveStableProjectId(projectPath);
+function projectId(canonicalPath: string): string {
+  // Dashboard routes address a working directory, not a repository shared by worktrees.
+  return `dashboard-${createHash('sha256').update(canonicalPath).digest('hex')}`;
 }
 
 function projectName(projectPath: string): string {
@@ -69,11 +75,30 @@ function sortEntries(left: DashboardProjectEntry, right: DashboardProjectEntry):
   return left.name.localeCompare(right.name);
 }
 
+async function projectWorkflow(
+  projectPath: string,
+  availability: DashboardProjectAvailability,
+): Promise<Pick<DashboardProjectEntry, 'defaultWorkflow' | 'workflowSource'>> {
+  if (availability !== 'available') {
+    return { defaultWorkflow: 'classic', workflowSource: 'fallback' };
+  }
+  try {
+    const config = await readWorkflowProjectConfig(projectPath);
+    if (config?.default_workflow === 'native' || config?.default_workflow === 'classic') {
+      return { defaultWorkflow: config.default_workflow, workflowSource: 'configured' };
+    }
+  } catch {
+    // The project directory remains usable when an optional workflow hint cannot be read.
+  }
+  return { defaultWorkflow: 'classic', workflowSource: 'fallback' };
+}
+
 export async function collectDashboardProjectDirectory(
   currentProjectPath: string,
   options: DashboardProjectDirectoryOptions = {},
 ): Promise<DashboardProjectDirectory> {
   const currentPath = path.resolve(currentProjectPath);
+  const currentKey = canonicalKey(await fs.realpath(currentPath).catch(() => currentPath));
   let registryProjects: ProjectRegistryEntry[] = [];
   let warning: string | undefined;
 
@@ -85,7 +110,7 @@ export async function collectDashboardProjectDirectory(
   }
 
   const candidates = new Map<string, { path: string; lastSeenAt: string | null }>();
-  candidates.set(canonicalKey(currentPath), { path: currentPath, lastSeenAt: null });
+  candidates.set(currentKey, { path: currentPath, lastSeenAt: null });
   for (const entry of registryProjects) {
     const key = canonicalKey(entry.canonicalPath || entry.path);
     const existing = candidates.get(key);
@@ -95,20 +120,18 @@ export async function collectDashboardProjectDirectory(
     });
   }
 
-  const currentKey = canonicalKey(currentPath);
   const projects = await Promise.all(
     [...candidates.entries()].map(async ([key, candidate]) => {
       const availability = await availabilityOf(candidate.path);
+      const workflow = await projectWorkflow(candidate.path, availability);
       return {
-        id:
-          availability === 'available'
-            ? projectId(candidate.path)
-            : stableProjectId(candidate.path),
+        id: projectId(key),
         name: projectName(candidate.path),
         path: candidate.path,
         lastSeenAt: candidate.lastSeenAt,
         availability,
         isCurrent: key === currentKey,
+        ...workflow,
       };
     }),
   );

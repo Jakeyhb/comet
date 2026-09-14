@@ -8,6 +8,10 @@ import type {
   MemoryCorrection,
   MemoryFileProjection,
   MemoryInput,
+  MemoryLearningCheckKind,
+  MemoryLearningStatus,
+  MemoryLearningCheckContext,
+  MemoryObservationResultKind,
   MemoryLanguage,
   MemoryManagementConflict,
   MemoryManagementRecord,
@@ -51,6 +55,8 @@ const DEFAULT_TASK_MAX_CHARS = 6000;
 const DEFAULT_MANAGEMENT_MAX_ENTRIES = 100;
 const DEFAULT_MANAGEMENT_MAX_BYTES = 32 * 1024;
 const MAX_SOURCES = 8;
+const MAX_LEARNING_PROJECTS = 128;
+const MAX_LEARNING_REASON_CHARS = 240;
 
 interface MarkdownBullet {
   readonly category: string;
@@ -491,15 +497,23 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
   public async observe(observation: MemoryObservation): Promise<MemoryObservationResult> {
     validateObservation(observation);
     if (observation.source?.kind !== 'user' && !isUsefulAutomaticObservation(observation)) {
-      return {
+      const result: MemoryObservationResult = {
         deduplicated: false,
         ignored: true,
         candidate: false,
         promoted: false,
         record: null,
+        result: 'ignored',
       };
+      await this.recordLearningStatus(
+        result,
+        false,
+        learningContext(observation),
+        observation.reason,
+      );
+      return result;
     }
-    return this.repository.withLock(async () => {
+    const result = await this.repository.withLock(async () => {
       const state = await this.loadAndReconcile(observation.scope, observation.projectKey);
       const projectIdentity = observation.projectIdentity ?? observation.projectKey;
       const normalizedObservation: MemoryObservation = {
@@ -516,6 +530,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: false,
           promoted: false,
           record: null,
+          result: 'deduplicated' as const,
         };
       }
       const source = observation.source ?? {
@@ -568,6 +583,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: false,
           promoted: false,
           record: null,
+          result: 'ignored' as const,
         };
       }
       const paused =
@@ -582,6 +598,8 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: false,
           promoted: false,
           record: null,
+          result:
+            !state.settings.learningEnabled || paused ? ('ignored' as const) : ('skipped' as const),
         };
       }
 
@@ -630,6 +648,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
             candidate: true,
             promoted: false,
             record: null,
+            result: 'candidate-created' as const,
           };
         }
         const refreshed = addSource(explicit, source, this.timestamp());
@@ -646,6 +665,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: false,
           promoted: false,
           record: cloneRecord(refreshed),
+          result: 'skipped' as const,
         };
       }
       const conflicting = state.records.filter(
@@ -669,6 +689,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: true,
           promoted: false,
           record: null,
+          result: 'candidate-created' as const,
         };
       }
       if (active !== undefined && normalizeText(active.text) === normalized) {
@@ -688,6 +709,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: false,
           promoted: false,
           record: cloneRecord(refreshed),
+          result: 'skipped' as const,
         };
       }
       const independentEvidence = independentEvidenceCount(
@@ -703,6 +725,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: true,
           promoted: false,
           record: null,
+          result: 'candidate-created' as const,
         };
       }
       if (active !== undefined && active.id !== record.id) {
@@ -719,6 +742,7 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           candidate: true,
           promoted: false,
           record: null,
+          result: 'candidate-created' as const,
         };
       }
 
@@ -741,7 +765,97 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
         candidate: true,
         promoted: true,
         record: cloneRecord(promoted),
+        result: 'candidate-promoted' as const,
       };
+    });
+    await this.recordLearningStatus(
+      result,
+      result.result === 'candidate-created' ||
+        result.result === 'candidate-promoted' ||
+        result.result === 'deduplicated',
+      learningContext(observation),
+      observation.reason,
+    );
+    return result;
+  }
+
+  private async recordLearningStatus(
+    result: MemoryObservationResult,
+    validObservation: boolean,
+    context?: MemoryLearningCheckContext,
+    reason?: string,
+  ): Promise<void> {
+    await this.repository.withLock(async () => {
+      const state = await this.loadAndReconcile();
+      const checkedAt = this.timestamp();
+      const projectKey = context?.projectKey ?? this.repository.projectFileBinding?.()?.projectKey;
+      const scopedContext = projectKey === undefined ? context : { ...(context ?? {}), projectKey };
+      const previousGlobal = state.learning;
+      const previousScoped = previousLearningStatus(state, projectKey);
+      const nextScoped = createLearningSubmissionStatus(
+        previousScoped,
+        result,
+        validObservation,
+        scopedContext,
+        checkedAt,
+        reason,
+      );
+      state.learning = createLearningSubmissionStatus(
+        previousGlobal,
+        result,
+        validObservation,
+        scopedContext,
+        checkedAt,
+        reason,
+      );
+      if (projectKey !== undefined) setProjectLearningStatus(state, projectKey, nextScoped);
+      await this.persist(state);
+    });
+  }
+
+  public async markLearningCheck(
+    check: MemoryLearningCheckKind,
+    result?: MemoryObservationResultKind,
+    context?: MemoryLearningCheckContext,
+    reason?: string,
+  ): Promise<MemoryLearningStatus> {
+    return this.repository.withLock(async () => {
+      const state = await this.loadAndReconcile();
+      const projectKey = context?.projectKey ?? this.repository.projectFileBinding?.()?.projectKey;
+      const scopedContext = projectKey === undefined ? context : { ...(context ?? {}), projectKey };
+      const previousGlobal = state.learning;
+      const previousScoped = previousLearningStatus(state, projectKey);
+      const submissionVerified =
+        check !== 'submitted' || context?.changeId === undefined
+          ? undefined
+          : state.observations.some(
+              (entry) =>
+                entry.changeId === context.changeId &&
+                (projectKey === undefined || entry.projectKey === projectKey) &&
+                (context.workflow === undefined || entry.source.workflow === context.workflow),
+            );
+      const checkedAt = this.timestamp();
+      const nextScoped = createLearningCheckStatus(
+        previousScoped,
+        check,
+        result,
+        scopedContext,
+        checkedAt,
+        submissionVerified,
+        reason,
+      );
+      state.learning = createLearningCheckStatus(
+        previousGlobal,
+        check,
+        result,
+        scopedContext,
+        checkedAt,
+        submissionVerified,
+        reason,
+      );
+      if (projectKey !== undefined) setProjectLearningStatus(state, projectKey, nextScoped);
+      await this.persist(state);
+      return nextScoped;
     });
   }
 
@@ -1235,6 +1349,8 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
     const status = await this.repository.withLock(async () => {
       const state = await this.loadAndReconcile();
       await this.persist(state);
+      const projectKey = this.repository.projectFileBinding?.()?.projectKey;
+      const learning = projectScopedLearningStatus(state, projectKey);
       return {
         learningEnabled: state.settings.learningEnabled,
         retrievalEnabled: state.settings.retrievalEnabled,
@@ -1246,6 +1362,24 @@ export class PersonalMemoryService implements PersonalMemoryServiceLike, Persona
           .sort(),
         provider: { provider: 'local' as const, configured: true },
         profile: { usedChars: profileUsedChars(state), maxChars: this.profileMaxChars },
+        learning: {
+          ...(learning.lastCheckedAt === undefined
+            ? {}
+            : { lastCheckedAt: learning.lastCheckedAt }),
+          ...(learning.lastCheck === undefined ? {} : { lastCheck: learning.lastCheck }),
+          ...(learning.lastResult === undefined ? {} : { lastResult: learning.lastResult }),
+          ...(learning.lastReason === undefined ? {} : { lastReason: learning.lastReason }),
+          ...(learning.lastProjectKey === undefined
+            ? {}
+            : { lastProjectKey: learning.lastProjectKey }),
+          ...(learning.lastWorkflow === undefined ? {} : { lastWorkflow: learning.lastWorkflow }),
+          ...(learning.lastChangeId === undefined ? {} : { lastChangeId: learning.lastChangeId }),
+          ...(learning.submissionVerified === undefined
+            ? {}
+            : { submissionVerified: learning.submissionVerified }),
+          observedCount: learning.observedCount,
+          validObservationCount: learning.validObservationCount,
+        },
         counts: {
           active: state.records.filter((record) => isVisibleMemoryRecord(state, record)).length,
           trial: state.records.filter(
@@ -1595,6 +1729,8 @@ interface MutableMemoryState extends Omit<
   | 'applicationOutcomes'
   | 'feedbackState'
   | 'pendingFileProjections'
+  | 'learning'
+  | 'learningByProject'
 > {
   records: StoredRecord[];
   history: Record<string, StoredRecord[]>;
@@ -1619,6 +1755,8 @@ interface MutableMemoryState extends Omit<
     { baseState: Exclude<import('./types.js').MemoryLifecycleState, 'superseded'> }
   >;
   pendingFileProjections: Record<string, MemoryFileProjection>;
+  learning?: MemoryLearningStatus;
+  learningByProject: Record<string, MemoryLearningStatus>;
 }
 
 function mutableState(raw: MemoryRuntimeState): MutableMemoryState {
@@ -1675,6 +1813,175 @@ function mutableState(raw: MemoryRuntimeState): MutableMemoryState {
     applicationOutcomes: { ...(raw.applicationOutcomes ?? {}) },
     feedbackState: { ...(raw.feedbackState ?? {}) },
     pendingFileProjections: { ...(raw.pendingFileProjections ?? {}) },
+    learning: normalizeLearningStatus(raw.learning),
+    learningByProject: normalizeLearningStatusMap(raw),
+  };
+}
+
+function inferObservationResult(result: MemoryObservationResult): MemoryObservationResultKind {
+  if (result.promoted) return 'candidate-promoted';
+  if (result.candidate) return 'candidate-created';
+  if (result.deduplicated) return 'deduplicated';
+  if (result.ignored) return 'ignored';
+  return 'skipped';
+}
+
+function learningContext(observation: MemoryObservation): MemoryLearningCheckContext {
+  return {
+    ...(observation.projectKey === undefined ? {} : { projectKey: observation.projectKey }),
+    workflow: observation.workflow,
+    changeId: observation.changeId,
+  };
+}
+
+function normalizeLearningStatus(learning: MemoryLearningStatus | undefined): MemoryLearningStatus {
+  const reason = normalizeLearningReason(learning?.lastReason);
+  return {
+    ...(learning ?? {}),
+    ...(reason === undefined ? {} : { lastReason: reason }),
+    lastCheck: learning?.lastCheck ?? 'not-run',
+    observedCount: learning?.observedCount ?? 0,
+    validObservationCount: learning?.validObservationCount ?? 0,
+  };
+}
+
+function normalizeLearningReason(reason: string | undefined): string | undefined {
+  const normalized = reason?.trim();
+  if (normalized === undefined || normalized.length === 0) return undefined;
+  return normalized.length > MAX_LEARNING_REASON_CHARS
+    ? `${normalized.slice(0, MAX_LEARNING_REASON_CHARS - 1)}…`
+    : normalized;
+}
+
+function normalizeLearningStatusMap(raw: MemoryRuntimeState): Record<string, MemoryLearningStatus> {
+  const map = Object.fromEntries(
+    Object.entries(raw.learningByProject ?? {}).map(([projectKey, learning]) => [
+      projectKey,
+      normalizeLearningStatus(learning),
+    ]),
+  );
+  if (
+    raw.learning?.lastProjectKey !== undefined &&
+    map[raw.learning.lastProjectKey] === undefined
+  ) {
+    map[raw.learning.lastProjectKey] = normalizeLearningStatus(raw.learning);
+  }
+  const keys = Object.keys(map);
+  if (keys.length > MAX_LEARNING_PROJECTS) {
+    keys
+      .sort((left, right) => {
+        const leftCheckedAt = map[left]?.lastCheckedAt ?? '';
+        const rightCheckedAt = map[right]?.lastCheckedAt ?? '';
+        return leftCheckedAt.localeCompare(rightCheckedAt) || left.localeCompare(right);
+      })
+      .slice(0, keys.length - MAX_LEARNING_PROJECTS)
+      .forEach((key) => delete map[key]);
+  }
+  return map;
+}
+
+function previousLearningStatus(
+  state: Pick<MutableMemoryState, 'learning' | 'learningByProject'>,
+  projectKey: string | undefined,
+): MemoryLearningStatus | undefined {
+  if (projectKey === undefined) return state.learning;
+  return (
+    state.learningByProject[projectKey] ??
+    (state.learning?.lastProjectKey === projectKey ? state.learning : undefined)
+  );
+}
+
+function setProjectLearningStatus(
+  state: Pick<MutableMemoryState, 'learningByProject'>,
+  projectKey: string,
+  learning: MemoryLearningStatus,
+): void {
+  state.learningByProject[projectKey] = learning;
+  const keys = Object.keys(state.learningByProject);
+  if (keys.length <= MAX_LEARNING_PROJECTS) return;
+  keys
+    .sort((left, right) => {
+      const leftCheckedAt = state.learningByProject[left]?.lastCheckedAt ?? '';
+      const rightCheckedAt = state.learningByProject[right]?.lastCheckedAt ?? '';
+      return leftCheckedAt.localeCompare(rightCheckedAt) || left.localeCompare(right);
+    })
+    .slice(0, keys.length - MAX_LEARNING_PROJECTS)
+    .forEach((key) => delete state.learningByProject[key]);
+}
+
+function projectScopedLearningStatus(
+  state: Pick<MutableMemoryState, 'learning' | 'learningByProject'>,
+  projectKey: string | undefined,
+): MemoryLearningStatus {
+  const learning = previousLearningStatus(state, projectKey);
+  const counts =
+    projectKey === undefined
+      ? {
+          observedCount: learning?.observedCount ?? state.learning?.observedCount ?? 0,
+          validObservationCount:
+            learning?.validObservationCount ?? state.learning?.validObservationCount ?? 0,
+        }
+      : {
+          observedCount: learning?.observedCount ?? 0,
+          validObservationCount: learning?.validObservationCount ?? 0,
+        };
+  if (learning === undefined) return { ...counts, lastCheck: 'not-run' };
+  return { ...counts, ...learning };
+}
+
+function createLearningSubmissionStatus(
+  previous: MemoryLearningStatus | undefined,
+  result: MemoryObservationResult,
+  validObservation: boolean,
+  context: MemoryLearningCheckContext | undefined,
+  checkedAt: string,
+  reason: string | undefined,
+): MemoryLearningStatus {
+  const normalizedReason = normalizeLearningReason(reason);
+  return {
+    lastCheckedAt: checkedAt,
+    lastCheck: 'submitted',
+    lastResult: result.result ?? inferObservationResult(result),
+    ...(normalizedReason === undefined ? {} : { lastReason: normalizedReason }),
+    ...(context?.projectKey === undefined ? {} : { lastProjectKey: context.projectKey }),
+    ...(context?.workflow === undefined ? {} : { lastWorkflow: context.workflow }),
+    ...(context?.changeId === undefined ? {} : { lastChangeId: context.changeId }),
+    observedCount: (previous?.observedCount ?? 0) + 1,
+    validObservationCount: (previous?.validObservationCount ?? 0) + Number(validObservation),
+  };
+}
+
+function createLearningCheckStatus(
+  previous: MemoryLearningStatus | undefined,
+  check: MemoryLearningCheckKind,
+  result: MemoryObservationResultKind | undefined,
+  context: MemoryLearningCheckContext | undefined,
+  checkedAt: string,
+  submissionVerified: boolean | undefined,
+  reason: string | undefined,
+): MemoryLearningStatus {
+  const normalizedReason = normalizeLearningReason(reason);
+  return {
+    ...(result === undefined
+      ? check === 'submitted' && previous?.lastResult !== undefined
+        ? { lastResult: previous.lastResult }
+        : {}
+      : { lastResult: result }),
+    ...(reason === undefined
+      ? check === 'submitted' && previous?.lastReason !== undefined
+        ? { lastReason: previous.lastReason }
+        : {}
+      : normalizedReason === undefined
+        ? {}
+        : { lastReason: normalizedReason }),
+    lastCheckedAt: checkedAt,
+    lastCheck: check,
+    ...(context?.projectKey === undefined ? {} : { lastProjectKey: context.projectKey }),
+    ...(context?.workflow === undefined ? {} : { lastWorkflow: context.workflow }),
+    ...(context?.changeId === undefined ? {} : { lastChangeId: context.changeId }),
+    ...(submissionVerified === undefined ? {} : { submissionVerified }),
+    observedCount: previous?.observedCount ?? 0,
+    validObservationCount: previous?.validObservationCount ?? 0,
   };
 }
 

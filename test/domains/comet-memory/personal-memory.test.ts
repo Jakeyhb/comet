@@ -1260,6 +1260,170 @@ describe('PersonalMemoryService', () => {
     });
   });
 
+  it('records the last learning check and distinguishes submitted observations', async () => {
+    await withTempRepository(async (root) => {
+      const memories = service(root);
+      await memories.observe({
+        scope: 'project',
+        projectKey: 'project-a',
+        category: '协作习惯',
+        text: '提交前只暂存本次改动文件',
+        language: 'zh-CN',
+        workflow: 'native',
+        changeId: 'change-a',
+        candidateKey: 'staging',
+        success: true,
+      });
+
+      await expect(memories.status()).resolves.toMatchObject({
+        learning: {
+          lastCheck: 'submitted',
+          lastResult: 'candidate-created',
+          observedCount: 1,
+          validObservationCount: 1,
+        },
+      });
+
+      await memories.markLearningCheck('no-observation');
+      await expect(memories.status()).resolves.toMatchObject({
+        learning: { lastCheck: 'no-observation', observedCount: 1 },
+      });
+      await expect(memories.status()).resolves.not.toMatchObject({
+        learning: { lastResult: expect.any(String) },
+      });
+    });
+  });
+
+  it('keeps learning diagnostics for each project when a second project submits a check', async () => {
+    await withTempRepository(async (root) => {
+      const projectA = new PersonalMemoryService({
+        repository: new FileMemoryRepository(root, {
+          projectKey: 'project-a',
+          projectName: 'project-a',
+        }),
+      });
+      const projectB = new PersonalMemoryService({
+        repository: new FileMemoryRepository(root, {
+          projectKey: 'project-b',
+          projectName: 'project-b',
+        }),
+      });
+
+      await projectA.observe({
+        scope: 'project',
+        projectKey: 'project-a',
+        category: '协作习惯',
+        text: '提交前只暂存本次改动文件',
+        workflow: 'native',
+        changeId: 'change-a',
+        candidateKey: 'staging',
+        success: true,
+      });
+      await projectB.markLearningCheck('no-observation');
+
+      await expect(projectA.status()).resolves.toMatchObject({
+        learning: {
+          lastCheck: 'submitted',
+          lastProjectKey: 'project-a',
+          lastChangeId: 'change-a',
+        },
+      });
+      await expect(projectB.status()).resolves.toMatchObject({
+        learning: { lastCheck: 'no-observation', lastProjectKey: 'project-b' },
+      });
+
+      const projectC = new PersonalMemoryService({
+        repository: new FileMemoryRepository(root, {
+          projectKey: 'project-c',
+          projectName: 'project-c',
+        }),
+      });
+      await expect(projectC.status()).resolves.toMatchObject({
+        learning: { lastCheck: 'not-run', observedCount: 0, validObservationCount: 0 },
+      });
+    });
+  });
+
+  it('persists the short reason for the latest learning result', async () => {
+    await withTempRepository(async (root) => {
+      const memories = service(root);
+      await memories.observe({
+        scope: 'project',
+        projectKey: 'project-a',
+        category: '协作习惯',
+        text: '这次只做一次性的改动',
+        reason: '仅适用于当前任务',
+        workflow: 'native',
+        changeId: 'change-once',
+        candidateKey: 'one-off',
+        success: true,
+        source: { kind: 'user' },
+      });
+
+      await expect(memories.status()).resolves.toMatchObject({
+        learning: { lastReason: '仅适用于当前任务' },
+      });
+    });
+  });
+
+  it('does not treat submitted as verified when the current change has no observation', async () => {
+    await withTempRepository(async (root) => {
+      const memories = service(root);
+      await memories.observe({
+        scope: 'project',
+        projectKey: 'project-a',
+        category: '协作习惯',
+        text: '提交前只暂存本次改动文件',
+        language: 'zh-CN',
+        workflow: 'native',
+        changeId: 'change-a',
+        candidateKey: 'staging',
+        success: true,
+      });
+
+      await memories.markLearningCheck('submitted', undefined, {
+        projectKey: 'project-a',
+        workflow: 'native',
+        changeId: 'change-b',
+      });
+
+      await expect(memories.status()).resolves.toMatchObject({
+        learning: {
+          lastCheck: 'submitted',
+          lastChangeId: 'change-b',
+          submissionVerified: false,
+        },
+      });
+    });
+  });
+
+  it('does not count failed or skipped observations as valid evidence', async () => {
+    await withTempRepository(async (root) => {
+      const memories = service(root);
+      await expect(
+        memories.observe({
+          scope: 'project',
+          projectKey: 'project-a',
+          category: '协作习惯',
+          text: '这次失败的临时尝试',
+          language: 'zh-CN',
+          workflow: 'native',
+          changeId: 'failed-change',
+          candidateKey: 'temporary',
+          success: false,
+        }),
+      ).resolves.toMatchObject({ result: 'skipped', ignored: false });
+
+      await expect(memories.status()).resolves.toMatchObject({
+        learning: {
+          lastResult: 'skipped',
+          observedCount: 1,
+          validObservationCount: 0,
+        },
+      });
+    });
+  });
+
   it('keeps distinct preference keys independent when they share a category', async () => {
     await withTempRepository(async (root) => {
       const memories = service(root);

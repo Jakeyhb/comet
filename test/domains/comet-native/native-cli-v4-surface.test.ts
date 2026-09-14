@@ -10,6 +10,7 @@ import { readNativeLocalExecution } from '../../../domains/comet-native/native-l
 import { nativeProjectPaths } from '../../../domains/comet-native/native-paths.js';
 import {
   nativeLocalExecutionFile,
+  nativePortableStateFile,
   returnNativePortableChangeToShape,
 } from '../../../domains/comet-native/native-portable-runtime.js';
 
@@ -23,6 +24,16 @@ interface JsonEnvelope {
 function json(result: Awaited<ReturnType<typeof runNativeCli>>): JsonEnvelope {
   expect(result.stdout).toBeTruthy();
   return JSON.parse(result.stdout!) as JsonEnvelope;
+}
+
+function inputTemplate(result: JsonEnvelope, name: string): Record<string, unknown> {
+  const continuation = result.data?.continuation as {
+    inputOptions: Array<{ name: string; template: Record<string, unknown> }>;
+  };
+  const option = continuation.inputOptions.find((option) => option.name === name);
+  expect(option).toBeDefined();
+  expect(Array.isArray(option!.template)).toBe(false);
+  return structuredClone(option!.template);
 }
 
 describe('Native v4 public CLI surface', () => {
@@ -65,6 +76,25 @@ describe('Native v4 public CLI surface', () => {
         stateVersion: state.state_version,
         iteration: state.loop.iteration,
         attempt: state.loop.attempt,
+        verifierExecutionRef: local?.execution?.executionId,
+      };
+    }
+    if (
+      input &&
+      typeof input === 'object' &&
+      (input as { kind?: string }).kind === 'verifier-response' &&
+      !('candidateId' in input)
+    ) {
+      const current = json(await runNativeCli(['show', name, '--json', ...projectArgs()]));
+      const state = current.data?.state as {
+        builder_handoff: { candidate_id: string };
+      };
+      const local = await readNativeLocalExecution(
+        nativeLocalExecutionFile(await nativeProjectPaths(projectRoot, 'docs'), name),
+      );
+      payload = {
+        ...(input as Record<string, unknown>),
+        candidateId: state.builder_handoff.candidate_id,
         verifierExecutionRef: local?.execution?.executionId,
       };
     }
@@ -198,6 +228,8 @@ Run applicable focused checks.
     expect(next.stdout).toContain('continuation.runnerAction');
     expect(next.stdout).toContain('continuation.userCommunication');
     expect(next.stdout).toContain('--runner-input <file>');
+    expect(next.stdout).toContain('--validate-only');
+    expect(next.stdout).toContain('retry-checks');
     expect(next.stdout).toContain('--coordination-mode multi-session|single-session');
     expect(next.stdout).toContain('not trusted identity attestation');
     expect(next.stdout).toContain('Checks completed, but your confirmation is required');
@@ -407,6 +439,134 @@ Run applicable focused checks.
     }
   });
 
+  it.each([
+    '{invalid-json',
+    JSON.stringify({ kind: 'unsupported-future-protocol' }),
+    JSON.stringify({ kind: 'dispatch-verifier', checks: [] }),
+  ])('rejects invalid Runner input before recovering Shape drift: %s', async (input) => {
+    const name = 'invalid-input-before-recovery';
+    await prepareBuild(name);
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const stateFile = nativePortableStateFile(paths, name);
+    const localFile = nativeLocalExecutionFile(paths, name);
+    const stateBefore = await fs.readFile(stateFile, 'utf8');
+    const localBefore = await fs.readFile(localFile, 'utf8');
+    await fs.appendFile(
+      path.join(projectRoot, 'docs/comet/changes', name, 'brief.md'),
+      '\nChanged requirements.\n',
+    );
+    const inputFile = path.join(projectRoot, 'invalid-input.json');
+    await fs.writeFile(inputFile, input);
+    const result = json(
+      await runNativeCli(['next', name, '--runner-input', inputFile, '--json', ...projectArgs()]),
+    );
+    expect(result.exitCode).not.toBe(0);
+    await expect(fs.readFile(stateFile, 'utf8')).resolves.toBe(stateBefore);
+    await expect(fs.readFile(localFile, 'utf8')).resolves.toBe(localBefore);
+  });
+
+  it('validates Runner input without mutating the state or local execution overlay', async () => {
+    const name = 'validate-only-boundary';
+    await prepareBuild(name);
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const stateFile = nativePortableStateFile(paths, name);
+    const localFile = nativeLocalExecutionFile(paths, name);
+    const stateBefore = await fs.readFile(stateFile, 'utf8');
+    const localBefore = await fs.readFile(localFile, 'utf8');
+    const inputFile = path.join(projectRoot, 'validate-only-input.json');
+    await fs.writeFile(
+      inputFile,
+      JSON.stringify({
+        kind: 'builder-handoff',
+        summary: 'Validated candidate input.',
+        addressed_acceptance_ids: ['A1'],
+        checks: [],
+        known_limits: [],
+      }),
+    );
+
+    try {
+      const result = json(
+        await runNativeCli([
+          'next',
+          name,
+          '--runner-input',
+          inputFile,
+          '--validate-only',
+          '--json',
+          ...projectArgs(),
+        ]),
+      );
+      expect(result).toMatchObject({
+        exitCode: 0,
+        data: { validation: { valid: true, kind: 'builder-handoff' } },
+      });
+      await expect(fs.readFile(stateFile, 'utf8')).resolves.toBe(stateBefore);
+      await expect(fs.readFile(localFile, 'utf8')).resolves.toBe(localBefore);
+    } finally {
+      await fs.rm(inputFile, { force: true });
+    }
+  });
+
+  it('validates the current Runner boundary and check executables before reservation', async () => {
+    const name = 'validate-only-check-plan';
+    await prepareBuild(name);
+    const handedOff = await runnerStep(name, {
+      kind: 'builder-handoff',
+      summary: 'Implemented the confirmed behavior.',
+      addressed_acceptance_ids: ['A1'],
+      checks: [],
+      known_limits: [],
+    });
+    expect(handedOff).toMatchObject({ exitCode: 0, data: { state: { phase: 'verify' } } });
+
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const stateFile = nativePortableStateFile(paths, name);
+    const localFile = nativeLocalExecutionFile(paths, name);
+    const stateBefore = await fs.readFile(stateFile, 'utf8');
+    const localBefore = await fs.readFile(localFile, 'utf8');
+    const inputFile = path.join(projectRoot, 'validate-only-check-plan.json');
+    await fs.writeFile(
+      inputFile,
+      JSON.stringify({
+        kind: 'dispatch-verifier',
+        checks: [
+          {
+            id: 'missing-command',
+            name: 'Missing command',
+            executable: path.join(projectRoot, 'bin', 'does-not-exist'),
+            argv: [],
+            cwdRef: '.',
+            timeoutMs: 1000,
+            repeatable: true,
+          },
+        ],
+      }),
+    );
+
+    try {
+      const result = json(
+        await runNativeCli([
+          'next',
+          name,
+          '--runner-input',
+          inputFile,
+          '--validate-only',
+          '--json',
+          ...projectArgs(),
+        ]),
+      );
+      expect(result).toMatchObject({
+        exitCode: 65,
+        error: { code: 'invalid-data', message: expect.stringContaining('/checks/0') },
+      });
+      await expect(fs.readFile(stateFile, 'utf8')).resolves.toBe(stateBefore);
+      await expect(fs.readFile(localFile, 'utf8')).resolves.toBe(localBefore);
+    } finally {
+      await fs.rm(inputFile, { force: true });
+    }
+  });
+
   it('rejects user-decision flags when combined with another public transition flag', async () => {
     await prepareBuild('revise-requirements-mutual-exclusion');
 
@@ -454,15 +614,15 @@ Run applicable focused checks.
     delete withoutReview.review;
     const missingReview = await runnerStep('reject-forged-runner-fields', withoutReview);
     expect(missingReview).toMatchObject({
-      exitCode: 65,
-      error: { code: 'invalid-data', message: expect.stringContaining('fields are invalid') },
+      exitCode: 0,
+      data: { state: { phase: 'verify' } },
     });
 
     expect(
       json(
         await runNativeCli(['status', 'reject-forged-runner-fields', '--json', ...projectArgs()]),
       ).data,
-    ).toMatchObject({ phase: 'build', loop: { attempt: 0 } });
+    ).toMatchObject({ phase: 'verify', loop: { attempt: 0 } });
   });
 
   it('drives a complete skill-coordinated CLI loop to Archive with an explicit empty check plan', async () => {
@@ -485,11 +645,6 @@ Run applicable focused checks.
                 summary: '<summary>',
                 addressed_acceptance_ids: ['<acceptance-id>'],
                 known_limits: [],
-                review: {
-                  status: 'passed',
-                  summary: '<review-summary>',
-                  reviewer_execution_ref: '<reviewer-execution-ref>',
-                },
               },
             },
           ],
@@ -497,7 +652,11 @@ Run applicable focused checks.
       },
     });
 
-    const built = await runnerStep(name, builderHandoff(['A1', 'A2']));
+    const built = await runnerStep(name, {
+      ...builderHandoff(['A1', 'A2']),
+      checks: [{ name: 'Focused tests', result: 'passed', note: 'Existing command output' }],
+      known_limits: ['Host Hook not exercised'],
+    });
     expect(built).toMatchObject({
       exitCode: 0,
       data: {
@@ -550,6 +709,9 @@ Run applicable focused checks.
             summary: { text: 'A read-only reviewer found no blocking issues.' },
           },
           runtimeChecks: [],
+          builderReportedChecks: [{ name: { text: 'Focused tests' }, result: 'passed' }],
+          builderKnownLimits: [{ text: 'Host Hook not exercised' }],
+          evidenceInstruction: expect.stringContaining('not Runtime receipts'),
         },
       },
     });
@@ -568,9 +730,15 @@ Run applicable focused checks.
         continuation: { inputOptions: Array<{ template: unknown }> };
       }
     ).continuation.inputOptions;
+    expect(responseInputs).toHaveLength(4);
+    for (const option of responseInputs) {
+      expect(Array.isArray(option.template)).toBe(false);
+      expect(option).toMatchObject({ exclusiveGroup: 'runner-input', name: expect.any(String) });
+    }
     expect(JSON.stringify(responseInputs)).toContain('request-checks');
     expect(JSON.stringify(responseInputs)).toContain('final-result');
     expect(JSON.stringify(responseInputs)).toContain('verifier-execution-error');
+    expect(JSON.stringify(responseInputs)).toContain(String(dispatch.verifierExecutionRef));
     expect(JSON.stringify(responseInputs)).not.toMatch(/identity|provider/iu);
 
     const forgedCandidate = await runnerStep(name, {
@@ -582,7 +750,27 @@ Run applicable focused checks.
       error: { message: expect.stringContaining('fields are invalid') },
     });
 
-    const awaitingConfirmation = await runnerStep(name, finalResponse(1, 1, ['A1', 'A2']));
+    const finalTemplate = inputTemplate(dispatched, 'final-result');
+    const responseTemplate = finalTemplate.response as {
+      kind: string;
+      result: Record<string, unknown>;
+    };
+    const awaitingConfirmation = await runnerStep(name, {
+      ...finalTemplate,
+      response: {
+        ...responseTemplate,
+        result: {
+          ...responseTemplate.result,
+          verdict: 'pass',
+          acceptance: ['A1', 'A2'].map((id) => ({
+            id,
+            result: 'passed',
+            reason: `Observed ${id}.`,
+          })),
+          summary: 'Reviewed all criteria.',
+        },
+      },
+    });
     expect(awaitingConfirmation).toMatchObject({
       exitCode: 0,
       data: {
@@ -680,7 +868,7 @@ Run applicable focused checks.
     ).toContain('结果: **验收通过，可归档**');
   });
 
-  it('verifies only the repair scope, reuses checks, then runs one final full verification', async () => {
+  it('runs one full verification for a repaired candidate without a duplicate final pass', async () => {
     const name = 'scoped-repair-verification';
     const counter = path.join(projectRoot, 'repair-check-count.txt');
     const checkPlan = {
@@ -731,29 +919,85 @@ Run applicable focused checks.
     expect(
       (repairDispatch.data as { verifierDispatch: { scopeIds: string[] } }).verifierDispatch
         .scopeIds,
-    ).toEqual(['A2']);
-    expect(await fs.readFile(counter, 'utf8')).toBe('2');
-    const repairPass = await runnerStep(name, finalResponse(2, 1, ['A2']));
-    expect(repairPass.data?.state).toMatchObject({
-      phase: 'verify',
-      status: 'active',
-      acceptance: { total: 2, pending: 2 },
-      loop: { stage: 'verify-ready', next_action: 'run-final-full-verification' },
-    });
-
-    const finalDispatch = await runnerStep(name, checkPlan);
-    expect(
-      (finalDispatch.data as { verifierDispatch: { scopeIds: string[] } }).verifierDispatch
-        .scopeIds,
     ).toEqual(['A1', 'A2']);
     expect(await fs.readFile(counter, 'utf8')).toBe('2');
-    const finalPass = await runnerStep(name, finalResponse(2, 2, ['A1', 'A2']));
-    expect(finalPass.data?.state).toMatchObject({
+    const repairPass = await runnerStep(name, finalResponse(2, 1, ['A1', 'A2']));
+    expect(repairPass.data?.state).toMatchObject({
       phase: 'verify',
       status: 'await-user',
       verification_result: 'pass',
       loop: { next_action: 'confirm-skill-coordinated-pass' },
     });
+    expect(await fs.readFile(counter, 'utf8')).toBe('2');
+  });
+
+  it('rejects a Verifier response bound to the pre-repair candidate before mutation', async () => {
+    const name = 'stale-response-after-repair';
+    await prepareBuild(name, ['First behavior works.', 'Second behavior works.']);
+    await runnerStep(name, builderHandoff(['A1', 'A2']));
+    const firstDispatch = await runnerStep(name, { kind: 'dispatch-verifier', checks: [] });
+    const firstBinding = (
+      firstDispatch.data as {
+        verifierDispatch: { candidateId: string; verifierExecutionRef: string };
+      }
+    ).verifierDispatch;
+    await runnerStep(name, {
+      kind: 'verifier-response',
+      response: {
+        kind: 'final-result',
+        result: {
+          iteration: 1,
+          attempt: 1,
+          verdict: 'fail',
+          acceptance: [
+            { id: 'A1', result: 'passed', reason: 'Observed A1.' },
+            { id: 'A2', result: 'failed', reason: 'A2 still fails.' },
+          ],
+          risks: [],
+          summary: 'A2 needs repair.',
+        },
+      },
+    });
+    await runnerStep(name, builderHandoff(['A2']));
+    const repairDispatch = await runnerStep(name, { kind: 'dispatch-verifier', checks: [] });
+    const repairBinding = (
+      repairDispatch.data as {
+        verifierDispatch: { candidateId: string; verifierExecutionRef: string };
+      }
+    ).verifierDispatch;
+    expect(repairBinding.candidateId).not.toBe(firstBinding.candidateId);
+
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const stateFile = nativePortableStateFile(paths, name);
+    const localFile = nativeLocalExecutionFile(paths, name);
+    const stateBefore = await fs.readFile(stateFile, 'utf8');
+    const localBefore = await fs.readFile(localFile, 'utf8');
+    const stale = await runnerStep(name, {
+      kind: 'verifier-response',
+      candidateId: firstBinding.candidateId,
+      verifierExecutionRef: firstBinding.verifierExecutionRef,
+      response: {
+        kind: 'final-result',
+        result: {
+          iteration: 2,
+          attempt: 1,
+          verdict: 'pass',
+          acceptance: [
+            { id: 'A1', result: 'passed', reason: 'Observed A1.' },
+            { id: 'A2', result: 'passed', reason: 'Observed A2.' },
+          ],
+          risks: [],
+          summary: 'Stale response must not be accepted.',
+        },
+      },
+    });
+    expect(stale).toMatchObject({
+      exitCode: 65,
+      error: { message: expect.stringContaining('stale for the current candidate or execution') },
+    });
+    await expect(fs.readFile(stateFile, 'utf8')).resolves.toBe(stateBefore);
+    await expect(fs.readFile(localFile, 'utf8')).resolves.toBe(localBefore);
+    expect(repairBinding.verifierExecutionRef).not.toBe(firstBinding.verifierExecutionRef);
   });
 
   it('revises requirements after a rejected skill-coordinated pass and starts a fresh candidate cycle', async () => {
@@ -1078,7 +1322,7 @@ Run applicable focused checks.
             },
           ]
         : [];
-      await runnerStep(name, { kind: 'dispatch-verifier', checks });
+      const dispatched = await runnerStep(name, { kind: 'dispatch-verifier', checks });
 
       const forged = await runnerStep(name, {
         kind: 'verifier-unavailable',
@@ -1091,7 +1335,7 @@ Run applicable focused checks.
       });
 
       const unavailable = await runnerStep(name, {
-        kind: 'verifier-unavailable',
+        ...inputTemplate(dispatched, 'verifier-unavailable'),
         summary: 'This platform cannot start an independent Agent execution.',
       });
       expect(unavailable).toMatchObject({
@@ -1264,12 +1508,8 @@ Run applicable focused checks.
       }
     ).verifierDispatch;
     const firstError = await runnerStep(name, {
-      kind: 'verifier-execution-error',
+      ...inputTemplate(firstDispatch, 'verifier-execution-error'),
       summary: 'The first Verifier execution ended.',
-      stateVersion: first.stateVersion,
-      iteration: first.iteration,
-      attempt: first.attempt,
-      verifierExecutionRef: first.verifierExecutionRef,
     });
     expect(firstError).toMatchObject({
       exitCode: 0,
@@ -1409,12 +1649,11 @@ Run applicable focused checks.
       dispatched.data as { verifierDispatch: { iteration: number; attempt: number } }
     ).verifierDispatch;
 
+    const requestTemplate = inputTemplate(dispatched, 'request-checks');
     const requested = await runnerStep(name, {
-      kind: 'verifier-response',
+      ...requestTemplate,
       response: {
-        kind: 'request-checks',
-        iteration: firstDispatch.iteration,
-        attempt: firstDispatch.attempt,
+        ...(requestTemplate.response as Record<string, unknown>),
         checks: [
           {
             id: 'verifier-extra',

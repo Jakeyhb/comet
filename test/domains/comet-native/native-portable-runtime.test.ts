@@ -13,6 +13,7 @@ import { withNativeMutationLock } from '../../../domains/comet-native/native-mut
 import {
   ensureNativeDirectories,
   nativeProjectPaths,
+  nativePreferredChangeRuntimeDir,
 } from '../../../domains/comet-native/native-paths.js';
 import {
   confirmNativePortableShape as confirmNativePortableShapeAtBoundary,
@@ -28,10 +29,13 @@ import {
   prepareNativePortableShapeConfirmation,
   readNativePortableChange,
   recordNativePortableVerifierFailure,
+  retryNativePortableCheckPlan,
+  sameNativeCheckPlan,
   retryNativePortableVerifier,
   submitNativePortableBuilderCandidate,
   submitNativePortableVerifierResult,
 } from '../../../domains/comet-native/native-portable-runtime.js';
+import { sameNativeCheckPlan as sameNativeCheckPlanModule } from '../../../domains/comet-native/native-portable-checks.js';
 import { confirmNativePortableShape } from '../../helpers/native-portable-confirmed-transition.js';
 import { createNativeRunnerChannel } from '../../../domains/comet-native/native-runner-protocol.js';
 import type { NativeProjectPaths } from '../../../domains/comet-native/native-types.js';
@@ -45,6 +49,22 @@ function passedReview(reviewerExecutionRef: string) {
 }
 
 describe('Native portable Runtime vertical path', () => {
+  it('keeps check-plan identity in the portable checks module', () => {
+    const root = path.resolve(os.tmpdir(), 'comet-portable-checks');
+    const state = { builder_handoff: { candidate_id: 'candidate' } } as never;
+    const local = {
+      candidateId: 'candidate',
+      inputFingerprint: 'fingerprint',
+      workspace: {
+        projectRoot: root,
+        worktreeRoot: root,
+        branch: null,
+        machineId: os.hostname(),
+      },
+      checks: [],
+    } as never;
+    expect(sameNativeCheckPlanModule(local, [], root, state, 'fingerprint', null)).toBe(true);
+  });
   let root: string;
   let paths: NativeProjectPaths;
 
@@ -528,7 +548,7 @@ children:
     );
   });
 
-  it('reruns a repeatable interrupted check instead of reusing its incomplete result', async () => {
+  it('returns a retry action for an interrupted check and reruns it explicitly', async () => {
     await createNativePortableChange({ paths, name: 'timeout-rerun', language: 'en' });
     const changeDir = nativePortableChangeDir(paths, 'timeout-rerun');
     await fs.writeFile(
@@ -551,6 +571,15 @@ children:
         review: passedReview('timeout-reviewer'),
       },
     });
+    const passedPlan = {
+      id: 'passed-check',
+      name: 'Passed check',
+      executable: process.execPath,
+      argv: ['-e', "console.log('passed')"],
+      cwdRef: '.',
+      timeoutMs: 10_000,
+      repeatable: true,
+    } as const;
     const plan = {
       id: 'timeout-check',
       name: 'Timeout check',
@@ -561,14 +590,99 @@ children:
       repeatable: true,
     } as const;
 
-    const first = await executeNativePortableCheckPlan({ paths, name: state.name, plans: [plan] });
-    expect(first.checks).toMatchObject([{ id: plan.id, status: 'interrupted' }]);
-    const second = await executeNativePortableCheckPlan({ paths, name: state.name, plans: [plan] });
-    expect(second.checks).toMatchObject([{ id: plan.id, status: 'interrupted' }]);
+    const plans = [passedPlan, plan];
+    const first = await executeNativePortableCheckPlan({ paths, name: state.name, plans });
+    expect(first.checks).toMatchObject([
+      { id: passedPlan.id, status: 'passed' },
+      { id: plan.id, status: 'interrupted' },
+    ]);
+    const second = await executeNativePortableCheckPlan({ paths, name: state.name, plans });
+    expect(second.checks).toMatchObject([
+      { id: passedPlan.id, status: 'passed' },
+      { id: plan.id, status: 'interrupted' },
+    ]);
+    await expect(
+      retryNativePortableCheckPlan({
+        paths,
+        name: state.name,
+        checkIds: [plan.id],
+      }),
+    ).resolves.toMatchObject({
+      checks: [
+        { id: passedPlan.id, status: 'passed' },
+        { id: plan.id, status: 'interrupted' },
+      ],
+    });
+    await expect(
+      retryNativePortableCheckPlan({ paths, name: state.name, checkIds: [plan.id] }),
+    ).resolves.toMatchObject({
+      checks: [
+        { id: passedPlan.id, status: 'passed' },
+        { id: plan.id, status: 'interrupted' },
+      ],
+    });
+    await expect(
+      retryNativePortableCheckPlan({ paths, name: state.name, checkIds: [plan.id] }),
+    ).rejects.toThrow('retry limit (3)');
     const local = await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name));
     expect(local?.checks).toMatchObject([
-      { id: plan.id, status: 'interrupted', executionCount: 2 },
+      { id: passedPlan.id, status: 'passed', executionCount: 1 },
+      { id: plan.id, status: 'interrupted', executionCount: 3 },
     ]);
+  });
+
+  it('rejects an unavailable check before reserving a local execution operation', async () => {
+    await createNativePortableChange({ paths, name: 'preflight-boundary', language: 'en' });
+    const changeDir = nativePortableChangeDir(paths, 'preflight-boundary');
+    await fs.writeFile(
+      path.join(changeDir, 'brief.md'),
+      '# Acceptance examples\n- Invalid plans are rejected before reservation.\n',
+    );
+    let state = await confirmNativePortableShape({ paths, name: 'preflight-boundary' });
+    const runner = createNativeRunnerChannel();
+    state = await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'preflight-builder',
+        }),
+        candidateId: 'preflight-candidate',
+        summary: 'Implemented the candidate.',
+        addressedAcceptanceIds: ['A1'],
+        review: null,
+      },
+    });
+    const before = await readNativePortableChange(paths, state.name);
+    const localBefore = await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name));
+
+    await expect(
+      executeNativePortableCheckPlan({
+        paths,
+        name: state.name,
+        plans: [
+          {
+            id: 'missing-command',
+            name: 'Missing command',
+            executable: path.join(root, 'bin', 'does-not-exist'),
+            argv: [],
+            cwdRef: '.',
+            timeoutMs: 1000,
+            repeatable: true,
+          },
+        ],
+      }),
+    ).rejects.toThrow('/checks/0');
+
+    await expect(
+      readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name)),
+    ).resolves.toEqual(localBefore);
+    await expect(readNativePortableChange(paths, state.name)).resolves.toMatchObject({
+      state_version: before.state_version,
+      phase: before.phase,
+      loop: { failed_iteration_count: before.loop.failed_iteration_count },
+    });
   });
 
   it('runs one final check, accepts a trusted complete Verifier result, and writes the report', async () => {
@@ -616,6 +730,34 @@ Ship the behavior.
         },
       ],
     });
+    const executedLocal = await readNativeLocalExecution(
+      nativeLocalExecutionFile(paths, state.name),
+    );
+    const executedLog = path.join(
+      nativePreferredChangeRuntimeDir(paths, state.name),
+      ...executedLocal!.checks[0].log.split('/'),
+    );
+    expect(executedLocal?.checks[0].evidenceDigest).toBeTruthy();
+    await fs.writeFile(executedLog, 'tampered Runtime evidence\n');
+    const rerunAfterTamperedLog = await executeNativePortableCheckPlan({
+      paths,
+      name: state.name,
+      plans: [
+        {
+          id: 'behavior',
+          name: 'Behavior check',
+          executable: process.execPath,
+          argv: ['-e', "console.log('ready')"],
+          cwdRef: '.',
+          timeoutMs: 10_000,
+          repeatable: true,
+        },
+      ],
+    });
+    expect(rerunAfterTamperedLog.checks).toMatchObject([{ id: 'behavior', status: 'passed' }]);
+    await expect(
+      readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name)),
+    ).resolves.toMatchObject({ checks: [{ id: 'behavior', executionCount: 2 }] });
     state = await dispatchNativePortableVerifier({
       paths,
       name: state.name,
@@ -915,6 +1057,76 @@ Ship the behavior.
     expect(completed.state.verification?.risks[0]).toMatchObject({ truncated: true });
   });
 
+  it('invalidates reusable checks when an ignored generated artifact changes', async () => {
+    execFileSync('git', ['-C', root, 'init', '-b', 'master'], { stdio: 'ignore' });
+    await fs.writeFile(path.join(root, '.gitignore'), 'dist/\n.comet/\n');
+    await fs.writeFile(path.join(root, 'baseline.txt'), 'baseline\n');
+    execFileSync('git', ['-C', root, 'add', '.gitignore', 'baseline.txt'], { stdio: 'ignore' });
+    execFileSync(
+      'git',
+      [
+        '-C',
+        root,
+        '-c',
+        'user.name=Comet Test',
+        '-c',
+        'user.email=comet-test@example.com',
+        'commit',
+        '-m',
+        'baseline',
+      ],
+      { stdio: 'ignore' },
+    );
+
+    await createNativePortableChange({ paths, name: 'ignored-generated-input', language: 'en' });
+    const changeDir = nativePortableChangeDir(paths, 'ignored-generated-input');
+    await fs.writeFile(
+      path.join(changeDir, 'brief.md'),
+      '# Acceptance examples\n- Generated inputs invalidate reusable checks.\n',
+    );
+    let state = await confirmNativePortableShape({ paths, name: 'ignored-generated-input' });
+    const runner = createNativeRunnerChannel();
+    state = await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'ignored-generated-builder',
+        }),
+        candidateId: 'ignored-generated-candidate',
+        summary: 'Implemented the behavior.',
+        addressedAcceptanceIds: ['A1'],
+        review: passedReview('ignored-generated-reviewer'),
+      },
+    });
+    const plan = {
+      id: 'generated-input',
+      name: 'Generated input check',
+      executable: process.execPath,
+      argv: ['-e', 'process.exit(0)'],
+      cwdRef: '.',
+      timeoutMs: 10_000,
+      repeatable: true,
+    } as const;
+
+    await expect(
+      executeNativePortableCheckPlan({ paths, name: state.name, plans: [plan] }),
+    ).resolves.toMatchObject({ checks: [{ id: plan.id, status: 'passed' }] });
+    const firstLocal = await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name));
+    await fs.mkdir(path.join(root, 'dist'));
+    await fs.writeFile(path.join(root, 'dist', 'generated.txt'), 'generated output v1\n');
+
+    await expect(
+      executeNativePortableCheckPlan({ paths, name: state.name, plans: [plan] }),
+    ).resolves.toMatchObject({ checks: [{ id: plan.id, status: 'passed' }] });
+    const secondLocal = await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name));
+    expect(firstLocal?.execution?.operationId).toBeTruthy();
+    expect(secondLocal?.execution?.operationId).toBeTruthy();
+    expect(secondLocal?.execution?.operationId).not.toBe(firstLocal?.execution?.operationId);
+    expect(secondLocal?.checks).toMatchObject([{ id: plan.id, executionCount: 1 }]);
+  });
+
   it('does not hold the project mutation lock while a requested check is running', async () => {
     await createNativePortableChange({ paths, name: 'requested-check-lock', language: 'en' });
     const changeDir = nativePortableChangeDir(paths, 'requested-check-lock');
@@ -1192,6 +1404,55 @@ Ship the behavior.
     const local = await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name));
     expect(reused.checks.map(({ id }) => id)).toEqual(['baseline', 'round-one', 'round-two']);
     expect(local?.checks.map(({ executionCount }) => executionCount)).toEqual([1, 1, 1]);
+  });
+
+  it('uses the reserved branch snapshot while deciding whether checks are reusable', async () => {
+    execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'native@example.test'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Native Test'], { cwd: root });
+    await fs.writeFile(path.join(root, 'source.txt'), 'baseline\n');
+    execFileSync('git', ['add', '.'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'seed branch snapshot'], {
+      cwd: root,
+      stdio: 'ignore',
+    });
+
+    await createNativePortableChange({ paths, name: 'branch-snapshot', language: 'en' });
+    const changeDir = nativePortableChangeDir(paths, 'branch-snapshot');
+    await fs.writeFile(
+      path.join(changeDir, 'brief.md'),
+      '# Acceptance examples\n- The branch snapshot remains stable.\n',
+    );
+    let state = await confirmNativePortableShape({ paths, name: 'branch-snapshot' });
+    const runner = createNativeRunnerChannel();
+    state = await submitNativePortableBuilderCandidate({
+      paths,
+      name: state.name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'branch-snapshot-builder',
+        }),
+        candidateId: 'branch-snapshot-candidate',
+        summary: 'Implemented the branch snapshot behavior.',
+        addressedAcceptanceIds: ['A1'],
+        review: passedReview('branch-snapshot-reviewer'),
+      },
+    });
+
+    await executeNativePortableCheckPlan({ paths, name: state.name, plans: [] });
+    const local = await readNativeLocalExecution(nativeLocalExecutionFile(paths, state.name));
+    const branch = execFileSync('git', ['branch', '--show-current'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).trim();
+    expect(local).not.toBeNull();
+    expect(sameNativeCheckPlan(local!, [], root, state, local!.inputFingerprint, branch)).toBe(
+      true,
+    );
+    expect(
+      sameNativeCheckPlan(local!, [], root, state, local!.inputFingerprint, 'different-branch'),
+    ).toBe(false);
   });
 
   it('rejects a late host response without charging the current Verifier attempt', async () => {

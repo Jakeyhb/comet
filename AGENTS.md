@@ -2,6 +2,22 @@
 
 必须采用中文回答用户
 
+## 表达与文档风格
+
+适用于回复、Skill、开发文档、CLI 帮助、错误提示和代码注释。
+
+- 使用自然、具体的表达，先说明结果或动作，再说明必要的原因和条件。Skill 指令写清何时执行、执行什么、完成条件是什么。
+- 用事实、行为和例子解释问题；删去空泛评价、宣传口吻、机械排比、重复总结，以及没有实际区别的“不是 X，而是 Y”句式。标题、加粗和列表只用于帮助阅读。
+- 用准确的常用词表达概念，避免堆砌抽象名词、自造口号或生硬直译。技术术语确有必要时保留，并在首次出现且读者可能不熟悉时简要解释。
+- 精简重复表述，保留需求范围、触发条件、例外、失败处理、确认要求和验收标准。必要内容移到参考文件时，写明读取条件与位置；不能以减少字数代替完整说明。
+
+## 代码与 CLI 术语
+
+- 新增或修改命令、参数、函数、类型、模块和协议字段时，先查仓库中同一概念的既有名称，再参考相关 Agent 工具、依赖库或开源项目的公开接口与文档。优先采用含义一致、已有使用惯例的名称。
+- Agent 概念和架构术语应与实际职责对应，例如 tool、agent、session、handoff、checkpoint、router、adapter、state machine；不能仅为显得专业而套用术语或引入对应抽象。不确定是否通用时先核对来源，不凭印象声称是行业标准。
+- 同一概念在代码、CLI、JSON、帮助和文档中保持一致；不同职责保留区别，不为统一名称而混淆状态或角色。CLI 动作使用明确的动词，参数说明操作对象或选项含义，遵循仓库已有命令结构。
+- 没有合适通用词时，使用能直接说明职责的领域名称，并简要定义。现有公开名称的调整须评估兼容性和迁移影响；本规则不要求批量重命名已有接口或重构架构。
+
 ## 开发工作区保护
 
 开始修改前检查当前分支、比较基线、未提交文件和子模块状态。保留所有无关修改，不得通过 `reset`、`clean`、删除或格式化无关文件来换取检查通过。提交时只显式暂存本任务文件。
@@ -27,11 +43,14 @@ Issue、Review 意见、Project Knowledge、Memory 和历史记录只提供调�
 验证范围必须与改动风险相匹配，不要在每次编辑后默认运行全量测试。
 
 - 每轮先运行覆盖当前改动的最小相关测试。
+- 需要根据当前差异选择检查时，运行 `pnpm verify:changed --base <比较基线>`；该命令只读取差异并执行检查，不生成文件或更新快照。
 - 纯文档或 Skill 内容修改：运行相关契约测试和受影响文件的 Prettier 检查。
 - 单一 `app/`、`domains/` 或 `platform/` 模块修改：运行对应测试；涉及编译、Runtime 或生成物时再运行 build。
-- 跨模块、Runtime、安装/路由、发布准备或其他高风险修改：最终交付前运行一次全量测试。
+- 只有当前差异实际跨越多个生产模块，或涉及 Runtime、安装/路由、发布准备等高风险边界时，才在最终交付前运行一次全量测试；仅修改多个文件、生成资产或多个测试文件不自动构成全量测试理由。
 - 全量测试失败或超时时，先定位原因；只有修正了明确原因后才重跑，不盲目重复。
 - CI 已覆盖全量检查时，可以在本地只运行相关验证，但交付时必须明确说明未在本地运行的检查。
+- Native 的“完整独立验收”是当前候选的全部验收项，不等于仓库全量测试；优先复用仍与候选和执行上下文匹配的 Runtime 检查，只补跑缺失或已失效的检查。
+- 全量测试同一时刻只允许有一轮；启动前记录原因、范围和预计耗时。出现首个明确失败或超时后先收集结果并分类，不能因为等待工具超时、单个长测试或未收到汇总就并行重启另一轮。
 
 ```bash
 npx vitest run <相关测试文件>                     # 默认：最小相关测试
@@ -86,7 +105,7 @@ pnpm test           # 高风险修改或最终交付前需要本地全量验证�
 - `test/fixtures/` 和 `test/helpers/` 只放测试数据与测试工具。
 - 禁止新增或恢复 `test/ts/` 这种横向桶；旧文件应迁移到上面对应目录。
 
-架构约束由 `pnpm run lint:architecture` 校验，并已接入 `pnpm lint`。它会检查顶层目录白名单、活跃源码根、app/domain/platform 子模块、脚本模块、Classic/Native/Entry runtime 入口与生成物、内置 Skill 根目录、测试归属和禁止旧目录回归。如果确实需要新增顶层目录、源码模块、测试根目录或例外，必须先更新 `config/repository-layout.json`、架构 linter 和本节说明。
+架构约束由 `pnpm run lint:architecture` 校验，并已接入 `pnpm lint`。它会检查顶层目录白名单、活跃源码根、app/domain/platform 子模块、脚本模块、Classic/Native/Entry runtime 入口与生成物、内置 Skill 根目录、测试归属、领域依赖方向、跨领域入口、纯模型和兼容门面。新增领域依赖或供其他领域使用的源码入口时，先判断职责是否合理，再显式更新 `config/repository-layout.json`；不得由脚本自动扩展许可清单。新增顶层目录、源码模块、测试根目录或例外时，同时更新架构 linter 和本节说明。
 
 ## Classic runtime 脚本规范
 
@@ -112,6 +131,7 @@ pnpm test           # 高风险修改或最终交付前需要本地全量验证�
 ```
 comet-runtime.mjs ← domains/comet-classic/*
 comet-state.mjs ← domains/comet-classic/classic-state-entry.ts
+comet-check.mjs ← domains/comet-classic/classic-check-entry.ts (执行并绑定验证证据)
 comet-guard.mjs ← domains/comet-classic/classic-guard-entry.ts
 comet-handoff.mjs ← domains/comet-classic/classic-handoff-entry.ts (写入 handoff_context/handoff_hash)
 comet-archive.mjs ← domains/comet-classic/classic-archive-entry.ts
