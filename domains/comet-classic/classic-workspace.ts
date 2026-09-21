@@ -13,7 +13,12 @@ import {
   listGitWorktrees,
   type GitWorktreeEntry,
 } from '../../platform/paths/git-worktree.js';
-import { assertOpenSpecChangeName, inspectClassicActiveChangeDirectory } from './classic-paths.js';
+import {
+  assertOpenSpecChangeName,
+  findClassicArchiveChangeDirectory,
+  inspectClassicActiveChangeDirectory,
+} from './classic-paths.js';
+import { readClassicDelivery } from './classic-progress.js';
 import { readWorkflowProjectConfigDocument } from '../workflow-contract/project-config-reader.js';
 import { writeWorkflowProjectConfigSource } from '../workflow-contract/project-config-writer.js';
 import {
@@ -57,17 +62,23 @@ async function ensureWorkspaceConfig(sourceRoot: string, targetRoot: string): Pr
   });
   let openSpecContent;
   try {
-    openSpecContent = await readProtectedProjectFile(sourceRoot, relativeConfig, 1024 * 1024, {
-      label: 'Classic OpenSpec workspace configuration',
-    });
+    openSpecContent = await readProtectedProjectFile(
+      sourceRoot,
+      relativeConfig,
+      WORKFLOW_PROJECT_CONFIG_MAX_BYTES,
+      { label: 'Classic OpenSpec workspace configuration' },
+    );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
   if (targetConfig.exists) {
-    const targetContent = await readProtectedProjectFile(targetRoot, relativeConfig, 1024 * 1024, {
-      label: 'Classic OpenSpec workspace configuration',
-    });
+    const targetContent = await readProtectedProjectFile(
+      targetRoot,
+      relativeConfig,
+      WORKFLOW_PROJECT_CONFIG_MAX_BYTES,
+      { label: 'Classic OpenSpec workspace configuration' },
+    );
     if (
       openSpecContent.bytes.toString('utf8').replaceAll('\r\n', '\n') !==
       targetContent.bytes.toString('utf8').replaceAll('\r\n', '\n')
@@ -383,16 +394,37 @@ async function readCandidate(
   worktree: GitWorktreeEntry | null,
   name: string,
 ): Promise<ClassicWorkspaceCandidate | null> {
-  let active;
+  let changeDirectory: string | null = null;
   try {
-    active = await inspectClassicActiveChangeDirectory(name, projectRoot);
+    const active = await inspectClassicActiveChangeDirectory(name, projectRoot);
+    if (active.stateExists) changeDirectory = active.directory;
   } catch {
-    return null;
+    // An invalid active copy should not hide a valid archived pending-delivery copy.
   }
-  if (!active.stateExists) return null;
+  if (changeDirectory === null) {
+    const archived = await findClassicArchiveChangeDirectory(name, projectRoot);
+    if (!archived) return null;
+    let archivedDocument;
+    try {
+      archivedDocument = parseDocument(
+        await fs.readFile(path.join(archived.directory, '.comet.yaml'), 'utf8'),
+      );
+      const archivedRecord = (archivedDocument.toJS() ?? {}) as Record<string, unknown>;
+      if (archivedRecord.archived !== true) return null;
+      const delivery = await readClassicDelivery(projectRoot, archived.directory);
+      if (['complete', 'local-verified'].includes(delivery.verification.status)) return null;
+      changeDirectory = archived.directory;
+    } catch {
+      return null;
+    }
+  }
+  const candidateDirectory = changeDirectory;
+  if (candidateDirectory === null) return null;
   let document;
   try {
-    document = parseDocument(await fs.readFile(path.join(active.directory, '.comet.yaml'), 'utf8'));
+    document = parseDocument(
+      await fs.readFile(path.join(candidateDirectory, '.comet.yaml'), 'utf8'),
+    );
   } catch {
     return null;
   }
@@ -400,7 +432,7 @@ async function readCandidate(
   return {
     projectRoot: path.resolve(projectRoot),
     worktree,
-    changeDirectory: active.directory,
+    changeDirectory: candidateDirectory,
     isolation: typeof record.isolation === 'string' ? record.isolation : null,
     boundBranch: typeof record.bound_branch === 'string' ? record.bound_branch : null,
     branch: worktree?.branch ?? inspectGitWorktree(projectRoot).currentBranch,

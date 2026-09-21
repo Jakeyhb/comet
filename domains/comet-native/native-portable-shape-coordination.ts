@@ -23,13 +23,17 @@ import {
   reconcileNativeSupervisorState,
 } from './native-supervisor-model.js';
 import {
+  assertNoActiveNativeSupervisorTasks,
   readNativeSupervisorState,
   writeNativeSupervisorState,
 } from './native-supervisor-state.js';
 import { prepareNativeSupervisorIntegrationWorkspace } from './native-supervisor-workspace.js';
 import { rebuildNativeSupervisorStateFromFacts } from './native-supervisor-coordinator.js';
+import { appendNativePortableHistory } from './native-portable-state.js';
+import { toNativePortableText } from './native-portable-text.js';
 import {
   currentBranch,
+  lateBindPortableCurrentWorkspace,
   nativeLocalExecutionFile,
   nativePortableChangeDir,
   readNativePortableChange,
@@ -87,8 +91,32 @@ export async function confirmNativePortableShape(options: {
         acceptanceIds: acceptance.map(({ id }) => id),
         validation: nativeChildrenAcceptanceValidation({ ...state, acceptance }),
       });
+      let bound = state;
       if (children && state.workspace.change_branch === null) {
-        throw new Error('Native parent changes require a Git integration branch');
+        await assertNoActiveNativeSupervisorTasks(options.paths, state.name);
+        const workspace = lateBindPortableCurrentWorkspace(
+          state.workspace,
+          options.paths.projectRoot,
+        );
+        if (workspace === null) {
+          throw new Error(
+            'Native parent changes require a Git integration branch; initialize Git, commit to a branch, then rerun the latest continuation to bind the workspace',
+          );
+        }
+        bound = appendNativePortableHistory(
+          { ...state, workspace },
+          {
+            goal_cycle: state.loop.goal_cycle,
+            iteration: state.loop.iteration,
+            attempt: state.loop.attempt,
+            outcome: 'recovery',
+            unresolved_ids: [],
+            summary: toNativePortableText(
+              `Native workspace bound to branch ${workspace.change_branch} at the Supervisor Shape confirmation boundary`,
+            ),
+            completed_at: new Date().toISOString(),
+          },
+        );
       }
       const coordinationRequired =
         (await readNativeSupervisorShapeIntent(
@@ -122,11 +150,12 @@ export async function confirmNativePortableShape(options: {
           paths: options.paths,
           state,
           reason,
+          keepFailureBudget: true,
         });
         throw new Error(`${reason}; Native change returned to Shape and requires confirmation`);
       }
       const next = confirmNativePortableAcceptance({
-        state: { ...state, spec_changes: specChanges },
+        state: { ...bound, spec_changes: specChanges },
         acceptance: acceptance.map((entry) => ({ ...entry })),
       });
       delete next.children_contract_hash;
@@ -171,7 +200,7 @@ export async function confirmNativePortableShape(options: {
       let supervisorTargetBranch: string | null = null;
       let supervisorTargetCommit: string | null = null;
       if (children?.contract.schema === 'comet.native.children.v2') {
-        supervisorTargetBranch = state.workspace.change_branch ?? state.workspace.target_branch;
+        supervisorTargetBranch = bound.workspace.change_branch ?? bound.workspace.target_branch;
         if (!supervisorTargetBranch) {
           throw new Error('Native Supervisor v2 requires a target branch');
         }
@@ -198,6 +227,33 @@ export async function confirmNativePortableShape(options: {
           });
         }
       }
+      // Reconcile or create the Supervisor state before touching the portable
+      // state or local execution overlay. Contract removals and immutable
+      // integrated-child changes can throw; validating them first prevents a
+      // confirmed Shape from leaving a half-written portable plan behind.
+      const supervisorStateToWrite =
+        children?.contract.schema === 'comet.native.children.v2' &&
+        supervisorTargetBranch &&
+        supervisorTargetCommit
+          ? existingSupervisor
+            ? reconcileNativeSupervisorState({
+                state: existingSupervisor,
+                contract: children.contract,
+              })
+            : supervisorWorkspace
+              ? createNativeSupervisorState({
+                  parent: next.name,
+                  targetBranch: supervisorTargetBranch,
+                  targetCommit: supervisorTargetCommit,
+                  integrationBranch: supervisorWorkspace.binding.changeBranch!,
+                  integrationWorktree: supervisorWorkspace.projectRoot,
+                  contract: children.contract,
+                })
+              : null
+          : null;
+      if (children?.contract.schema === 'comet.native.children.v2' && !supervisorStateToWrite) {
+        throw new Error('Native Supervisor integration state is unavailable');
+      }
       const written = await writePortableMutation({ paths: options.paths, previous: state, next });
       await writeNativeLocalExecution(
         nativeLocalExecutionFile(options.paths, state.name),
@@ -208,28 +264,8 @@ export async function confirmNativePortableShape(options: {
         }),
         { containedRoot: options.paths.runtimeDir },
       );
-      if (
-        children?.contract.schema === 'comet.native.children.v2' &&
-        supervisorTargetBranch &&
-        supervisorTargetCommit
-      ) {
-        const supervisorState = existingSupervisor
-          ? reconcileNativeSupervisorState({
-              state: existingSupervisor,
-              contract: children.contract,
-            })
-          : supervisorWorkspace
-            ? createNativeSupervisorState({
-                parent: written.name,
-                targetBranch: supervisorTargetBranch,
-                targetCommit: supervisorTargetCommit,
-                integrationBranch: supervisorWorkspace.binding.changeBranch!,
-                integrationWorktree: supervisorWorkspace.projectRoot,
-                contract: children.contract,
-              })
-            : null;
-        if (!supervisorState) throw new Error('Native Supervisor integration state is unavailable');
-        await writeNativeSupervisorState(options.paths, supervisorState);
+      if (supervisorStateToWrite) {
+        await writeNativeSupervisorState(options.paths, supervisorStateToWrite);
       }
       return written;
     },

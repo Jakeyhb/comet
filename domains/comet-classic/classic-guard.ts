@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { promises as fs } from 'fs';
 import { inspectClassicAutonomousBuildProblems } from './classic-plan-readiness.js';
 import { classicIssue, type ClassicIssue } from './classic-issues.js';
 import { classicRecoveryContext } from './classic-recovery.js';
@@ -18,12 +19,15 @@ import type { ClassicCommandHandler, ClassicCommandResult } from './classic-cli.
 import { classicGuardCheckEnvelope, classicLocale } from './classic-output-language.js';
 import type { CliOutputEnvelope } from '../workflow-contract/output-envelope.js';
 import {
-  usableCommandCheck,
+  evaluateCommandCheck,
   latestCommandCheck,
+  latestInterruptedCommandCheck,
   executeCommandCheck,
+  type CommandCheckEvaluation,
   type CommandCheckScope,
   type RecordedCommandCheck,
 } from './classic-command-checks.js';
+import { readCheckPolicy } from './classic-check-policy.js';
 import { inspectClassicChange } from './classic-diagnostics.js';
 import { assertClassicLayoutWritable, classicProjectRelative } from './classic-layout.js';
 import {
@@ -307,7 +311,11 @@ async function preflight(changeDir: string, name: string): Promise<void> {
   const unknownKeys = Array.from(new Set(projection.unknownKeys)).sort();
   if (unknownKeys.length > 0) {
     throw new GuardFailure(
-      red(`FATAL: .comet.yaml has unknown field(s): ${unknownKeys.join(', ')}`),
+      red(
+        `FATAL: .comet.yaml has unknown field(s): ${unknownKeys.join(
+          ', ',
+        )}. Remove them (or realign them with this Comet version, e.g. after a version rollback), then rerun comet classic validate`,
+      ),
     );
   }
 }
@@ -392,7 +400,7 @@ interface CommandRun {
 }
 
 const INFERRED_COMMAND_SOURCES = [
-  'package.json with a build script',
+  'package.json with a build script (invocation root, or a single workspace package when the root has none)',
   'pom.xml',
   'Cargo.toml',
 ] as const;
@@ -423,7 +431,67 @@ function invocationTarget(relative: string): string {
   return path.resolve(classicCommandInvocationCwd(), relative);
 }
 
-async function inferredBuildCommand(): Promise<string | null> {
+/**
+ * Expands one workspace pattern level (`packages/*`, `apps/*`); deeper globs
+ * are left unexpanded so pathological repositories stay cheap to probe.
+ */
+function workspaceGlobDirectories(pattern: string): { prefix: string; wildcard: boolean } | null {
+  const normalized = pattern.replaceAll('\\', '/').replace(/\/+$/u, '');
+  const match = /^(.+\/)?\*(?:\/\*\*)?$/u.exec(normalized);
+  if (match) return { prefix: match[1] ?? '', wildcard: true };
+  if (normalized.includes('*')) return null;
+  return { prefix: normalized, wildcard: false };
+}
+
+const WORKSPACE_PACKAGE_LIMIT = 32;
+
+async function workspacePackageDirectories(rootWorkspaces: unknown): Promise<string[]> {
+  const listed = Array.isArray(rootWorkspaces)
+    ? rootWorkspaces
+    : rootWorkspaces &&
+        typeof rootWorkspaces === 'object' &&
+        Array.isArray((rootWorkspaces as { packages?: unknown }).packages)
+      ? (rootWorkspaces as { packages: unknown[] }).packages
+      : [];
+  const patterns = listed.filter((entry): entry is string => typeof entry === 'string');
+  const pnpmWorkspace = invocationTarget('pnpm-workspace.yaml');
+  if (await exists(pnpmWorkspace)) {
+    try {
+      const document = parseDocument(
+        await readClassicProjectFile(classicCommandProjectRoot(), pnpmWorkspace, {
+          label: 'pnpm-workspace.yaml',
+        }),
+      );
+      const packages = document.get('packages');
+      if (Array.isArray(packages))
+        for (const entry of packages) if (typeof entry === 'string') patterns.push(entry);
+    } catch {
+      // An unreadable workspace file must not break build detection.
+    }
+  }
+  const directories = new Set<string>();
+  for (const pattern of patterns) {
+    const parsed = workspaceGlobDirectories(pattern);
+    if (!parsed) continue;
+    if (!parsed.wildcard) {
+      directories.add(parsed.prefix);
+      continue;
+    }
+    const base = parsed.prefix ? invocationTarget(parsed.prefix) : classicCommandInvocationCwd();
+    let entries: import('fs').Dirent[];
+    try {
+      entries = await fs.readdir(base, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries.slice(0, WORKSPACE_PACKAGE_LIMIT))
+      if (entry.isDirectory()) directories.add(`${parsed.prefix}${entry.name}`);
+    if (directories.size >= WORKSPACE_PACKAGE_LIMIT) break;
+  }
+  return [...directories].sort();
+}
+
+async function inferredBuildCommand(): Promise<string | { ambiguous: string[] } | null> {
   const packageJson = invocationTarget('package.json');
   if (await exists(packageJson)) {
     const parsed = JSON.parse(
@@ -432,8 +500,34 @@ async function inferredBuildCommand(): Promise<string | null> {
       }),
     ) as {
       scripts?: Record<string, unknown>;
+      workspaces?: unknown;
     };
     if (typeof parsed.scripts?.build === 'string') return 'npm run build';
+    // A monorepo root without its own build script falls back to workspace
+    // packages; exactly one candidate auto-runs like a root script, several
+    // candidates stay explicit because choosing for the user would be a guess.
+    const candidates: string[] = [];
+    for (const directory of await workspacePackageDirectories(parsed.workspaces)) {
+      const subPackage = invocationTarget(path.posix.join(directory, 'package.json'));
+      if (!(await exists(subPackage))) continue;
+      try {
+        const sub = JSON.parse(
+          await readClassicProjectFile(classicCommandProjectRoot(), subPackage, {
+            label: `package.json (${directory})`,
+          }),
+        ) as {
+          scripts?: Record<string, unknown>;
+        };
+        if (typeof sub.scripts?.build === 'string') candidates.push(directory);
+      } catch {
+        continue;
+      }
+    }
+    if (candidates.length === 1) {
+      const directory = candidates[0].includes(' ') ? `"${candidates[0]}"` : candidates[0];
+      return `npm --prefix ${directory} run build`;
+    }
+    if (candidates.length > 1) return { ambiguous: candidates };
   }
   if (await exists(invocationTarget('pom.xml'))) {
     if (process.platform === 'win32') {
@@ -451,8 +545,43 @@ function evidenceDetail(record: RecordedCommandCheck): string {
   return `Evidence: recorded command-check at ${record.timestamp}; command: ${record.command}; cwd: ${record.cwd}`;
 }
 
-function recoveryCommand(change: string, scope: CommandCheckScope, command: string): string {
-  return `comet check run ${change} ${scope} --local -- ${command}`;
+function recoveryCommand(
+  change: string,
+  scope: CommandCheckScope,
+  command: string | readonly string[],
+): string {
+  const display = typeof command !== 'string' || parseLegacyArgv(command) !== null ? null : command;
+  if (display === null) return `comet check rerun ${change} ${scope}`;
+  return `comet check run ${change} ${scope} --local -- ${display}`;
+}
+
+/**
+ * Older command-check records stored argv as a JSON string in `command`.
+ * Never render that serialized array as shell syntax in a recovery hint.
+ */
+function parseLegacyArgv(command: string): readonly string[] | null {
+  const trimmed = command.trim();
+  if (!trimmed.startsWith('[')) return null;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string')
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function guardEvidenceCwd(root: string, record: RecordedCommandCheck): Promise<string> {
+  // A v2 policy entry matching the recorded command declares where its
+  // evidence belongs; every other command's evidence must come from the
+  // guard's invocation directory.
+  const policy = await readCheckPolicy(root, {
+    argv: record.argv ?? [],
+    cwd: record.cwd,
+  });
+  if (policy.declaredCwd) return path.resolve(root, policy.declaredCwd);
+  return classicCommandInvocationCwd();
 }
 
 async function commandCheckPasses(
@@ -472,52 +601,154 @@ async function commandCheckPasses(
     }
   }
   const root = classicCommandProjectRoot();
-  let recorded = await usableCommandCheck(root, changeDir, run, scope);
-  if (recorded && path.resolve(root, recorded.cwd) !== path.resolve(classicCommandInvocationCwd()))
-    recorded = null;
-  const inferred = scope === 'build' && !recorded ? await inferredBuildCommand() : null;
-  if (inferred) {
+  const invocationDir = path.relative(root, classicCommandInvocationCwd()) || '.';
+  const evaluation = await evaluateCommandCheck(root, changeDir, run, scope);
+  let recorded = evaluation.record;
+  let cwdMismatched: RecordedCommandCheck | null = null;
+  if (recorded) {
+    const requiredCwd = await guardEvidenceCwd(root, recorded);
+    if (path.resolve(root, recorded.cwd) !== path.resolve(requiredCwd)) {
+      cwdMismatched = recorded;
+      recorded = null;
+    }
+  }
+  // Never let heuristic command discovery replace a deliberate Runtime check,
+  // including a failed, manual, stale or cwd-mismatched record. The existing
+  // evidence must be surfaced with its recovery action first.
+  const previous = !recorded ? await latestCommandCheck(root, changeDir, run, scope) : null;
+  const interrupted =
+    !recorded && !previous
+      ? await latestInterruptedCommandCheck(root, changeDir, run, scope)
+      : null;
+  const inferred =
+    scope === 'build' && !recorded && !previous && !interrupted
+      ? await inferredBuildCommand()
+      : null;
+  if (inferred !== null && typeof inferred !== 'object') {
     // Only this fixed, Runtime-inferred command is shell syntax. Attestations
     // and check-run argv never enter this path.
     recorded = await executeCommandCheck(root, changeDir, run, {
       scope,
       reusable: true,
-      cwd: path.relative(root, classicCommandInvocationCwd()) || '.',
+      cwd: invocationDir,
       argv:
         process.platform === 'win32'
           ? [process.env.ComSpec || 'cmd.exe', '/d', '/s', '/c', inferred]
           : ['/bin/sh', '-c', inferred],
     });
     if (recorded.exitCode !== 0)
-      return { status: recorded.exitCode, output: `Build failed. Log: ${recorded.logRef}` };
+      return {
+        status: recorded.exitCode,
+        output: `Build failed (guard auto-ran the detected command '${inferred}' in '${invocationDir}'; disable with COMET_SKIP_BUILD=1). Log: ${recorded.logRef}`,
+      };
     if (recorded.inputBefore !== recorded.inputAfter)
       return {
         status: 1,
-        output: 'Build changed check inputs; rerun after the workspace is stable.',
+        output: [
+          `The detected build command '${inferred}' changed its own check inputs (for example nondeterministic build artifacts).`,
+          ...(recorded.changedDuringExecution?.length
+            ? [`Changed inputs: ${recorded.changedDuringExecution.slice(0, 20).join(', ')}.`]
+            : []),
+          'If these paths are generated artifacts, add them to the matching command outputs in .comet/check-policy.json; otherwise stabilize the inputs before rerunning.',
+          `Next: ${recoveryCommand(change, scope, '<program> [args...]')}`,
+        ].join('\n'),
       };
+    return {
+      status: 0,
+      output: `${evidenceDetail(recorded)} (guard auto-ran the detected command '${inferred}' in '${invocationDir}')`,
+    };
+  }
+  if (inferred !== null && typeof inferred === 'object') {
+    const example = inferred.ambiguous[0].includes(' ')
+      ? `"${inferred.ambiguous[0]}"`
+      : inferred.ambiguous[0];
+    return {
+      status: 1,
+      output: [
+        `The invocation root has no build script, and several workspace packages declare one: ${inferred.ambiguous.join(', ')}.`,
+        'Guard auto-runs a build only when exactly one candidate exists.',
+        `Next: record the intended build explicitly, for example:\n${recoveryCommand(change, scope, `npm --prefix ${example} run build`)}`,
+      ].join('\n'),
+    };
   }
   if (!recorded) {
-    const previous = await latestCommandCheck(root, changeDir, run, scope);
+    if (interrupted)
+      return {
+        status: 1,
+        output: [
+          `The latest Runtime ${scope} check started at ${interrupted.timestamp} but did not complete.`,
+          `Its original argv, cwd, timeout and evidence policy were preserved; automatic command discovery will not replace it.`,
+          `Next: comet check rerun ${change} ${scope}`,
+        ].join('\n'),
+      };
     if (previous && previous.exitCode !== 0)
       return {
         status: previous.exitCode,
-        output: `Latest recorded ${scope} check failed with exit code ${previous.exitCode}.\n${evidenceDetail(previous)}\nNext: ${recoveryCommand(change, scope, '<program> [args...]')}`,
+        output: `Latest recorded ${scope} check failed with exit code ${previous.exitCode}.\n${evidenceDetail(previous)}\nNext: ${recoveryCommand(change, scope, previous.argv ?? previous.command)}`,
       };
+    if (previous && previous.provenance !== 'runtime')
+      return {
+        status: 1,
+        output: [
+          `Latest ${scope} record is a manual record-check declaration (recorded ${previous.timestamp}, command: ${previous.command}).`,
+          'Manual declarations never satisfy the guard, and they shadow the earlier runtime evidence until a new runtime check runs.',
+          `Next: ${recoveryCommand(change, scope, '<program> [args...]')}`,
+        ].join('\n'),
+      };
+    if (cwdMismatched)
+      return {
+        status: 1,
+        output: [
+          `No current Runtime ${scope} evidence from this directory.`,
+          evidenceDetail(cwdMismatched),
+          `Why: the recorded check is valid but ran in '${cwdMismatched.cwd}'; check evidence is reused only when its cwd matches the guard's invocation directory '${invocationDir}' or a matching check-policy entry.`,
+          `Rerun the command in a form that executes from '${invocationDir}' (for example npm --prefix <subdir> run build for a subdirectory build) and record it again, or declare this command with cwd '${cwdMismatched.cwd}' in .comet/check-policy.json (version 2) to bind subdirectory evidence.`,
+          `Next: ${recoveryCommand(change, scope, '<program> [args...]')}`,
+        ].join('\n'),
+      };
+    const invalidation = invalidationDetail(evaluation);
     return {
       status: 1,
       output:
         scope === 'build'
-          ? `No current Runtime build evidence. Detection searched: ${INFERRED_COMMAND_SOURCES.join(', ')}.\nNext: ${recoveryCommand(change, scope, '<program> [args...]')}`
-          : `No current Runtime verify evidence. Manual attestations, stale inputs and recovered checks require a new execution.\nNext: ${recoveryCommand(change, scope, '<program> [args...]')}`,
+          ? `No current Runtime build evidence. Detection searched: ${INFERRED_COMMAND_SOURCES.join(', ')}.${invalidation}\nNext: ${recoveryCommand(change, scope, '<program> [args...]')}`
+          : `No current Runtime verify evidence. Manual attestations, stale inputs and recovered checks require a new execution.${invalidation}\nNext: ${recoveryCommand(change, scope, '<program> [args...]')}`,
     };
   }
   if (recorded.exitCode !== 0) {
     return {
       status: recorded.exitCode,
-      output: `Latest recorded ${scope} check failed with exit code ${recorded.exitCode}.\n${evidenceDetail(recorded)}\nNext: rerun the command successfully, then record it with:\n${recoveryCommand(change, scope, recorded.command)}`,
+      output: `Latest recorded ${scope} check failed with exit code ${recorded.exitCode}.\n${evidenceDetail(recorded)}\nNext: rerun the command successfully, then record it with:\n${recoveryCommand(change, scope, recorded.argv ?? recorded.command)}`,
     };
   }
-  return { status: 0, output: evidenceDetail(recorded) };
+  const tierNote =
+    recorded.tier === 'incremental'
+      ? ' (incremental evidence: rerun the full command before --apply)'
+      : '';
+  const documentNote = documentChangesDetail(evaluation);
+  return { status: 0, output: `${evidenceDetail(recorded)}${tierNote}${documentNote}` };
+}
+
+function documentChangesDetail(evaluation: CommandCheckEvaluation): string {
+  const ignored = evaluation.documentChangesIgnored;
+  if (!ignored?.length) return '';
+  const shown = ignored.slice(0, 10);
+  const remainder = ignored.length - shown.length;
+  return `\nIgnored document-only changes (neutral by default; declare inputs in .comet/check-policy.json or set classic.document_evidence: strict if this command consumes them): ${shown.join(', ')}${remainder > 0 ? ` (+${remainder} more)` : ''}`;
+}
+
+function invalidationDetail(evaluation: CommandCheckEvaluation): string {
+  if (!evaluation.reason) return '';
+  const lines = [`\nWhy: ${evaluation.reason}.`];
+  if (evaluation.changedPaths?.length) {
+    const shown = evaluation.changedPaths.slice(0, 20);
+    const remainder = evaluation.changedPaths.length - shown.length;
+    lines.push(
+      `Changed inputs: ${shown.join(', ')}${remainder > 0 ? ` (+${remainder} more)` : ''}`,
+    );
+    if (evaluation.relevance) lines.push(`Relevance scope: ${evaluation.relevance}.`);
+  }
+  return lines.join('\n');
 }
 
 async function tasksAllDone(changeDir: string): Promise<CheckResult> {
@@ -725,7 +956,7 @@ async function designHandoffContextValid(changeDir: string, change: string): Pro
   const recordedHash = await readField(changeDir, 'handoff_hash');
   if (!context || context === 'null') {
     return fail(
-      `handoff_context is missing from .comet.yaml\nNext: run node "$COMET_HANDOFF" ${change} design --write before invoking Superpowers.`,
+      `handoff_context is missing from .comet.yaml\nNext: run comet handoff ${change} design --write before invoking Superpowers.`,
     );
   }
   if (!(await nonempty(context))) {
@@ -1086,18 +1317,29 @@ async function applyStateUpdateLocked(
   // stale projection would write the pre-heal null back over it.
   const context = await ensureClassicRuntimeRun(changeDir);
   if ((phase === 'build' || phase === 'verify') && process.env.COMET_SKIP_BUILD !== '1') {
-    const record = await usableCommandCheck(
+    const evaluation = await evaluateCommandCheck(
       classicCommandProjectRoot(),
       changeDir,
       context.run,
       phase,
     );
-    if (
-      !record ||
+    const record = evaluation.record;
+    const cwdMismatched = Boolean(
+      record &&
       path.resolve(classicCommandProjectRoot(), record.cwd) !==
-        path.resolve(classicCommandInvocationCwd())
-    )
-      throw new GuardFailure('Check evidence changed before transition; rerun the check.');
+        path.resolve(await guardEvidenceCwd(classicCommandProjectRoot(), record)),
+    );
+    if (!record || record.tier === 'incremental' || cwdMismatched) {
+      const reason =
+        record?.tier === 'incremental'
+          ? 'Incremental check evidence cannot advance the phase; rerun the full command before --apply.'
+          : cwdMismatched && record
+            ? `Check evidence ran in '${record.cwd}', not the guard's invocation directory '${
+                path.relative(classicCommandProjectRoot(), classicCommandInvocationCwd()) || '.'
+              }'; rerun the check from the invocation directory, or declare its cwd in .comet/check-policy.json (version 2), before --apply.`
+            : 'Check evidence changed before transition; rerun the check.';
+      throw new GuardFailure(reason);
+    }
   }
   const result = applyClassicTransition(context.classic, event);
   await transitionClassicRuntimeRun(changeDir, result.classic, context.run, {
@@ -1203,6 +1445,8 @@ export const classicGuardCommand: ClassicCommandHandler = withProjectContext(
               classicCommandProjectRoot(),
               changeDir,
               updated.classic,
+              false,
+              updated.run ?? null,
             )),
             change,
             phase: updated.classic.phase,

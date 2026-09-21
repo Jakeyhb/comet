@@ -1,6 +1,7 @@
 interface NativeHelpEntry {
   usage: string;
   purpose: string;
+  agentQuickStart?: readonly string[];
   options?: readonly string[];
   output: string;
   examples?: readonly string[];
@@ -19,11 +20,18 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
     usage: 'comet native <command> [options]',
     purpose:
       'Create, inspect, recover, and archive portable Native changes through Runtime-enforced, skill-coordinated steps.',
+    agentQuickStart: [
+      'Run `comet native status --json` to discover active changes.',
+      'Select an existing change with `select`, or create one with `new`.',
+      'In `agent.workspace.cwd`, execute the exact `agent.continuation.commandArgs` returned by Runtime.',
+      'Use `agent.continuation.inputOptions` templates for JSON input; do not reconstruct fields from memory.',
+    ],
     subcommands: [
       'init                         Initialize Native project configuration.',
       'root show                    Inspect the configured artifact root.',
       'root move <artifact-root>    Move the configured artifact root.',
       'new <change-name>            Create a change and prepare its workspace.',
+      'spec disassociate            Revoke a capability association through Runtime.',
       'spec remove                  Record a complete capability removal intent.',
       'spec sync <change-name> <capability> --input <json-file>  Audit local Markdown reference corrections.',
       'show <change-name>           Read formal artifacts and portable state.',
@@ -87,7 +95,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       '--worktree-path <path>       Worktree directory; defaults to .worktrees/<change-name>.',
     ],
     output:
-      'The portable state, workspace preparation result, and continuation with the next Runner action.',
+      'The portable state, canonical artifact paths, workspace preparation result, and continuation with the next Runner action.',
     examples: [
       'comet native new session-timeout --language zh-CN',
       'comet native new add-sms-login --task "add SMS login to authentication"',
@@ -97,10 +105,11 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
   },
   spec: {
     usage:
-      'comet native spec remove <change-name> <capability>\n       comet native spec sync <change-name> <capability> --input <json-file>',
+      'comet native spec disassociate <change-name> --expected-state-version <n> --expected-action disassociate-capability\n       comet native spec remove <change-name> <capability>\n       comet native spec sync <change-name> <capability> --input <json-file>',
     purpose:
       'Record a capability removal; create and modify intents use complete proposed Spec files.',
     subcommands: [
+      'disassociate <change-name>  Revoke a capability association and return to Shape.',
       'remove <change-name> <capability>  Record a capability removal.',
       'sync <change-name> <capability> --input <json-file>  Audit local Markdown reference corrections without changing prose or acceptance.',
     ],
@@ -109,6 +118,16 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
   'spec remove': {
     usage: 'comet native spec remove <change-name> <capability>',
     purpose: 'Record removal of a capability in the complete target specification.',
+    output: 'The updated portable state and continuation with the next Runner action.',
+  },
+  'spec disassociate': {
+    usage:
+      'comet native spec disassociate <change-name> --expected-state-version <n> --expected-action disassociate-capability',
+    purpose: 'Revoke a capability association through Runtime without hand-editing artifacts.',
+    options: [
+      '--expected-state-version <n>  State version returned by the latest status response.',
+      '--expected-action <action>   Must be disassociate-capability.',
+    ],
     output: 'The updated portable state and continuation with the next Runner action.',
   },
   'spec sync': {
@@ -125,7 +144,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
     usage: 'comet native show <change-name>',
     purpose: 'Read formal artifacts and portable state for one Native change.',
     output:
-      'A compact summary and NEXT action by default. Use --json to read the portable state, brief, complete proposed Specs, and continuation; legacy state is reported as migration-required. Fill command-template placeholders before executing NEXT commands.',
+      'A compact summary and NEXT action by default. Use --json to read canonical artifact paths, the portable state, brief, complete proposed Specs, and continuation; legacy state is reported as migration-required. Fill command-template placeholders before executing NEXT commands.',
   },
   check: {
     usage: 'comet native check <change-name>',
@@ -142,7 +161,7 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       '--details         Include one fixed-size page of acceptance, Spec, handoff, verification, history, workspace, and report details.',
     ],
     output:
-      'A compact v2 status page or one compact Loop projection with local execution availability. Use --details and --cursor to read fixed-size detail pages; parent changes expose childSummary and readyChildren.',
+      'A compact v2 status page or one compact Loop projection with canonical artifact paths and local execution availability. Use --details and --cursor to read fixed-size detail pages; parent changes expose childSummary and readyChildren.',
     examples: [
       'comet native status --json',
       'comet native status session-timeout --details --json',
@@ -170,13 +189,14 @@ const HELP: Readonly<Record<string, NativeHelpEntry>> = Object.freeze({
       '--max-parallel <n>  Supervisor task concurrency cap; defaults to 2, use 1 for serial fallback.',
       '--expected-state-version <n>  Continuation-issued guard that rejects stale public transition decisions.',
       '--expected-action <action>    Continuation-issued guard that binds the public transition decision to its intended action.',
-      '--runner-input <file>  Skill-coordinated JSON: builder-handoff, dispatch-verifier, retry-checks, verifier-response, verifier-execution-error, or verifier-unavailable. Builder/dispatch identity fields are rejected; verifier responses must echo the current candidateId and verifierExecutionRef from the Verifier dispatch.',
+      '--runner-input <file>  Skill-coordinated JSON: builder-handoff, dispatch-verifier, retry-checks, verifier-response, verifier-started, verifier-execution-error, or verifier-unavailable. Builder/dispatch identity fields are rejected; verifier responses must echo the current candidateId and verifierExecutionRef from the Verifier dispatch.',
       '--validate-only       Validate the Runner JSON shape and current boundary without writing state or starting a process; requires --runner-input.',
       '  Choose one object template from an inputOptions exclusiveGroup and save it as UTF-8 JSON (BOM accepted). Field errors return issues with JSON pointer, missingFields and unknownFields. Execute agent.continuation in agent.workspace.cwd; Supervisor results use task.returnAction.',
-      '  builder-handoff fields: kind, summary, addressed_acceptance_ids, checks, known_limits, optional review. If review is supplied, its fields are status=passed, summary, reviewer_execution_ref from a separate read-only review.',
+      '  builder-handoff fields: kind, summary, addressed_acceptance_ids, checks, verification_checks, known_limits, optional review. checks summarize development feedback. verification_checks is an optional Runtime plan executed after the candidate is frozen; a passing plan is reused without executing the same plan twice when dispatch-verifier receives the unchanged plan. If review is supplied, its fields are status=passed, summary, reviewer_execution_ref from a separate read-only review.',
       '  dispatch-verifier fields: kind, checks (an explicitly resolved plan; [] is allowed).',
       '  retry-checks fields: kind, check_ids for repeatable interrupted Runtime checks from the current candidate; each check can be retried at most three times.',
       '  verifier-response fields: kind, candidateId, verifierExecutionRef, response (request-checks or final-result); copy the two binding fields from the current continuation.',
+      '  verifier-started fields: kind, candidateId, verifierExecutionRef copied from verifierDispatch; the dispatched Verifier submits it as its first Runtime action so status can distinguish a registered dispatch from a Verifier that actually started. Repeating it is accepted without side effects.',
       '  verifier-execution-error fields: kind, summary, stateVersion, iteration, attempt, verifierExecutionRef copied from verifierDispatch.',
       '  verifier-unavailable fields: kind, summary, stateVersion, iteration, attempt, verifierExecutionRef copied from verifierDispatch; accepted only after the explicit Runtime check plan completed and passed.',
       '  Supervisor task fields: supervisor-builder-result (child, runId, candidateCommit), supervisor-builder-failure (child, runId, reason), supervisor-verifier-result (child, runId, verdict, verification data), supervisor-reconnect (child, runId), supervisor-cancel (child, runId, reason), or supervisor-integrate (child, checks).',
@@ -243,6 +263,9 @@ export function nativeHelp(topicParts: readonly string[] = []): {
   const entry = HELP[topic];
   if (!entry) throw new Error(`Unknown Native help topic: ${topic}`);
   const sections = [`Usage: ${entry.usage}`, '', entry.purpose];
+  if (entry.agentQuickStart) {
+    sections.push('', section('Agent Quick Start', entry.agentQuickStart));
+  }
   if (entry.subcommands) sections.push('', section('Commands', entry.subcommands));
   const options = topic === '' ? entry.options : [...(entry.options ?? []), ...GLOBAL_OPTIONS];
   if (options && options.length > 0) sections.push('', section('Options', options));

@@ -2497,6 +2497,7 @@ export const DEMO_PLUGIN_PAGES = [
     data: {
       provider: 'local',
       configured: true,
+      localLimits: { maxFileMb: 1, maxTotalMb: 32 },
       retrieval: '当前页面使用预置的项目知识，便于查看 Agent 在任务中会获得的上下文。',
       local: {
         available: true,
@@ -2535,20 +2536,90 @@ export const DEMO_PLUGIN_PAGES = [
         channels: ['records', 'sections'],
       },
       records: demoProjectKnowledgeRecords,
-      manifestPreview: demoProjectKnowledgeRecords.slice(0, 2).map((record) => ({
-        id: record.id,
-        memoryType:
-          record.type === 'topology' || record.type === 'fact' || record.type === 'dependency'
-            ? 'project-model'
-            : 'project-policy',
-        title: record.title,
-        summary: record.summary,
-        whyApplied: record.lastApplication?.whyApplied,
-        delivery: record.lastApplication?.delivery,
-        appliedAt: record.lastApplication?.appliedAt,
-        outcome: record.lastApplication?.outcome,
-        lastApplication: record.lastApplication,
-      })),
+      projectMemory: {
+        directory: '%LOCALAPPDATA%/Comet/project-knowledge/comet/memory',
+        total: 2,
+        entries: [
+          {
+            slug: 'dashboard-change-verification',
+            title: 'Dashboard 改动验证顺序',
+            description: '先跑最小相关测试，涉及前端构建时再跑 build:dashboard。',
+            type: 'procedure',
+            created: '2026-09-20T09:12:00.000Z',
+            updated: '2026-09-20T09:12:00.000Z',
+            paths: ['domains/dashboard/', 'test/domains/dashboard/'],
+            source: 'change dashboard-memory',
+            body: '每轮先运行覆盖当前改动的最小相关测试；涉及前端构建和生成资产时再运行 pnpm build:dashboard；交互或响应式变化再补 Playwright E2E。\n\n临时项目的 cacheRoot 必须显式传入，避免污染真实用户缓存。',
+          },
+          {
+            slug: 'windows-temp-dir-lock',
+            title: 'Windows 测试临时目录清理',
+            description: '测试进程退出后立即删除临时目录可能遇到 EBUSY，先确认没有进程再占用。',
+            type: 'failure-resolution',
+            created: '2026-09-20T10:40:00.000Z',
+            updated: '2026-09-20T10:40:00.000Z',
+            paths: ['test/'],
+            body: 'Windows 上删除刚写入的临时目录偶发 EBUSY：多为杀毒软件或残留句柄。复现时先确认没有测试子进程仍在运行，再重试删除；与本次改动无关的环境抖动不要计入回归。',
+          },
+        ],
+        applicationCount: 3,
+        lastApplication: {
+          applicationId: 'application:demo-project-memory-index',
+          candidateId: 'project-memory-index',
+          owner: 'comet.project-knowledge',
+          scope: 'project',
+          memoryType: 'project-policy',
+          candidateState: 'proven',
+          candidateTitle: '项目记忆索引',
+          task: '为项目知识页增加项目记忆标签页',
+          whyApplied: 'Agent 为本项目沉淀的可复用经验索引；单条内容按需展开。',
+          delivery: 'full',
+          appliedAt: '2026-09-20T11:40:00.000Z',
+          outcome: 'used-successfully',
+        },
+        applicationHistory: [],
+      },
+      manifestPreview: [
+        ...demoProjectKnowledgeRecords.slice(0, 2).map((record) => ({
+          id: record.id,
+          memoryType:
+            record.type === 'topology' || record.type === 'fact' || record.type === 'dependency'
+              ? 'project-model'
+              : 'project-policy',
+          title: record.title,
+          summary: record.summary,
+          whyApplied: record.lastApplication?.whyApplied,
+          delivery: record.lastApplication?.delivery,
+          appliedAt: record.lastApplication?.appliedAt,
+          outcome: record.lastApplication?.outcome,
+          lastApplication: record.lastApplication,
+        })),
+        {
+          id: 'project-memory-index',
+          memoryType: 'project-policy',
+          title: '项目记忆索引',
+          summary: '2 条项目记忆：Dashboard 改动验证顺序；Windows 测试临时目录清理',
+          whyApplied: 'Agent 为本项目沉淀的可复用经验索引；单条内容按需展开。',
+          applicationCount: 3,
+          successCount: 2,
+          failureCount: 0,
+          delivery: 'full',
+          appliedAt: '2026-09-20T11:40:00.000Z',
+          outcome: 'used-successfully',
+          lastApplication: {
+            applicationId: 'application:demo-project-memory-index',
+            candidateId: 'project-memory-index',
+            owner: 'comet.project-knowledge',
+            scope: 'project',
+            memoryType: 'project-policy',
+            task: '为项目知识页增加项目记忆标签页',
+            whyApplied: 'Agent 为本项目沉淀的可复用经验索引；单条内容按需展开。',
+            delivery: 'full',
+            appliedAt: '2026-09-20T11:40:00.000Z',
+            outcome: 'used-successfully',
+          },
+        },
+      ],
       counts: {
         trial: 0,
         proven: demoProjectKnowledgeRecords.length,
@@ -2621,6 +2692,8 @@ export const DEMO_PROJECT_CONFIG = {
   knowledge: {
     provider: 'local',
     localInclude: ['docs/architecture/**/*.md', 'packages/*/README.md'],
+    maxFileMb: 1,
+    maxTotalMb: 32,
   },
   native: {
     artifactRoot: '.comet/native',

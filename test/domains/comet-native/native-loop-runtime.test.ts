@@ -257,6 +257,29 @@ describe('Native portable Build/Verify loop', () => {
     expect(repairing.loop.previous_unresolved_ids).toEqual(['A2']);
   });
 
+  it('serializes unresolved acceptance IDs when Builder failures exhaust the budget', () => {
+    const prepared = buildState();
+    const blocked = applyNativeVerifierEnvelope({
+      state: prepared.state,
+      envelope: envelope(prepared.runner, prepared.state, 'blocked', ['A2']),
+      checks,
+      maxVerifyFailures: 5,
+    }).state;
+
+    const stopped = returnNativeCandidateToBuild({
+      state: blocked,
+      reason: 'The required Runtime check failed.',
+      failureBudget: { maxVerifyFailures: 1 },
+    });
+
+    expect(stopped).toMatchObject({
+      phase: 'verify',
+      status: 'await-user',
+      blockers: [{ acceptance_ids: ['A2'], resolution_action: 'await-user' }],
+      loop: { stop_reason: 'budget', next_action: 'resolve-loop-stop' },
+    });
+  });
+
   it('allows a parent handoff when every child is done without a mandatory review', () => {
     const state = confirmAcceptance(
       createNativePortableState({ name: 'parent-change', language: 'en' }),
@@ -285,6 +308,16 @@ describe('Native portable Build/Verify loop', () => {
       ],
     });
     expect(continuation.inputOptions[0].template).not.toHaveProperty('review');
+    expect(continuation.inputOptions[0].template).toMatchObject({
+      verification_checks: [
+        expect.objectContaining({
+          id: '<check-id>',
+          executable: '<executable>',
+          cwdRef: '.',
+          repeatable: true,
+        }),
+      ],
+    });
   });
 
   it('requires an explicit coordination choice before confirming a multi-child Supervisor Shape', () => {
@@ -578,6 +611,17 @@ describe('Native portable Build/Verify loop', () => {
       commandArgs: null,
       requiredInputs: ['archive-blocker-resolution'],
     });
+    expect(
+      nativePortableContinuation(isolated, null, {
+        archiveMode: 'preview',
+        archiveBlockers: ['verification.md is missing'],
+      }),
+    ).toMatchObject({
+      disposition: 'continue',
+      action: 'repair',
+      commandArgs: ['comet', 'native', 'doctor', 'loop-change', '--repair'],
+      requiredInputs: [],
+    });
   });
 
   it('allows an explicitly empty Runtime check plan when Verifier covers every acceptance ID', () => {
@@ -600,6 +644,34 @@ describe('Native portable Build/Verify loop', () => {
       'passed',
       'passed',
     ]);
+  });
+
+  it('accepts a full known-passed matrix when only one acceptance ID is pending', () => {
+    const prepared = buildState();
+    const preservedReason = toNativePortableText('A1 passed in an earlier scoped attempt.');
+    const state: NativePortableState = {
+      ...prepared.state,
+      acceptance: prepared.state.acceptance.map((entry) =>
+        entry.id === 'A1' ? { ...entry, result: 'passed', reason: preservedReason } : entry,
+      ),
+    };
+
+    const applied = applyNativeVerifierEnvelope({
+      state,
+      envelope: envelope(prepared.runner, state, 'pass', [], ['A1', 'A2']),
+      checks,
+      maxVerifyFailures: 5,
+    });
+
+    expect(applied.response).toMatchObject({
+      kind: 'final-result',
+      result: { acceptance: [{ id: 'A2', result: 'passed' }] },
+    });
+    expect(applied.state.acceptance).toMatchObject([
+      { id: 'A1', result: 'passed', reason: preservedReason },
+      { id: 'A2', result: 'passed' },
+    ]);
+    expect(applied.state.loop.execution_failure_count).toBe(0);
   });
 
   it('returns an implementation failure to a new Build iteration', () => {

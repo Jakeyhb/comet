@@ -439,7 +439,8 @@ describe('Classic hook guard command', () => {
 
       expect(result.status).toBe(2);
       expect(result.stderr).toContain('multiple active changes require a current change');
-      expect(result.stderr).toContain('comet state select <change-name>');
+      expect(result.stderr).toContain('comet state select build-change');
+      expect(result.stderr).toContain('comet state select unrelated-design');
     });
 
     it.each(['open', 'design', 'verify', 'archive'] as const)(
@@ -629,7 +630,8 @@ describe('Classic hook guard command', () => {
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('multiple active changes require a current change');
-    expect(result.stderr).toContain('comet state select <change-name>');
+    expect(result.stderr).toContain('comet state select build-ready');
+    expect(result.stderr).toContain('comet state select open-change');
     expect(result.stderr).toContain('build-ready');
     expect(result.stderr).toContain('open-change');
     expect(result.stderr).not.toContain('Current phase: open');
@@ -710,6 +712,18 @@ describe('Classic hook guard command', () => {
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('Current phase: open');
+    expect(result.stderr).toContain('comet guard open-change open --apply');
+  });
+
+  it('returns an executable design recovery command for the selected change', async () => {
+    const dir = await makeProject();
+    await seedChange(dir, 'design-change', 'design');
+
+    const result = run(dir, 'hook-guard', [], hookInput(path.join(dir, 'src', 'feature.ts')));
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('comet guard design-change design --apply');
+    expect(result.stderr).not.toContain('<change-name>');
   });
 
   it('blocks implementation writes during verify so repairs return through build', async () => {
@@ -720,7 +734,7 @@ describe('Classic hook guard command', () => {
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('Current phase: verify');
-    expect(result.stderr).toContain('return to build before repairing implementation');
+    expect(result.stderr).toContain('comet state transition verify-change verify-fail');
   });
 
   it('blocks tasks updates during verify so task state is repaired in build', async () => {
@@ -737,7 +751,17 @@ describe('Classic hook guard command', () => {
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('Current phase: verify');
     expect(result.stderr).toContain('verification reports and state updates only');
-    expect(result.stderr).toContain('run verify-fail and return to build');
+    expect(result.stderr).toContain('comet state transition verify-tasks verify-fail');
+  });
+
+  it('returns the exact Archive continuation command for the selected change', async () => {
+    const dir = await makeProject();
+    await seedChange(dir, 'archive-change', 'archive');
+
+    const result = run(dir, 'hook-guard', [], hookInput(path.join(dir, 'src', 'feature.ts')));
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('comet archive archive-change');
   });
 
   it('keeps single-change source guard behavior without a selection', async () => {
@@ -1066,5 +1090,93 @@ describe('Classic hook guard command', () => {
 
     expect(result.status).toBe(2);
     expect(await fs.readFile(path.join(changeDir, '.comet.yaml'), 'utf8')).toBe(before);
+  });
+
+  it('allows neutral document writes during verify while keeping phase artifacts bound', async () => {
+    const dir = await makeProject();
+    await seedChange(dir, 'docedit', 'verify', {
+      designDoc: 'docs/superpowers/specs/docedit-design.md',
+    });
+    const inspect = (target: string) =>
+      inspectClassicHookGuard(dir, 'docedit', {
+        intent: 'write',
+        targets: [path.join(dir, target)],
+      });
+
+    expect((await inspect('docs/guide.md')).allowed).toBe(true);
+    expect((await inspect('README.md')).allowed).toBe(true);
+    expect((await inspect('.github/ISSUE_TEMPLATE/bug.md')).allowed).toBe(true);
+
+    const tasks = await inspect('openspec/changes/docedit/tasks.md');
+    expect(tasks.allowed).toBe(false);
+    const unrecordedSpec = await inspect('docs/superpowers/specs/other-topic.md');
+    expect(unrecordedSpec.allowed).toBe(false);
+  });
+
+  it('keeps docs-layout OpenSpec artifacts bound while allowing neutral documents', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'classic-hook-docs-'));
+    temporary.push(dir);
+    await fs.mkdir(path.join(dir, '.comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.comet', 'config.yaml'),
+      [
+        'schema: comet.project.v1',
+        'default_workflow: classic',
+        'workflows: [classic]',
+        'classic:',
+        '  artifact_layout: docs',
+        '',
+      ].join('\n'),
+    );
+    // Under the docs layout the change directory lives inside docs/, exactly
+    // where the neutral-document prefix would otherwise match.
+    const changeDir = path.join(dir, 'docs', 'openspec', 'changes', 'dl');
+    await fs.mkdir(changeDir, { recursive: true });
+    await fs.writeFile(
+      path.join(changeDir, '.comet.yaml'),
+      [
+        'workflow: full',
+        'phase: verify',
+        'design_doc: docs/superpowers/specs/dl-design.md',
+        'plan: null',
+        'verification_report: null',
+        'build_mode: executing-plans',
+        'isolation: branch',
+        'verify_mode: light',
+        'verify_result: pending',
+        'verified_at: null',
+        'archived: false',
+        '',
+      ].join('\n'),
+    );
+    const inspect = (target: string) =>
+      inspectClassicHookGuard(dir, 'dl', {
+        intent: 'write',
+        targets: [path.join(dir, target)],
+      });
+
+    expect((await inspect('docs/guide.md')).allowed).toBe(true);
+    expect((await inspect('docs/openspec/changes/dl/tasks.md')).allowed).toBe(false);
+    expect((await inspect('docs/openspec/changes/dl/specs/capability/spec.md')).allowed).toBe(
+      false,
+    );
+    expect((await inspect('docs/superpowers/plans/other-plan.md')).allowed).toBe(false);
+  });
+
+  it('keeps verify document writes blocked under classic.document_evidence: strict', async () => {
+    const dir = await makeProject();
+    await fs.appendFile(path.join(dir, '.comet', 'config.yaml'), '  document_evidence: strict\n');
+    await seedChange(dir, 'docedit', 'verify', {
+      designDoc: 'docs/superpowers/specs/docedit-design.md',
+    });
+    const inspect = (target: string) =>
+      inspectClassicHookGuard(dir, 'docedit', {
+        intent: 'write',
+        targets: [path.join(dir, target)],
+      });
+
+    expect((await inspect('docs/guide.md')).allowed).toBe(false);
+    // The historical root-markdown whitelist survives strict mode.
+    expect((await inspect('README.md')).allowed).toBe(true);
   });
 });

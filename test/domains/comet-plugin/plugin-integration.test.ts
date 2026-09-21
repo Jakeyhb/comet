@@ -76,6 +76,36 @@ test('remote memory failures reject explicit operations but leave automatic cont
   }
 });
 
+test('best-effort context does not reconcile or persist plugin state', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-plugin-context-hook-'));
+  const projectRoot = path.join(root, 'project');
+  const stateRoot = path.join(root, 'plugins');
+  await fs.mkdir(projectRoot);
+  try {
+    const bridge = await createProductionCometPluginBridge({
+      projectRoot,
+      projectId: 'hook-context-project',
+      homeDirectory: root,
+      stateRoot,
+      lockTimeoutMs: 750,
+      bestEffortContext: true,
+      memoryProviderConfig: {
+        provider: 'local',
+        profileCharLimit: 2000,
+        taskContextCharLimit: 6000,
+      },
+    });
+
+    await expect(bridge.collectContext({ task: 'optional Hook context' })).resolves.toEqual([]);
+    await expect(fs.access(path.join(stateRoot, 'state.json'))).rejects.toThrow();
+    await expect(
+      fs.access(path.join(stateRoot, 'storage', 'comet.agent-context-user-global.json')),
+    ).rejects.toThrow();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 function createDefaultCometPluginBridge(
   options: Parameters<typeof createProductionCometPluginBridge>[0],
 ): ReturnType<typeof createProductionCometPluginBridge> {
@@ -415,6 +445,112 @@ describe('Comet plugin integration bridge', () => {
       expect(
         (await bridge.retrieve({ projectKey: 'policy-learning-project' })).records,
       ).toHaveLength(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('skips paused CLI observations before invoking the memory reviewer', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-plugin-paused-cli-learning-'));
+    const memoryRoot = path.join(root, 'memory');
+    let reviewCalls = 0;
+    try {
+      const bridge = await createDefaultCometPluginBridge({
+        projectRoot: root,
+        memoryRoot,
+        projectId: 'paused-cli-project',
+        stateRoot: path.join(root, 'plugin-state'),
+        runMemoryReview: async (packet) => {
+          reviewCalls += 1;
+          return {
+            schema: 'comet.memory.actions.v1',
+            actions: [
+              {
+                action: 'create',
+                scope: 'project',
+                projectKey: packet.projectKey,
+                language: packet.language,
+                category: '协作偏好',
+                text: '恢复后可以学习',
+                candidateKey: 'resume-cli',
+              },
+            ],
+          };
+        },
+      });
+      await bridge.pauseProjectLearning(true);
+      const observation = {
+        scope: 'project' as const,
+        projectKey: 'paused-cli-project',
+        category: '协作偏好',
+        text: '暂停期间不应保存',
+        language: 'zh-CN' as const,
+        workflow: 'native',
+        changeId: 'paused-cli-change',
+        candidateKey: 'resume-cli',
+        success: true,
+      };
+
+      await expect(bridge.observeMemory(observation)).resolves.toMatchObject({
+        action: 'skip',
+        persisted: false,
+        observation: { result: 'ignored', ignored: true },
+      });
+      expect(reviewCalls).toBe(0);
+      await expect(bridge.manage({ projectKey: 'paused-cli-project' })).resolves.toMatchObject({
+        records: [],
+      });
+
+      await bridge.pauseProjectLearning(false);
+      await expect(bridge.observeMemory(observation)).resolves.toMatchObject({
+        action: 'create',
+        persisted: true,
+      });
+      expect(reviewCalls).toBe(1);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('skips paused lifecycle observations before invoking the memory reviewer', async () => {
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'comet-plugin-paused-lifecycle-learning-'),
+    );
+    let reviewCalls = 0;
+    try {
+      const bridge = await createDefaultCometPluginBridge({
+        projectRoot: root,
+        memoryRoot: path.join(root, 'memory'),
+        projectId: 'paused-lifecycle-project',
+        stateRoot: path.join(root, 'plugin-state'),
+        runMemoryReview: async () => {
+          reviewCalls += 1;
+          return {
+            schema: 'comet.memory.actions.v1',
+            actions: [],
+          };
+        },
+      });
+      await bridge.pauseProjectLearning(true);
+
+      await expect(
+        dispatchWorkflowExperience(bridge, {
+          name: 'verification.completed',
+          workflow: 'native',
+          changeId: 'paused-lifecycle-change',
+          success: true,
+          category: '协作偏好',
+          text: '暂停期间不应评审',
+          userEvidence: ['以后暂停期间不应评审'],
+          candidateKey: 'resume-lifecycle',
+        }),
+      ).resolves.toBeUndefined();
+      expect(reviewCalls).toBe(0);
+      await expect(
+        bridge.manage({ projectKey: 'paused-lifecycle-project' }),
+      ).resolves.toMatchObject({
+        records: [],
+      });
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

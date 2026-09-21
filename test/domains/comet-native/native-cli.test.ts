@@ -105,7 +105,23 @@ describe('Comet Native CLI dispatcher', () => {
     return currentBranch();
   }
 
+  async function ensureTargetSpec(name: string): Promise<void> {
+    const config = await readProjectConfig(projectRoot);
+    const paths = await nativeProjectPaths(projectRoot, config?.native.artifact_root ?? 'docs');
+    const entries = await fs.readdir(path.join(paths.changesDir, name, 'specs'), {
+      withFileTypes: true,
+    });
+    if (entries.some((entry) => entry.isDirectory())) return;
+    const fixtureDir = path.join(paths.changesDir, name, 'specs', 'fixture');
+    await fs.mkdir(fixtureDir, { recursive: true });
+    await fs.writeFile(
+      path.join(fixtureDir, 'spec.md'),
+      '# Fixture target\n\nThis document binds the Native CLI fixture.\n',
+    );
+  }
+
   async function prepareShape(name: string, summary = 'Shape is ready for confirmation') {
+    await ensureTargetSpec(name);
     return json(
       await runNativeCli(['next', name, '--summary', summary, '--json', ...projectArgs()]),
     );
@@ -600,6 +616,27 @@ describe('Comet Native CLI dispatcher', () => {
       exitCode: 0,
       data: {
         schema: 'comet.native.v4',
+        artifacts: {
+          artifactRoot: path.join(projectRoot, 'artifacts', 'native'),
+          nativeRoot: path.join(projectRoot, 'artifacts', 'native', 'comet'),
+          changeDir: path.join(
+            projectRoot,
+            'artifacts',
+            'native',
+            'comet',
+            'changes',
+            'sentence-counting',
+          ),
+          briefPath: path.join(
+            projectRoot,
+            'artifacts',
+            'native',
+            'comet',
+            'changes',
+            'sentence-counting',
+            'brief.md',
+          ),
+        },
         continuation: { action: 'prepare-shape-confirmation', runnerAction: { kind: 'none' } },
       },
     });
@@ -619,6 +656,10 @@ describe('Comet Native CLI dispatcher', () => {
         expect.objectContaining({
           name: 'sentence-counting',
           phase: 'shape',
+          artifacts: expect.objectContaining({
+            briefPath: path.join(changeDir, 'brief.md'),
+            statePath: path.join(changeDir, 'comet-state.yaml'),
+          }),
           workspace: expect.objectContaining({
             projectRoot: path.resolve(projectRoot),
             bindingState: 'aligned',
@@ -630,6 +671,11 @@ describe('Comet Native CLI dispatcher', () => {
       json(await runNativeCli(['show', 'sentence-counting', '--json', ...projectArgs()])).data,
     ).toMatchObject({
       state: { schema: 'comet.native.v4', language: 'zh-CN', phase: 'shape' },
+      artifacts: expect.objectContaining({
+        changeDir,
+        briefPath: path.join(changeDir, 'brief.md'),
+        specsDir: path.join(changeDir, 'specs'),
+      }),
       brief,
       continuation: { action: 'prepare-shape-confirmation' },
     });
@@ -837,6 +883,15 @@ describe('Comet Native CLI dispatcher', () => {
     expect(nextHelp.stdout).not.toMatch(/^\s+--(?:result|report|artifact)\b/mu);
     const specHelp = await runNativeCli(['spec', 'remove', '--help', ...projectArgs()]);
     expect(specHelp.stdout).toContain('spec remove <change-name> <capability>');
+    const disassociateHelp = await runNativeCli([
+      'spec',
+      'disassociate',
+      '--help',
+      ...projectArgs(),
+    ]);
+    expect(disassociateHelp.stdout).toContain(
+      'spec disassociate <change-name> --expected-state-version <n> --expected-action disassociate-capability',
+    );
     expect(
       json(await runNativeCli(['spec', 'rebase', '--help', '--json', ...projectArgs()])),
     ).toMatchObject({ exitCode: 64, error: { code: 'usage' } });

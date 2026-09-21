@@ -1,18 +1,59 @@
 import { promises as fs } from 'node:fs';
+
+/**
+ * A dispatched Verifier that never confirmed startup is presumed lost after
+ * this long; explicit doctor repair may register its failure so the change
+ * returns to a dispatchable Verify boundary (platform queue loss, quota
+ * reclaim). Genuine startups report progress well within the window.
+ */
+const NATIVE_VERIFIER_CONFIRM_TAKEOVER_MS = 30 * 60 * 1_000;
 import path from 'node:path';
 
+import { inspectGitWorktree, resolveGitRef } from '../../platform/paths/git-worktree.js';
+import { gitWorktreeIsClean } from '../../platform/process/git.js';
+
 import { doctorNativeProject } from './native-doctor.js';
-import { inspectNativeChildren } from './native-children.js';
+import { inspectNativeChildren, readNativeChildrenContract } from './native-children.js';
 import { archiveNativePortableChange } from './native-portable-archive.js';
 import { nativePortableContinuation } from './native-portable-continuation.js';
+import { compareAndSwapNativePortableState } from './native-portable-state.js';
+import { recordNativeVerifierExecutionError } from './native-loop-runtime.js';
 import {
   hasIncompleteNativePortableMigration,
   migrateNativeLegacyChangeToPortable,
 } from './native-portable-migration-runtime.js';
+import {
+  inspectNativePortableAcceptanceDrift,
+  recoverNativePortableShapeConfirmationDrift,
+} from './native-portable-requirements.js';
 import { recoverNativePortableChange } from './native-portable-recovery.js';
+import { readNativeLocalExecution } from './native-local-execution.js';
+import { inspectNativePortableCheckExecution } from './native-portable-checks.js';
 import { inspectNativeSupervisorOverlay } from './native-supervisor-overlay.js';
-import { isNativePortableChange, readNativePortableChange } from './native-portable-runtime.js';
+import {
+  activeNativeSupervisorTaskNames,
+  readNativeSupervisorState,
+  writeNativeSupervisorState,
+} from './native-supervisor-state.js';
+import { supervisorDependenciesIntegrated } from './native-supervisor-model.js';
+import { withNativeMutationLock } from './native-mutation-lock.js';
+import {
+  isNativePortableChange,
+  nativeLocalExecutionFile,
+  nativePortableChangeDir,
+  nativePortableStateFile,
+  readNativePortableChange,
+} from './native-portable-runtime.js';
+import {
+  listNativeWorkspaceFinishJournals,
+  quarantineNativeWorkspaceFinishJournal,
+  readNativeWorkspaceFinishJournal,
+} from './native-workspace-finish.js';
 import type { NativePortableState } from './native-portable-types.js';
+import type {
+  NativeSupervisorChildState,
+  NativeSupervisorState,
+} from './native-supervisor-model.js';
 import {
   inspectNativePortableStatus,
   listNativePortableChangeNames,
@@ -37,6 +78,104 @@ import type { NativeDoctorFinding, NativeProjectPaths } from './native-types.js'
 async function portableContinuation(paths: NativeProjectPaths, state: NativePortableState) {
   const children = await inspectNativeChildren({ paths, state });
   return nativePortableContinuation(state, children);
+}
+
+async function portableCheckExecutionFinding(
+  paths: NativeProjectPaths,
+  name: string,
+): Promise<NativeDoctorFinding | null> {
+  let local: Awaited<ReturnType<typeof readNativeLocalExecution>>;
+  try {
+    local = await readNativeLocalExecution(nativeLocalExecutionFile(paths, name));
+  } catch {
+    return null;
+  }
+  if (local?.execution?.stage !== 'checking' || local.execution.actor !== 'runtime') return null;
+  if (local.execution.status !== 'running') return null;
+  const liveness = await inspectNativePortableCheckExecution(local);
+  if (liveness === 'running') return null;
+  const message =
+    liveness === 'orphaned'
+      ? `Native Runtime check operation ${local.execution.operationId} has no live owner or active check process`
+      : `Native Runtime check operation ${local.execution.operationId} is running, but its owner process identity is unavailable`;
+  return {
+    severity: 'error',
+    code: 'portable-check-execution-stuck',
+    message: `${name}: ${message}; run comet native doctor ${name} --repair to recover it`,
+    path: nativeLocalExecutionFile(paths, name),
+    repair: 'recover',
+  };
+}
+
+async function portableShapeConfirmationFinding(
+  paths: NativeProjectPaths,
+  name: string,
+  state: NativePortableState,
+): Promise<NativeDoctorFinding | null> {
+  if (
+    state.phase !== 'shape' ||
+    state.status !== 'await-user' ||
+    state.loop.next_action !== 'confirm-shape'
+  ) {
+    return null;
+  }
+  const drift = await inspectNativePortableAcceptanceDrift({ paths, state });
+  if (!drift.drifted) return null;
+  const reason = drift.reason ?? 'Native confirmed requirements changed';
+  return {
+    severity: 'error',
+    code: 'portable-shape-confirmation-drift',
+    message: `${name}: pending Shape confirmation is stale (${reason}); run comet native doctor ${name} --repair to reopen Shape`,
+    path: nativePortableStateFile(paths, name),
+    repair: 'recover',
+    repairCommand: `comet native doctor ${name} --repair`,
+  };
+}
+
+/**
+ * A change with a children contract needs a Git target branch, but
+ * `--isolation current` changes created before Git existed keep a null
+ * binding. Surface the mismatch instead of reporting an unqualified healthy
+ * state; the confirmation boundary binds the workspace once Git is available.
+ */
+async function portableSupervisorGitBindingFinding(
+  paths: NativeProjectPaths,
+  name: string,
+  state: NativePortableState,
+): Promise<NativeDoctorFinding | null> {
+  if (state.archived || state.workspace.change_branch !== null) return null;
+  let childrenPresent: boolean;
+  try {
+    childrenPresent =
+      (await readNativeChildrenContract({
+        changeDir: nativePortableChangeDir(paths, name),
+        policy: 'advisory',
+      })) !== null;
+  } catch {
+    // An unreadable children.yaml still requires the Git binding; the
+    // continuation reports the contract error separately.
+    childrenPresent = true;
+  }
+  if (!childrenPresent) return null;
+  const inspection = inspectGitWorktree(paths.projectRoot);
+  const attached =
+    inspection.isGitWorktree &&
+    inspection.currentBranch !== null &&
+    resolveGitRef(paths.projectRoot, inspection.currentBranch) !== null;
+  const clean = attached && gitWorktreeIsClean(paths.projectRoot);
+  const activeTasks = attached ? await activeNativeSupervisorTaskNames(paths, name) : [];
+  return {
+    severity: 'error',
+    code: 'portable-supervisor-git-binding-missing',
+    message: !attached
+      ? `${name}: the Supervisor change requires Git; initialize a Git repository, commit to a branch, then rerun the latest continuation`
+      : !clean
+        ? `${name}: the Supervisor change has no Git branch binding and the current Git baseline is dirty; commit or stash pending changes to restore a clean current working directory, then rerun the latest continuation`
+        : activeTasks.length > 0
+          ? `${name}: the Supervisor change has no Git branch binding while active child tasks exist (${activeTasks.join(', ')}); finish or recover those tasks before rerunning the latest continuation`
+          : `${name}: the Supervisor change has no Git branch binding; run comet native status ${name} --json and rerun its continuation to bind branch ${inspection.currentBranch} at the Shape confirmation boundary`,
+    path: nativePortableStateFile(paths, name),
+  };
 }
 
 async function listActiveChangeNames(paths: NativeProjectPaths): Promise<string[]> {
@@ -90,6 +229,36 @@ function uniqueFindings(findings: readonly NativeDoctorFinding[]): NativeDoctorF
   return [...unique.values()];
 }
 
+async function inspectWorkspaceFinishJournalErrors(
+  paths: NativeProjectPaths,
+  name?: string,
+): Promise<Array<{ name: string; message: string }>> {
+  const errors: Array<{ name: string; message: string }> = [];
+  if (name !== undefined && !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u.test(name)) return errors;
+  const onError = (journalName: string, message: string) =>
+    errors.push({ name: journalName, message });
+  if (name !== undefined) {
+    await readNativeWorkspaceFinishJournal(paths, name, { onError });
+  } else {
+    await listNativeWorkspaceFinishJournals(paths, { onError });
+  }
+  return errors;
+}
+
+function workspaceFinishJournalFinding(
+  paths: NativeProjectPaths,
+  error: { name: string; message: string },
+): NativeDoctorFinding {
+  return {
+    severity: 'error',
+    code: 'portable-workspace-finish-journal-invalid',
+    message: `Native workspace finish journal for ${error.name} is invalid (${error.message}); run comet native doctor ${error.name} --repair to quarantine it and resume from the preserved change or Archive record`,
+    path: path.join(paths.transactionsDir, `workspace-finish-${error.name}.json`),
+    repair: 'continue',
+    repairCommand: `comet native doctor ${error.name} --repair`,
+  };
+}
+
 function unhealthyDoctor(data: Record<string, unknown>): DispatchResult {
   return {
     command: 'doctor',
@@ -132,6 +301,40 @@ function portableSupervisorOverlayFinding(
     };
   }
   return null;
+}
+
+/**
+ * A `ready` child whose dependencies are not integrated is a state the
+ * dispatcher always rejects (issue #439): the Supervisor change self-locks on
+ * `advance-children` while doctor reports healthy. A pre-0.4.2 overlay can
+ * still carry that state, so doctor surfaces it explicitly instead of
+ * reporting healthy and lets --repair demote the stuck children to `pending`
+ * — the smallest write that unlocks the change without touching any
+ * integrated work.
+ */
+function unmetReadySupervisorDependencyFinding(
+  name: string,
+  supervisorState: NativeSupervisorState,
+  blocked: NativeSupervisorChildState[],
+): NativeDoctorFinding {
+  const statuses = new Map(
+    supervisorState.children.map(({ name: child, status }) => [child, status]),
+  );
+  const detail = blocked
+    .map((child) => {
+      const unmet = child.dependsOn.filter(
+        (dependency) => statuses.get(dependency) !== 'integrated',
+      );
+      return `${child.name} (waiting on: ${unmet.join(', ')})`;
+    })
+    .join('; ');
+  return {
+    severity: 'error',
+    code: 'portable-supervisor-ready-dependencies-unmet',
+    message: `Native Supervisor children are marked ready but their dependencies are not integrated: ${detail}. Run doctor --repair to demote them to pending until their dependencies integrate.`,
+    repair: 'continue',
+    repairCommand: `comet native doctor ${name} --repair`,
+  };
 }
 
 async function inspectPortableTransactions(
@@ -199,6 +402,45 @@ export async function nativeDoctorCommand(
   const name = args[0]?.startsWith('--') ? undefined : args.shift();
   assertNoArguments(args);
   const paths = await doctorPaths(projectRoot);
+  const workspaceFinishJournalErrors = await inspectWorkspaceFinishJournalErrors(paths, name);
+  if (name && workspaceFinishJournalErrors.length > 0) {
+    const finding = workspaceFinishJournalFinding(paths, workspaceFinishJournalErrors[0]);
+    if (!repair) {
+      const portable = await isNativePortableChange(paths, name);
+      const result = portable
+        ? await inspectNativePortableStatus({ paths, name, details: true })
+        : undefined;
+      return unhealthyDoctor({
+        healthy: false,
+        workflow: 'native-portable',
+        change: name,
+        repaired: false,
+        ...(result ? { result, continuation: result.continuation } : {}),
+        findings: [finding],
+      });
+    }
+    const quarantined = await quarantineNativeWorkspaceFinishJournal(paths, name);
+    const portable = await isNativePortableChange(paths, name);
+    if (portable) {
+      const state = await readNativePortableChange(paths, name);
+      return success('doctor', {
+        healthy: true,
+        workflow: 'native-portable',
+        change: name,
+        repaired: true,
+        workspaceFinishJournal: { quarantined, finding },
+        state,
+        continuation: await portableContinuation(paths, state),
+      });
+    }
+    return success('doctor', {
+      healthy: true,
+      workflow: 'native-portable',
+      change: name,
+      repaired: true,
+      workspaceFinishJournal: { quarantined, finding },
+    });
+  }
   const portableTransactions = await inspectPortableTransactions(paths, name);
   if (name && portableTransactions.findings.length > 0) {
     if (recoveryStrategy) {
@@ -279,6 +521,19 @@ export async function nativeDoctorCommand(
       });
     }
     const portableState = await readNativePortableChange(paths, name);
+    const gitBindingFinding = await portableSupervisorGitBindingFinding(paths, name, portableState);
+    if (gitBindingFinding) {
+      const result = await inspectNativePortableStatus({ paths, name, details: true });
+      return unhealthyDoctor({
+        healthy: false,
+        workflow: 'native-portable',
+        change: name,
+        repaired: false,
+        result,
+        findings: [gitBindingFinding],
+        continuation: result.continuation,
+      });
+    }
     const supervisorOverlay = await inspectNativeSupervisorOverlay({
       paths,
       state: portableState,
@@ -309,14 +564,153 @@ export async function nativeDoctorCommand(
           continuation: await portableContinuation(paths, state),
         });
       }
-      const result = await recoverNativePortableChange({ paths, name });
+      const shapeRecovery = await recoverNativePortableShapeConfirmationDrift({ paths, name });
+      if (shapeRecovery.repaired) {
+        return success('doctor', {
+          healthy: true,
+          workflow: 'native-portable',
+          change: name,
+          repaired: true,
+          result: shapeRecovery,
+          continuation: await portableContinuation(paths, shapeRecovery.state),
+        });
+      }
+      // A dispatched Verifier that never confirmed startup parks the change on
+      // await-verifier forever (platform queue loss, quota reclaim). Once the
+      // dispatch is old enough that no startup can plausibly still arrive,
+      // explicit doctor repair registers the failure so Runtime returns to a
+      // dispatchable Verify boundary.
+      const localExecution = await readNativeLocalExecution(
+        nativeLocalExecutionFile(paths, name),
+      ).catch(() => null);
+      const execution = localExecution?.execution;
+      if (
+        execution &&
+        execution.stage === 'verifying' &&
+        execution.actor === 'verifier' &&
+        execution.status === 'running' &&
+        execution.verifierStartedAt === undefined
+      ) {
+        const waitingMs = Date.now() - Date.parse(execution.startedAt);
+        if (waitingMs >= NATIVE_VERIFIER_CONFIRM_TAKEOVER_MS) {
+          const portableNow = await readNativePortableChange(paths, name);
+          const recorded = recordNativeVerifierExecutionError({
+            state: portableNow,
+            summary: `Verifier dispatch registered ${Math.round(waitingMs / 60_000)} minutes ago and never confirmed startup; doctor repair recorded the failure`,
+          });
+          const written = await compareAndSwapNativePortableState({
+            file: nativePortableStateFile(paths, name),
+            expectedStateVersion: portableNow.state_version,
+            next: recorded,
+            containedRoot: paths.nativeRoot,
+          });
+          return success('doctor', {
+            healthy: true,
+            workflow: 'native-portable',
+            change: name,
+            repaired: true,
+            result: { verifierTakeover: true, waitedMinutes: Math.round(waitingMs / 60_000) },
+            continuation: await portableContinuation(paths, written),
+          });
+        }
+      }
+      const result = await recoverNativePortableChange({
+        paths,
+        name,
+        recoverUnknownRuntimeCheck: true,
+      });
+      if (result.reason === 'execution-active') {
+        return success('doctor', {
+          healthy: true,
+          workflow: 'native-portable',
+          change: name,
+          repaired: false,
+          result,
+          continuation: await portableContinuation(paths, result.state),
+        });
+      }
+      // Repair legacy overlays that the pre-0.4.2 derivation left self-locked
+      // (issue #439): demote ready children with unmet dependencies to pending
+      // under the same mutation lock used by dispatch and integration.
+      const supervisorDependencyRepair = await withNativeMutationLock(
+        paths,
+        `repair Native Supervisor dependencies ${name}`,
+        async () => {
+          const supervisorState = await readNativeSupervisorState(paths, name);
+          const demoted =
+            supervisorState?.children.filter(
+              (child) =>
+                child.status === 'ready' &&
+                !supervisorDependenciesIntegrated(child.dependsOn, supervisorState.children),
+            ) ?? [];
+          if (demoted.length === 0 || !supervisorState) return [];
+          for (const child of demoted) {
+            child.status = 'pending';
+            child.blocker = null;
+          }
+          await writeNativeSupervisorState(paths, supervisorState);
+          return demoted.map(({ name: child }) => child);
+        },
+      );
       return success('doctor', {
         healthy: true,
         workflow: 'native-portable',
         change: name,
         repaired: true,
+        ...(supervisorDependencyRepair.length > 0 ? { supervisorDependencyRepair } : {}),
         result,
         continuation: await portableContinuation(paths, result.state),
+      });
+    }
+    const shapeFinding = await portableShapeConfirmationFinding(paths, name, portableState);
+    if (shapeFinding) {
+      const result = await inspectNativePortableStatus({ paths, name, details: true });
+      return unhealthyDoctor({
+        healthy: false,
+        workflow: 'native-portable',
+        change: name,
+        repaired: false,
+        result,
+        findings: [shapeFinding],
+        continuation: result.continuation,
+      });
+    }
+    const executionFinding = await portableCheckExecutionFinding(paths, name);
+    if (executionFinding) {
+      const result = await inspectNativePortableStatus({ paths, name, details: true });
+      return unhealthyDoctor({
+        healthy: false,
+        workflow: 'native-portable',
+        change: name,
+        repaired: false,
+        result,
+        findings: [executionFinding],
+        continuation: result.continuation,
+      });
+    }
+    // Doctor must stay available when a persisted pre-upgrade overlay has
+    // lost its children contract. Diagnostic reads preserve that evidence and
+    // let the continuation explain how to restore children.yaml.
+    const supervisorState = await readNativeSupervisorState(paths, name, {
+      diagnostics: true,
+    });
+    const unmetReady =
+      supervisorState &&
+      supervisorState.children.filter(
+        (child) =>
+          child.status === 'ready' &&
+          !supervisorDependenciesIntegrated(child.dependsOn, supervisorState.children),
+      );
+    if (supervisorState && unmetReady && unmetReady.length > 0) {
+      const result = await inspectNativePortableStatus({ paths, name, details: true });
+      return unhealthyDoctor({
+        healthy: false,
+        workflow: 'native-portable',
+        change: name,
+        repaired: false,
+        result,
+        findings: [unmetReadySupervisorDependencyFinding(name, supervisorState, unmetReady)],
+        continuation: result.continuation,
       });
     }
     const result = await inspectNativePortableStatus({ paths, name, details: true });
@@ -359,7 +753,11 @@ export async function nativeDoctorCommand(
   }
   const portableNames = await listNativePortableChangeNames(paths);
   const projectPortableTransactions = portableTransactions;
-  if (portableNames.length > 0 || projectPortableTransactions.findings.length > 0) {
+  if (
+    portableNames.length > 0 ||
+    projectPortableTransactions.findings.length > 0 ||
+    workspaceFinishJournalErrors.length > 0
+  ) {
     if (recoveryStrategy) {
       throw new NativeUsageError('--strategy is only available to the legacy transaction doctor');
     }
@@ -370,6 +768,14 @@ export async function nativeDoctorCommand(
         change: string;
         transactionId: string;
       }> = [];
+      const repairedWorkspaceFinishJournals: Array<{ change: string; quarantined: string | null }> =
+        [];
+      for (const error of workspaceFinishJournalErrors) {
+        repairedWorkspaceFinishJournals.push({
+          change: error.name,
+          quarantined: await quarantineNativeWorkspaceFinishJournal(paths, error.name),
+        });
+      }
       for (const transaction of projectPortableTransactions.transactions) {
         if (transaction.kind === 'archive') {
           await archiveNativePortableChange({ paths, name: transaction.change });
@@ -382,6 +788,19 @@ export async function nativeDoctorCommand(
           transactionId: transaction.journal.id,
         });
       }
+      const repairedShapeConfirmations: Array<{ change: string; reason: string }> = [];
+      for (const change of portableNames) {
+        const shapeRecovery = await recoverNativePortableShapeConfirmationDrift({
+          paths,
+          name: change,
+        });
+        if (shapeRecovery.repaired) {
+          repairedShapeConfirmations.push({
+            change,
+            reason: shapeRecovery.reason ?? 'Native confirmed requirements changed',
+          });
+        }
+      }
       const inspected = await nativeDoctorCommand([], projectRoot);
       const inspectedData =
         inspected.data && typeof inspected.data === 'object' && !Array.isArray(inspected.data)
@@ -393,6 +812,8 @@ export async function nativeDoctorCommand(
           ...inspectedData,
           repaired: true,
           repairedPortableTransactions,
+          repairedWorkspaceFinishJournals,
+          repairedShapeConfirmations,
           repairFindings: projectRepair.findings,
         },
       };
@@ -405,18 +826,39 @@ export async function nativeDoctorCommand(
         .map(({ change }) => change),
     );
     const legacyNames = activeNames.filter((change) => !portableSet.has(change));
-    const [changes, conflicts, incompleteMigrations, legacyResults, projectResult] =
-      await Promise.all([
-        Promise.all(
-          portableNames.map((change) => inspectNativePortableStatus({ paths, name: change })),
-        ),
-        Promise.all(portableNames.map((change) => activeArchiveConflictFinding(paths, change))),
-        Promise.all(
-          portableNames.map((change) => hasIncompleteNativePortableMigration(paths, change)),
-        ),
-        Promise.all(legacyNames.map((change) => doctorNativeProject({ paths, name: change }))),
-        doctorNativeProject({ paths, projectOnly: true }),
-      ]);
+    const [
+      changes,
+      conflicts,
+      incompleteMigrations,
+      shapeFindings,
+      gitBindingFindings,
+      executionFindings,
+      legacyResults,
+      projectResult,
+    ] = await Promise.all([
+      Promise.all(
+        portableNames.map((change) => inspectNativePortableStatus({ paths, name: change })),
+      ),
+      Promise.all(portableNames.map((change) => activeArchiveConflictFinding(paths, change))),
+      Promise.all(
+        portableNames.map((change) => hasIncompleteNativePortableMigration(paths, change)),
+      ),
+      Promise.all(
+        portableNames.map(async (change) => {
+          const state = await readNativePortableChange(paths, change);
+          return portableShapeConfirmationFinding(paths, change, state);
+        }),
+      ),
+      Promise.all(
+        portableNames.map(async (change) => {
+          const state = await readNativePortableChange(paths, change);
+          return portableSupervisorGitBindingFinding(paths, change, state);
+        }),
+      ),
+      Promise.all(portableNames.map((change) => portableCheckExecutionFinding(paths, change))),
+      Promise.all(legacyNames.map((change) => doctorNativeProject({ paths, name: change }))),
+      doctorNativeProject({ paths, projectOnly: true }),
+    ]);
     const findings = uniqueFindings([
       ...conflicts.filter((finding): finding is NativeDoctorFinding => finding !== null),
       ...portableNames.flatMap((change, index) =>
@@ -424,7 +866,11 @@ export async function nativeDoctorCommand(
           ? [incompleteMigrationFinding(paths, change)]
           : [],
       ),
+      ...shapeFindings.filter((finding): finding is NativeDoctorFinding => finding !== null),
+      ...gitBindingFindings.filter((finding): finding is NativeDoctorFinding => finding !== null),
+      ...executionFindings.filter((finding): finding is NativeDoctorFinding => finding !== null),
       ...projectPortableTransactions.findings,
+      ...workspaceFinishJournalErrors.map((error) => workspaceFinishJournalFinding(paths, error)),
       ...legacyNames.map<NativeDoctorFinding>((change) => ({
         severity: 'error',
         code: 'portable-migration-required',

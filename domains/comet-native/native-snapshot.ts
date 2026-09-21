@@ -33,13 +33,13 @@ import type {
 
 export const DEFAULT_NATIVE_SNAPSHOT_LIMITS = {
   maxFiles: 10_000,
-  maxFileBytes: 5 * 1024 * 1024,
-  maxTotalBytes: 64 * 1024 * 1024,
-  maxManifestBytes: 1024 * 1024,
+  maxFileBytes: 1024 * 1024 * 1024,
+  maxTotalBytes: 1024 * 1024 * 1024,
+  // Recorded in manifests for compatibility but no longer enforced.
+  maxManifestBytes: 1024 * 1024 * 1024,
 } as const;
 
 const MAX_RECORDED_OMISSIONS = 1_000;
-const NATIVE_SNAPSHOT_MANIFEST_HARD_MAX_BYTES = 8 * 1024 * 1024;
 const CHANGE_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 const MANIFEST_KEYS = new Set([
   'schema',
@@ -126,6 +126,8 @@ interface SnapshotOptions {
   limits?: Partial<NativeContentSnapshotManifest['limits']>;
   policy?: Pick<NativeSnapshotPolicy, 'include' | 'exclude'> | NativeSnapshotPolicy;
   denylist?: readonly string[];
+  /** Config override (native.snapshot.max_selection_records) for the Git-record and physical-node ceilings; explicit selection limits still win. */
+  maxSelectionRecords?: number;
   gitSelectionLimits?: Partial<NativeGitSelectionLimits>;
   gitSelectionHooks?: NativeGitSelectionHooks;
   physicalSelectionLimits?: Partial<NativePhysicalSelectionLimits>;
@@ -301,8 +303,13 @@ function isNativeGitSnapshotTimeout(error: unknown): boolean {
 
 function resolveNativePhysicalSelectionLimits(
   values: Partial<NativePhysicalSelectionLimits> | undefined,
+  maxNodesFromConfig?: number,
 ): NativePhysicalSelectionLimits {
-  const limits = { ...DEFAULT_NATIVE_PHYSICAL_SELECTION_LIMITS, ...values };
+  const limits = {
+    ...DEFAULT_NATIVE_PHYSICAL_SELECTION_LIMITS,
+    ...(maxNodesFromConfig === undefined ? {} : { maxNodes: maxNodesFromConfig }),
+    ...values,
+  };
   if (
     !Number.isSafeInteger(limits.maxNodes) ||
     limits.maxNodes < 1 ||
@@ -451,8 +458,13 @@ function startNativeGitProcess(
 
 function resolveNativeGitSelectionLimits(
   values: Partial<NativeGitSelectionLimits> | undefined,
+  maxRecordsFromConfig?: number,
 ): NativeGitSelectionLimits {
-  const limits = { ...DEFAULT_NATIVE_GIT_SELECTION_LIMITS, ...values };
+  const limits = {
+    ...DEFAULT_NATIVE_GIT_SELECTION_LIMITS,
+    ...(maxRecordsFromConfig === undefined ? {} : { maxRecords: maxRecordsFromConfig }),
+    ...values,
+  };
   if (
     !Number.isSafeInteger(limits.maxRecords) ||
     limits.maxRecords < 1 ||
@@ -754,6 +766,15 @@ interface NativeGitSelectionResults {
   stagedAfter: GitNullRecordResult;
 }
 
+function nativeExcludePathspecs(patterns: readonly string[] | undefined): string[] {
+  if (!patterns) return [];
+  return patterns
+    .filter((pattern) => pattern && !pattern.startsWith('!'))
+    .flatMap((pattern) =>
+      pattern.includes('**') ? [`:(exclude,glob)${pattern}`] : [`:(exclude)${pattern}`],
+    );
+}
+
 async function readNativeGitSelectionResults(
   execution: NativeSnapshotExecution,
   paths: NativeProjectPaths,
@@ -762,6 +783,7 @@ async function readNativeGitSelectionResults(
     NativeGitSelectionHooks,
     'afterStageBefore' | 'afterCombined' | 'outputChunkBytes'
   > = {},
+  excludedPatterns?: readonly string[],
 ): Promise<NativeGitSelectionResults> {
   const projectRoot = path.resolve(paths.projectRoot);
   const selectionFile = path.join(projectRoot, '.comet', 'current-change.json');
@@ -773,10 +795,14 @@ async function readNativeGitSelectionResults(
       return safe;
     },
   );
+  // Policy excludes are excluded from snapshot content, so they must not be
+  // fenced either: monitoring them turns unrelated background churn (dev
+  // servers, build output) into git-selection-changed failures.
   const pathspecs = [
     '--',
     '.',
     ...excludedRefs.flatMap((relative) => [`:(exclude)${relative}`, `:(exclude)${relative}/**`]),
+    ...nativeExcludePathspecs(excludedPatterns),
   ];
   const options: GitNullRecordOptions = {
     ...limits,
@@ -818,6 +844,7 @@ async function nativeGitSnapshotSelection(
   paths: NativeProjectPaths,
   limits: NativeGitSelectionLimits = DEFAULT_NATIVE_GIT_SELECTION_LIMITS,
   hooks: NativeGitSelectionHooks = {},
+  excludedPatterns?: readonly string[],
 ): Promise<NativeGitSnapshotSelection | null> {
   const projectRoot = path.resolve(paths.projectRoot);
   if (!(await hasGitMetadataBoundary(projectRoot))) return null;
@@ -838,7 +865,13 @@ async function nativeGitSnapshotSelection(
   }
   let results: NativeGitSelectionResults;
   try {
-    results = await readNativeGitSelectionResults(execution, paths, limits, hooks);
+    results = await readNativeGitSelectionResults(
+      execution,
+      paths,
+      limits,
+      hooks,
+      excludedPatterns,
+    );
   } catch (error) {
     if (isNativeGitSnapshotTimeout(error)) throw error;
     throw new Error('Native Git snapshot provider failed after repository detection', {
@@ -933,12 +966,19 @@ async function finalizeNativeGitSnapshotSelection(
   limits: NativeGitSelectionLimits,
   selection: NativeGitSnapshotSelection,
   outputChunkBytes?: number,
+  excludedPatterns?: readonly string[],
 ): Promise<void> {
   let finalResults: NativeGitSelectionResults;
   try {
-    finalResults = await readNativeGitSelectionResults(execution, paths, limits, {
-      ...(outputChunkBytes === undefined ? {} : { outputChunkBytes }),
-    });
+    finalResults = await readNativeGitSelectionResults(
+      execution,
+      paths,
+      limits,
+      {
+        ...(outputChunkBytes === undefined ? {} : { outputChunkBytes }),
+      },
+      excludedPatterns,
+    );
   } catch (error) {
     if (isNativeGitSnapshotTimeout(error)) throw error;
     throw new Error('Native Git snapshot provider failed during its final selection fence', {
@@ -1392,10 +1432,6 @@ function isUnreadableError(error: unknown): boolean {
 
 function isChangedDuringReadError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === 'ENOENT';
-}
-
-function serializedManifestBytes(manifest: NativeContentSnapshotManifest): number {
-  return Buffer.byteLength(JSON.stringify(manifest, null, 2) + '\n');
 }
 
 function snapshotPolicyHash(include: readonly string[], exclude: readonly string[]): string {
@@ -2152,9 +2188,6 @@ export function parseNativeContentSnapshotManifest(value: unknown): NativeConten
     omittedCount,
     ...(omissionOverflow ? { omissionOverflow } : {}),
   };
-  if (serializedManifestBytes(parsed) > limits.maxManifestBytes) {
-    throw new Error('Native content snapshot exceeds its manifest byte limit');
-  }
   return parsed;
 }
 
@@ -2310,16 +2343,7 @@ export async function filterNativeContentSnapshotToProjectScope(
         }
       : {}),
   });
-  let projected = buildProjection();
-  while (serializedManifestBytes(projected) > manifest.limits.maxManifestBytes) {
-    const omission = takeLastCompactableOmission(omitted);
-    if (omission === null) {
-      throw new Error('Projected Native snapshot cannot fit its manifest byte limit');
-    }
-    foldOverflow(omission);
-    projected = buildProjection();
-  }
-  return parseNativeContentSnapshotManifest(projected);
+  return parseNativeContentSnapshotManifest(buildProjection());
 }
 
 export function nativeBaselineManifestFile(paths: NativeProjectPaths, name: string): string {
@@ -2346,9 +2370,13 @@ export async function createNativeContentSnapshot(
     ...options,
     deadlineMs: options.deadlineMs ?? limits.maxDurationMs,
   });
-  const gitSelectionLimits = resolveNativeGitSelectionLimits(options.gitSelectionLimits);
+  const gitSelectionLimits = resolveNativeGitSelectionLimits(
+    options.gitSelectionLimits,
+    options.maxSelectionRecords,
+  );
   const physicalSelectionLimits = resolveNativePhysicalSelectionLimits(
     options.physicalSelectionLimits,
+    options.maxSelectionRecords,
   );
   if (
     limits.maxFiles < 1 ||
@@ -2407,14 +2435,6 @@ export async function createNativeContentSnapshot(
     overflowHash = foldSnapshotOverflowHash(overflowHash, 'git-selection', {
       source: 'git-selection',
       ...value,
-    });
-  };
-
-  const foldManifestEntryOverflow = (entry: NativeSnapshotEntry): void => {
-    overflowCount += 1;
-    overflowHash = foldSnapshotOverflowHash(overflowHash, 'manifest-entry', {
-      reason: 'manifest-size',
-      entry,
     });
   };
 
@@ -2768,6 +2788,7 @@ export async function createNativeContentSnapshot(
     paths,
     gitSelectionLimits,
     options.gitSelectionHooks,
+    policy?.manifest.exclude,
   );
   if (gitSelection === null) {
     const before = await nativePhysicalSnapshotSelection({
@@ -3080,6 +3101,7 @@ export async function createNativeContentSnapshot(
       gitSelectionLimits,
       gitSelection,
       options.gitSelectionHooks?.outputChunkBytes,
+      policy?.manifest.exclude,
     );
     // Reused entries already require a final worktree fence. Newly captured entries only need
     // the extra fence when they are being added to an incremental baseline: a full snapshot has
@@ -3150,30 +3172,7 @@ export async function createNativeContentSnapshot(
       : {}),
   });
 
-  let manifest = buildManifest();
-  while (serializedManifestBytes(manifest) > limits.maxManifestBytes) {
-    const compactableOmissionCount = omitted.filter(
-      (omission) => !isSelectionIntegrityOmission(omission),
-    ).length;
-    if (compactableOmissionCount > 0) {
-      const removeCount = Math.max(1, Math.ceil(omitted.length / 4));
-      for (let removed = 0; removed < removeCount; removed += 1) {
-        const omission = takeLastCompactableOmission(omitted);
-        if (omission === null) break;
-        foldOverflow(omission);
-      }
-    } else if (entries.length > 0) {
-      const removeCount = Math.max(1, Math.ceil(entries.length / 4));
-      for (const entry of entries.splice(-removeCount)) {
-        omittedCount += 1;
-        foldManifestEntryOverflow(entry);
-      }
-    } else {
-      throw new Error('Native snapshot manifest byte limit is too small for its metadata');
-    }
-    manifest = buildManifest();
-  }
-  return manifest;
+  return buildManifest();
 }
 
 export async function createNativeCurrentContentSnapshot(
@@ -3187,6 +3186,7 @@ export async function createNativeCurrentContentSnapshot(
     ...options,
     policy: baseline.policy,
     incrementalBaseline: baseline,
+    maxSelectionRecords: settings.max_selection_records,
     limits: {
       maxFiles: settings.max_files,
       maxFileBytes: settings.max_total_bytes,
@@ -3218,7 +3218,7 @@ export async function readNativeBaselineManifest(
     const source = await readNativeProtectedTextFile({
       root: storageRoot,
       file,
-      maxBytes: NATIVE_SNAPSHOT_MANIFEST_HARD_MAX_BYTES,
+      maxBytes: null,
       label: 'Native baseline snapshot manifest',
     });
     return parseNativeContentSnapshotManifest(JSON.parse(source.text));

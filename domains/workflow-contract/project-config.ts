@@ -20,7 +20,7 @@ import type {
 
 export type ProjectConfigCommentLanguage = 'en' | 'zh-CN';
 
-export const WORKFLOW_PROJECT_CONFIG_MAX_BYTES = 64 * 1024;
+export const WORKFLOW_PROJECT_CONFIG_MAX_BYTES = Number.MAX_SAFE_INTEGER;
 export const MAX_WORKFLOW_SNAPSHOT_PATTERN_LENGTH = 1024;
 export const MAX_WORKFLOW_SNAPSHOT_PATTERN_WILDCARDS = 64;
 export const MAX_WORKFLOW_KNOWLEDGE_INCLUDE_PATTERN_LENGTH = 1024;
@@ -30,6 +30,11 @@ export const DEFAULT_WORKFLOW_MEMORY_PROJECT_CONFIG: WorkflowMemoryProjectConfig
   learning: true,
   retrieval: true,
 };
+export const DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG = {
+  include: [],
+  max_file_mb: 1,
+  max_total_mb: 32,
+} satisfies WorkflowKnowledgeLocalConfig;
 export const DEFAULT_WORKFLOW_KNOWLEDGE_PROJECT_CONFIG: WorkflowKnowledgeProjectConfig = {
   provider: 'local',
 };
@@ -149,8 +154,9 @@ export const DEFAULT_WORKFLOW_NATIVE_SNAPSHOT_CONFIG: WorkflowNativeSnapshotConf
   include: ['**/*'],
   exclude: [...DEFAULT_WORKFLOW_NATIVE_SNAPSHOT_EXCLUDES],
   max_files: 10_000,
-  max_total_bytes: 256 * 1024 * 1024,
+  max_total_bytes: 1024 * 1024 * 1024,
   max_duration_ms: 60_000,
+  max_selection_records: 20_000,
 };
 
 type ProjectConfigCommentKey =
@@ -165,6 +171,8 @@ type ProjectConfigCommentKey =
   | 'knowledge.provider'
   | 'knowledge.local'
   | 'knowledge.local.include'
+  | 'knowledge.local.max_file_mb'
+  | 'knowledge.local.max_total_mb'
   | 'knowledge.remote'
   | 'knowledge.remote.endpoint'
   | 'knowledge.remote.token_env'
@@ -178,6 +186,7 @@ type ProjectConfigCommentKey =
   | 'native.clarification_mode'
   | 'native.archive_confirmation'
   | 'native.max_verify_failures'
+  | 'native.document_writes'
   | 'native.finish'
   | 'native.snapshot'
   | 'native.snapshot.include'
@@ -185,12 +194,14 @@ type ProjectConfigCommentKey =
   | 'native.snapshot.max_files'
   | 'native.snapshot.max_total_bytes'
   | 'native.snapshot.max_duration_ms'
+  | 'native.snapshot.max_selection_records'
   | 'classic'
   | 'classic.artifact_layout'
   | 'classic.language'
   | 'classic.context_compression'
   | 'classic.review_mode'
-  | 'classic.auto_transition';
+  | 'classic.auto_transition'
+  | 'classic.document_evidence';
 
 const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigCommentKey, string>> = {
   en: {
@@ -209,6 +220,10 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
     'knowledge.local': '# Additional project-relative Markdown globs used by the local provider.',
     'knowledge.local.include':
       '# One project-relative Markdown glob per list item; appended to the built-in corpus.',
+    'knowledge.local.max_file_mb':
+      '# Maximum size in MB for one local Markdown document. Increase it for long specifications or verification reports.',
+    'knowledge.local.max_total_mb':
+      '# Maximum total size in MB of the local Markdown retrieval corpus.',
     'knowledge.remote': '# Fixed Comet Retrieval API v1 settings used when provider is remote.',
     'knowledge.remote.endpoint': '# HTTPS endpoint; loopback HTTP is allowed.',
     'knowledge.remote.token_env': '# Optional environment variable containing the bearer token.',
@@ -228,6 +243,8 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
       '# Controls whether Native archives automatically after a successful preview or waits for explicit user confirmation.\n# archive_confirmation: automatic | required',
     'native.max_verify_failures':
       '# Maximum failed Verify outcomes allowed for one confirmed acceptance target before Native stops the completion loop.',
+    'native.document_writes':
+      '# Controls documentation file writes during Shape, Verify, and Archive: allow treats them as neutral instead of returning the change to Build, revert restores the strict behavior.\n# document_writes: allow | revert',
     'native.finish':
       '# Optional repository-owned finish providers. Native keeps commit, push, generic remote verification, and recovery ownership.',
     'native.snapshot':
@@ -242,6 +259,8 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
       '# Bounds the total file content hashed by one snapshot. Content is streamed and does not depend on Git hashes.',
     'native.snapshot.max_duration_ms':
       '# Bounds snapshot capture time in milliseconds. Increase it together with the byte budget on slower or larger repositories.',
+    'native.snapshot.max_selection_records':
+      '# Bounds Git selection records and physical enumeration nodes per snapshot. Raise it for monorepos whose tracked plus untracked file list exceeds the default.',
     classic: '# Classic workflow settings. They do not change Native state or behavior.',
     'classic.artifact_layout':
       '# Selects the Classic artifact layout. The default is docs; update preserves detected root-level legacy artifacts.\n# artifact_layout: legacy | docs',
@@ -253,6 +272,8 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
       '# Sets the default review depth for new Classic changes.\n# review_mode: off | standard | thorough',
     'classic.auto_transition':
       '# Automatically enters the next Classic phase after a phase passes.\n# auto_transition: true | false',
+    'classic.document_evidence':
+      '# Controls how documentation edits affect recorded check evidence: neutral keeps build and verify evidence valid when only documentation files changed, strict binds every working-tree file again.\n# document_evidence: neutral | strict',
   },
   'zh-CN': {
     schema: '# Comet 使用的配置格式版本，请勿修改此值。',
@@ -269,6 +290,9 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
     'knowledge.provider': '# 项目知识 Provider。\n# 可选值：local | remote',
     'knowledge.local': '# Local Provider 额外加载的项目相对 Markdown 路径。',
     'knowledge.local.include': '# 每项填写一个项目相对 Markdown glob；会追加到内置语料。',
+    'knowledge.local.max_file_mb':
+      '# 单个本地 Markdown 文档允许参与检索的最大 MB 数；较长的规格或验证报告可按需提高。',
+    'knowledge.local.max_total_mb': '# 本地 Markdown 检索语料允许读取的总 MB 数。',
     'knowledge.remote': '# provider 为 remote 时使用的固定 Comet Retrieval API v1 配置。',
     'knowledge.remote.endpoint': '# HTTPS 地址；loopback 地址允许使用 HTTP。',
     'knowledge.remote.token_env': '# 可选的 Bearer Token 环境变量名。',
@@ -285,6 +309,8 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
       '# Native 归档检查成功后自动归档，或等待用户明确确认。\n# 可选值：automatic | required',
     'native.max_verify_failures':
       '# 同一个已确认验收目标最多允许的 Verify 失败次数；达到上限后停止完成循环。',
+    'native.document_writes':
+      '# Shape、Verify 和 Archive 阶段的文档类写入处理方式：allow 视为中性写入、不再把 change 打回 Build，revert 恢复严格行为。\n# 可选值：allow | revert',
     'native.finish':
       '# 可选的仓库自有收尾 provider；提交、推送、通用远端核验和恢复仍由 Native 负责。',
     'native.snapshot': '# Native 内容快照使用的可审计项目范围与有界工作预算。',
@@ -295,6 +321,8 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
       '# 单次快照最多哈希的文件内容总字节数；内容采用流式读取，不依赖 Git hash。',
     'native.snapshot.max_duration_ms':
       '# 单次快照的最长执行时间（毫秒）；较慢或更大的仓库应与字节预算一并提高。',
+    'native.snapshot.max_selection_records':
+      '# 单次快照的 Git 选择记录数与物理枚举节点数上限；tracked 加 untracked 清单超过默认值的大型 monorepo 可按需提高。',
     classic: '# Classic 工作流配置，不会改变 Native 的状态或行为。',
     'classic.artifact_layout':
       '# Classic 产物布局；默认使用 docs，update 检测到根目录 legacy 产物时予以保留。\n# 可选值：legacy | docs',
@@ -304,6 +332,8 @@ const COMMENTS: Record<ProjectConfigCommentLanguage, Record<ProjectConfigComment
     'classic.review_mode':
       '# 新建 Classic change 默认使用的审查深度。\n# 可选值：off | standard | thorough',
     'classic.auto_transition': '# Classic 阶段通过后是否自动进入下一阶段。\n# 可选值：true | false',
+    'classic.document_evidence':
+      '# 文档编辑对已记录检查证据的影响：neutral 在只有文档文件变化时保持 build 和 verify 证据有效，strict 重新绑定工作区的全部文件。\n# 可选值：neutral | strict',
   },
 };
 
@@ -530,6 +560,14 @@ function positiveWorkflowSnapshotInteger(value: unknown, fallback: number, label
   return resolved as number;
 }
 
+function workflowKnowledgeLimitMb(value: unknown, fallback: number, label: string): number {
+  const resolved = positiveWorkflowSnapshotInteger(value, fallback, label);
+  if (resolved > Math.floor(Number.MAX_SAFE_INTEGER / (1024 * 1024))) {
+    throw new Error(`${label} is too large to convert to bytes safely`);
+  }
+  return resolved;
+}
+
 function normalizeWorkflowSnapshot(value: unknown): WorkflowNativeSnapshotConfig {
   if (value === undefined) {
     return {
@@ -564,6 +602,11 @@ function normalizeWorkflowSnapshot(value: unknown): WorkflowNativeSnapshotConfig
       snapshot.max_duration_ms,
       DEFAULT_WORKFLOW_NATIVE_SNAPSHOT_CONFIG.max_duration_ms,
       'native.snapshot.max_duration_ms',
+    ),
+    max_selection_records: positiveWorkflowSnapshotInteger(
+      snapshot.max_selection_records,
+      DEFAULT_WORKFLOW_NATIVE_SNAPSHOT_CONFIG.max_selection_records,
+      'native.snapshot.max_selection_records',
     ),
   };
 }
@@ -694,6 +737,10 @@ function normalizeWorkflowNativeProjectConfig(
   if (!Number.isSafeInteger(maxVerifyFailures) || (maxVerifyFailures as number) < 1) {
     throw new Error('native.max_verify_failures must be a positive integer');
   }
+  const documentWrites = native.document_writes ?? 'allow';
+  if (documentWrites !== 'allow' && documentWrites !== 'revert') {
+    throw new Error('native.document_writes must be allow or revert');
+  }
   const pending = normalizeWorkflowPendingRootMove(native.pending_root_move);
   const finish = normalizeWorkflowNativeFinish(native.finish);
   return {
@@ -702,6 +749,7 @@ function normalizeWorkflowNativeProjectConfig(
     clarification_mode: clarificationMode,
     archive_confirmation: archiveConfirmation,
     max_verify_failures: maxVerifyFailures as number,
+    ...(documentWrites === 'revert' ? { document_writes: documentWrites } : {}),
     snapshot: normalizeWorkflowSnapshot(native.snapshot),
     ...(finish ? { finish } : {}),
     ...(pending ? { pending_root_move: pending } : {}),
@@ -722,12 +770,17 @@ function normalizeWorkflowClassicProjectConfig(value: unknown): WorkflowClassicP
   if (typeof autoTransition !== 'boolean') {
     throw new Error('classic.auto_transition must be true or false');
   }
+  const documentEvidence = classic.document_evidence ?? 'neutral';
+  if (documentEvidence !== 'neutral' && documentEvidence !== 'strict') {
+    throw new Error('classic.document_evidence must be neutral or strict');
+  }
   return {
     artifact_layout: normalizeClassicArtifactLayout(classic.artifact_layout),
     language: projectConfigLanguage(classic.language, 'zh-CN', 'classic.language'),
     context_compression: contextCompression,
     review_mode: reviewMode,
     auto_transition: autoTransition,
+    ...(documentEvidence === 'strict' ? { document_evidence: documentEvidence } : {}),
   };
 }
 
@@ -812,7 +865,7 @@ function normalizeKnowledgeLocal(value: unknown): WorkflowKnowledgeLocalConfig {
   const local = projectKnowledgeRecord(value, 'knowledge.local');
   const include = local.include ?? [];
   if (!Array.isArray(include)) throw new Error('knowledge.local.include must be an array');
-  return {
+  const normalized = {
     include: [
       ...new Set(
         include.map((pattern, index) =>
@@ -820,7 +873,21 @@ function normalizeKnowledgeLocal(value: unknown): WorkflowKnowledgeLocalConfig {
         ),
       ),
     ],
+    max_file_mb: workflowKnowledgeLimitMb(
+      local.max_file_mb,
+      DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_file_mb,
+      'knowledge.local.max_file_mb',
+    ),
+    max_total_mb: workflowKnowledgeLimitMb(
+      local.max_total_mb,
+      DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_total_mb,
+      'knowledge.local.max_total_mb',
+    ),
   };
+  if (normalized.max_file_mb > normalized.max_total_mb) {
+    throw new Error('knowledge.local.max_file_mb must not exceed max_total_mb');
+  }
+  return normalized;
 }
 
 function normalizeKnowledgeEndpoint(value: unknown): string {
@@ -1040,8 +1107,17 @@ export function workflowProjectConfigManagedValue(
     memory: config.memory ?? { ...DEFAULT_WORKFLOW_MEMORY_PROJECT_CONFIG },
     knowledge: {
       provider: knowledge.provider,
-      ...(knowledge.local && knowledge.local.include.length > 0
-        ? { local: { include: [...knowledge.local.include] } }
+      ...(knowledge.local
+        ? {
+            local: {
+              include: [...knowledge.local.include],
+              max_file_mb:
+                knowledge.local.max_file_mb ?? DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_file_mb,
+              max_total_mb:
+                knowledge.local.max_total_mb ??
+                DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_total_mb,
+            },
+          }
         : {}),
       ...(knowledge.remote
         ? {
@@ -1071,6 +1147,9 @@ export function workflowProjectConfigManagedValue(
             clarification_mode: config.native.clarification_mode,
             archive_confirmation: config.native.archive_confirmation,
             max_verify_failures: config.native.max_verify_failures,
+            ...(config.native.document_writes
+              ? { document_writes: config.native.document_writes }
+              : {}),
             ...(config.native.finish?.pull_request
               ? {
                   finish: {
@@ -1098,6 +1177,9 @@ export function workflowProjectConfigManagedValue(
             context_compression: config.classic.context_compression,
             review_mode: config.classic.review_mode,
             auto_transition: config.classic.auto_transition,
+            ...(config.classic.document_evidence
+              ? { document_evidence: config.classic.document_evidence }
+              : {}),
           },
         }
       : {}),
@@ -1144,10 +1226,12 @@ export function mergeWorkflowProjectConfigDocument(
       ...existingKnowledge,
       provider: validated.knowledge.provider,
     };
-    if (validated.knowledge.local && validated.knowledge.local.include.length > 0) {
+    if (validated.knowledge.local) {
       knowledge.local = {
         ...optionalRecord(existingKnowledge.local),
         include: [...validated.knowledge.local.include],
+        max_file_mb: validated.knowledge.local.max_file_mb,
+        max_total_mb: validated.knowledge.local.max_total_mb,
       };
     } else {
       delete knowledge.local;
@@ -1182,6 +1266,9 @@ export function mergeWorkflowProjectConfigDocument(
       clarification_mode: validated.native.clarification_mode,
       archive_confirmation: validated.native.archive_confirmation,
       max_verify_failures: validated.native.max_verify_failures,
+      ...(validated.native.document_writes
+        ? { document_writes: validated.native.document_writes }
+        : {}),
     };
     if (validated.native.finish?.pull_request) {
       const existingFinish = optionalRecord(existingNative.finish);
@@ -1226,6 +1313,9 @@ export function mergeWorkflowProjectConfigDocument(
       context_compression: validated.classic.context_compression,
       review_mode: validated.classic.review_mode,
       auto_transition: validated.classic.auto_transition,
+      ...(validated.classic.document_evidence
+        ? { document_evidence: validated.classic.document_evidence }
+        : {}),
     };
   }
   return output;
@@ -1262,8 +1352,8 @@ export function defaultWorkflowProjectConfig(
  */
 export function workflowProjectConfigRuntimeHelperScript(): string {
   return String.raw`
-const WORKFLOW_PROJECT_CONFIG_MAX_BYTES = 64 * 1024;
-const WORKFLOW_PROJECT_FILE_MAX_BYTES = 2 * 1024 * 1024;
+const WORKFLOW_PROJECT_CONFIG_MAX_BYTES = Number.MAX_SAFE_INTEGER;
+const WORKFLOW_PROJECT_FILE_MAX_BYTES = Number.MAX_SAFE_INTEGER;
 
 function workflowProjectRelativeSegments(value, label) {
   if (typeof value !== 'string') throw new Error(label + ' must be a string');
@@ -1345,13 +1435,30 @@ function normalizeWorkflowKnowledgeIncludePattern(value, label) {
   return pattern;
 }
 
+function workflowKnowledgeLimitMb(value, fallback, label) {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 1) {
+    throw new Error(label + ' must be a positive integer');
+  }
+  if (resolved > Math.floor(Number.MAX_SAFE_INTEGER / (1024 * 1024))) {
+    throw new Error(label + ' is too large to convert to bytes safely');
+  }
+  return resolved;
+}
+
 function normalizeWorkflowKnowledgeLocal(value) {
   const local = workflowConfigRecord(value, 'knowledge.local');
   const include = local.include ?? [];
   if (!Array.isArray(include)) throw new Error('knowledge.local.include must be an array');
-  return {
+  const normalized = {
     include: [...new Set(include.map((pattern, index) => normalizeWorkflowKnowledgeIncludePattern(pattern, 'knowledge.local.include[' + index + ']')))],
+    max_file_mb: workflowKnowledgeLimitMb(local.max_file_mb, ${DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_file_mb}, 'knowledge.local.max_file_mb'),
+    max_total_mb: workflowKnowledgeLimitMb(local.max_total_mb, ${DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_total_mb}, 'knowledge.local.max_total_mb'),
   };
+  if (normalized.max_file_mb > normalized.max_total_mb) {
+    throw new Error('knowledge.local.max_file_mb must not exceed max_total_mb');
+  }
+  return normalized;
 }
 
 function normalizeWorkflowKnowledgeProjectConfig(value) {
@@ -2280,6 +2387,10 @@ function managedWorkflowConfigFields(source) {
     if (!Number.isSafeInteger(maxVerifyFailures) || maxVerifyFailures < 1) {
       throw new Error('native.max_verify_failures must be a positive integer');
     }
+    const documentWrites = native.document_writes ?? 'allow';
+    if (documentWrites !== 'allow' && documentWrites !== 'revert') {
+      throw new Error('native.document_writes must be allow or revert');
+    }
     if (native.finish !== undefined) {
       const finish = workflowConfigRecord(native.finish, 'native.finish');
       if (finish.pull_request !== undefined) {
@@ -2355,6 +2466,10 @@ function managedWorkflowConfigFields(source) {
     const autoTransition = classic.auto_transition ?? true;
     if (typeof autoTransition !== 'boolean') {
       throw new Error('classic.auto_transition must be true or false');
+    }
+    const documentEvidence = classic.document_evidence ?? 'neutral';
+    if (documentEvidence !== 'neutral' && documentEvidence !== 'strict') {
+      throw new Error('classic.document_evidence must be neutral or strict');
     }
   }
   const nativeEnabled = Array.isArray(workflows) && workflows.includes('native');

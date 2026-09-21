@@ -68,10 +68,16 @@ export function listBundlePlatformTargets(options: {
     if (platform.rulesFormat === 'dsh' || (platform.rulesDir && platform.rulesFormat)) {
       capabilities.add('rules');
     }
-    // OMP's Hook surface is an in-process TypeScript extension module. The
-    // Comet workflow Router has a dedicated bridge, while portable Bundle
-    // hook compilation remains limited to command-based host formats.
-    if (platform.supportsHooks && platform.hookFormat && platform.hookFormat !== 'omp') {
+    // OMP's Hook surface is an in-process TypeScript extension module, while
+    // Zcode requires a process argument vector. The Comet workflow Router has
+    // dedicated bridges for those hosts; portable Bundle hook compilation is
+    // limited to command-string host formats.
+    if (
+      platform.supportsHooks &&
+      platform.hookFormat &&
+      platform.hookFormat !== 'omp' &&
+      platform.hookFormat !== 'zcode'
+    ) {
       capabilities.add('hooks');
     }
     if (platform.id === 'claude') capabilities.add('agents');
@@ -196,7 +202,17 @@ export function planBundleHook(
 } | null {
   const format = target.platform.hookFormat;
   const destination = hookDestination(target, hook.id);
-  if (!target.layout.hooksSupported || !format || format === 'omp' || !destination) return null;
+  // 'omp' hooks are extension modules and 'zcode' hooks need a process
+  // argument vector; neither fits this command-string hook model.
+  if (
+    !target.layout.hooksSupported ||
+    !format ||
+    format === 'omp' ||
+    format === 'zcode' ||
+    !destination
+  ) {
+    return null;
+  }
   if (!['before_tool', 'before_write'].includes(hook.event)) return null;
   const script = scripts.find((item) => item.id === hook.script);
   if (!script || !target.layout.scriptsRoot) return null;

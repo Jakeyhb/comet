@@ -5,6 +5,7 @@ import { parseDocument } from 'yaml';
 
 import { memoizedHookReadSync } from '../../platform/process/hook-read-cache.js';
 import { withClassicStateLock } from './classic-store.js';
+import { CLASSIC_PROJECT_FILE_MAX_BYTES } from './classic-protected-path.js';
 import { atomicWriteContainedText } from '../workflow-contract/contained-atomic-write.js';
 import { readProtectedProjectFile } from '../workflow-contract/protected-project-path.js';
 
@@ -14,6 +15,7 @@ export function liveGitBranch(cwd: string): string | null {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10_000,
       windowsHide: true,
     }).trim();
     return branch && branch !== 'HEAD' ? branch : null;
@@ -34,6 +36,7 @@ export function isGitWorkTree(cwd: string): boolean {
         cwd,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 10_000,
         windowsHide: true,
       }).trim() === 'true'
     );
@@ -139,7 +142,7 @@ export async function healBoundBranch(changeDir: string, branch: string): Promis
 async function healBoundBranchLocked(changeDir: string, branch: string): Promise<void> {
   const file = path.join(changeDir, '.comet.yaml');
   const source = (
-    await readProtectedProjectFile(changeDir, '.comet.yaml', 2 * 1024 * 1024, {
+    await readProtectedProjectFile(changeDir, '.comet.yaml', CLASSIC_PROJECT_FILE_MAX_BYTES, {
       label: 'Classic branch binding',
     })
   ).bytes.toString('utf8');
@@ -169,7 +172,10 @@ export function driftStaleReason(
   boundBranch: string,
   currentBranch: string | null,
 ): string {
-  return `change '${change}' is bound to branch '${boundBranch}', but current branch is '${branchLabel(currentBranch)}'`;
+  return (
+    `change '${change}' is bound to branch '${boundBranch}', but current branch is '${branchLabel(currentBranch)}'` +
+    `. Next: switch to branch '${boundBranch}' and rerun, or run comet state rebind ${change} after the user explicitly confirms this branch should take over the change`
+  );
 }
 
 export function unboundDetachedMessage(change: string): string {

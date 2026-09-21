@@ -27,9 +27,11 @@ comet state select <change-name>
 comet state check <change-name> verify --json
 ```
 
-Continue from the returned layout, configuration, nextAction, task information, and coordination summary. If checks and the integration review remain valid, finish only the missing work instead of rerunning the phase. After context loss, use --recover --details --json when full records are needed. Handle the reported cause of any failure.
+Combine multiple read-only comet commands (for example `state get`, `state next`, `state artifacts`) into a single shell invocation to reduce process startup overhead.
 
-If select/check returns `BLOCKED` because `bound_branch` differs from the current branch, pause under `comet-classic/reference/decision-point.md`. Offer a single choice: return to the bound branch and rerun entry checks, or, after the user explicitly confirms that the current branch should take over this change, run `comet state rebind <change-name>` and rerun entry checks. Do not switch or rebind branches yourself.
+When the previous phase's guard already returned this phase's state, continue from that state and `agent.continuation` without repeating select/check; run the entry checks above only when resuming, after workspace changes, or after external state changes. Continue from the returned layout, configuration, nextAction, task information, and coordination summary. If checks and the integration review remain valid, finish only the missing work instead of rerunning the phase. After context loss, use --recover --details --json when full records are needed. Handle the reported cause of any failure.
+
+If select/check returns `BLOCKED` — or a branch-binding `ERROR` — because `bound_branch` differs from the current branch, pause under `comet-classic/reference/decision-point.md`. Offer a single choice: return to the bound branch and rerun entry checks, or, after the user explicitly confirms that the current branch should take over this change, run `comet state rebind <change-name>` and rerun entry checks. Do not switch or rebind branches yourself.
 
 **Continue from recorded results:** If `verify_result` is `pass`, proceed to archive. Keep `branch_status` at `pending` until the archive commit and final branch handling are complete. If `verify_result` is `pending`, inspect existing reports and results, then resume unfinished checks.
 
@@ -49,7 +51,7 @@ The script counts tasks, delta specs, and changed files, returning a light/full 
 
 Before verification, inspect uncommitted changes under `comet-classic/reference/dirty-worktree.md`. Apply these Verify-specific rules:
 
-1. Include uncommitted changes clearly belonging to this change in the verification input. Continue verifying, but do not modify or commit implementation, tests, tasks, delta spec, or the Design Doc in Verify.
+1. Include uncommitted changes clearly belonging to this change in the verification input. Continue verifying, but do not modify or commit implementation, tests, tasks, delta spec, or the Design Doc in Verify. Documentation-only edits (the neutral document set defined in comet-build: Markdown plus `LICENSE`/`NOTICE`/`AUTHORS` at the repository root, and Markdown/`.txt`/`.rst` under `docs/`, `doc/`, `documentation/`, `.github/`, excluding OpenSpec and Superpowers artifacts) may be completed normally in Verify — they are not implementation writes, they do not invalidate check evidence by default, and they do not require `verify-fail`.
 2. If uncommitted changes are Verify artifacts, such as a draft report, continue completing them and recording state in Verify.
 3. If implementation exists but tasks.md is unchecked, Build's task record is behind the code. Run `verify-fail` directly to return to Build, inspect evidence, and update task state. Do not ask whether to accept unfinished tasks.
 4. If ownership cannot be established or the changes belong to another change, report the stopping condition from dirty-worktree. Do not offer “continue/ignore” before ownership is known.
@@ -86,16 +88,19 @@ Accepting WARNING/SUGGESTION deviations or choosing a strategy after the fourth 
 
 ### 2. Read the artifacts needed for verification
 
-When verification needs OpenSpec artifacts, use the handoff status already returned by entry. Run this only if entry lacks the current hash comparison:
+When verification needs OpenSpec artifacts, use the handoff status already returned by entry. Run this only if entry lacks the current comparison:
 
 ```bash
 comet handoff <change-name> --hash-only
 ```
 
-- Compare the current hash with the recorded value from entry. Query `comet state get <change-name> handoff_hash` only if that value is absent. If both hashes are nonempty, non-null, and equal, reuse content only if that version is still in context. Read any missing sections needed for acceptance, and still verify task completion marks.
-- If `RECORDED_HASH` is empty, `null`, or differs from `CURRENT_HASH`, read every required source file in full because artifacts changed or the hash was not recorded.
+Read the `[HANDOFF] status:` verdict from stderr and act on it; the stdout hash stays for scripted callers and is never compared by hand:
 
-Matching hashes do not mean the content remains in context. After context loss, truncation, or uncertainty about what was read, reload the corresponding sources. A handoff summary cannot replace acceptance clauses that have not been read.
+- `FRESH`: reuse artifact content already in context, read only acceptance sections still missing, and still verify task completion marks.
+- `STALE (changed: <files>)`: read the listed changed artifacts in full before verifying acceptance against them; if runtime's NEXT suggests `comet handoff <change-name> design --write`, run it before reading.
+- `STALE` without a file list: read every required source file in full because the recorded handoff is missing or predates the current artifacts.
+
+A FRESH verdict does not mean the content is still in context. After context loss, truncation, or uncertainty about what was read, reload the corresponding sources. A handoff summary cannot replace acceptance clauses that have not been read.
 
 Autonomous performs the actual checks and records results under this Skill without requiring an external verification skill. Other strategies load Superpowers `verification-before-completion` through the Skill tool. No strategy may declare verification successful based only on self-assessment.
 
@@ -111,14 +116,14 @@ Return CRITICAL/IMPORTANT integration-review findings to Build under Step 1b. Ha
 Check all 7 items:
 
 1. Every tasks.md task is completed `[x]`.
-2. Changed files match tasks.md; compare task content against `git diff --stat` / `git diff --cached --stat` / `git diff --stat <base-ref>...HEAD`.
+2. Changed files match tasks.md; compare task content against `git diff --stat` / `git diff --cached --stat` / `git diff --stat <base-ref>...HEAD`. Documentation-only edits in the neutral document set are reported next to the comparison instead of being treated as an implementation mismatch.
 3. Compilation passes; reuse Build evidence only when Runtime confirms it remains valid, otherwise rerun it.
 4. Relevant tests pass.
 5. No obvious security issues, such as hard-coded secrets or new unsafe operations.
 6. Final integration review passes, or its omission under non-full-autonomous `review_mode: off` is recorded. Full autonomous cannot skip independent review.
 7. Core success, important failure/edge cases, and the high-risk requirements affected by this change all pass. Small changes may not omit these.
 
-To reuse a build, call `comet check run <change-name> build --local -- <program> [args...]` with the same cwd, program, and arguments used in Build. Reuse counts only when Runtime returns `reused=true`; changed inputs or environment cause an actual rerun. A past conversation saying “build passed” does not justify skipping the check.
+To reuse a build, call `comet check run <change-name> build --local -- <program> [args...]` with the same cwd, program, and arguments used in Build. Reuse counts only when Runtime returns `reused=true`; changed inputs or environment cause an actual rerun. Evidence cwd must equal the directory where guard is later invoked (usually the project root); record subdirectory builds in a form that executes from the root (for example `npm --prefix <subdir> run build`), or declare the command's cwd in `.comet/check-policy.json` (version 2) and record it with `--cwd <subdir>` — otherwise the guard rejects the evidence with an explanation. A past conversation saying “build passed” does not justify skipping the check. Evidence is judged by "input scope": the default inputs are working-tree file contents, so commits, staging, task checkbox ticks, and environment variable changes do not invalidate evidence by default. When guard reports invalid evidence it prints the reason and changed files; handle those instead of rerunning everything. Incremental `--incremental` evidence left by Build supports preview confirmation, while `--apply` requires full evidence from the complete command.
 
 Both light and full must execute actual verification commands through Runtime. Record the intended report path first so changes to the report are not counted as changes to verification inputs. Fill in results after tests and acceptance checks finish:
 
@@ -129,7 +134,7 @@ comet check run <change-name> verify --local -- <program> [args...]
 
 Use `--local` only for deterministic local checks. Omit it for external-service checks; their results may support only one successful phase transition. Guard preview does not consume them. `--apply` rechecks them and makes them unusable again after successful advancement. After context loss or input/environment changes, let Runtime decide which checks need rerunning.
 
-The platform adapter handles ordinary Windows npm/pnpm shims. Batch arguments containing shell metacharacters are rejected. Execute multiple required commands through an existing project verification entry that propagates any failure; a successful last command must not hide an earlier failure. Manual `record-check` only stores a declaration and cannot automatically advance the phase. Verify and Build evidence are separate and cannot substitute for one another. `COMET_SKIP_BUILD=1` is not a verifiable check record. Read logs through `logRef` as needed.
+The platform adapter handles ordinary Windows npm/pnpm shims. Batch arguments containing shell metacharacters are rejected. Execute multiple required commands through an existing project verification entry that propagates any failure; a successful last command must not hide an earlier failure. Manual `record-check` only stores a declaration, cannot automatically advance the phase, and shadows earlier valid Runtime evidence until a fresh `comet check run` runs. Verify and Build evidence are separate and cannot substitute for one another. Evidence for different check requirements stays independent; Runtime may reuse a local full command across Build and Verify only when argv, cwd, inputs, environment, and semantics all match. `COMET_SKIP_BUILD=1` is not a verifiable check record. Read logs through `logRef` as needed. Use `comet check run` for the first actual execution; after a failure, fix the cause and use `comet check rerun` to retry the exact command. Run guard immediately after success with no intervening `comet state` writes, and commit only after guard passes.
 
 The integration review uses this change's diff, tasks.md, and necessary test results. It does not replace spec coverage, Design Doc consistency, or divergence checks. `review_mode: off` skips only automatic code review, not builds, tests, security checks, or the debugging protocol.
 
@@ -179,7 +184,7 @@ comet state transition <change-name> verify-fail
 **Resolve spec divergence with the user:**
 
 - If item 6 finds content in delta spec that the Design Doc does not reflect, **pause, present a single-choice question, and wait for the user**. Do not choose automatically. Include:
-  - A: append an “Implementation Divergence” section explaining the deviation to the Design Doc. This is an allowed Verify artifact; do not trigger another Step 1b dirty-worktree decision because of this design edit.
+  - A: append an “Implementation Divergence” section explaining the deviation to the Design Doc. This is an allowed Verify artifact; do not trigger another Step 1b dirty-worktree decision because of this design edit. The Design Doc is a check input (not a neutral document), so after writing rerun `comet check run <change-name> verify --local -- <command>` and then `comet guard <change-name> verify --apply`.
   - B: run `comet state transition <change-name> verify-fail` after the user chooses B, then invoke `/comet-build`. Build loads Superpowers `brainstorming` under its spec-update rules to update the Design Doc + delta spec.
   - C: accept the deviation and continue verification. Archive will mark the Design Doc `superseded-by-main-spec`.
 

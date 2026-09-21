@@ -132,7 +132,13 @@ None.
 # Verification expectations
 Run applicable focused checks.
 `;
-    await fs.writeFile(path.join(projectRoot, 'docs', 'comet', 'changes', name, 'brief.md'), brief);
+    const changeDir = path.join(projectRoot, 'docs', 'comet', 'changes', name);
+    await fs.writeFile(path.join(changeDir, 'brief.md'), brief);
+    await fs.mkdir(path.join(changeDir, 'specs', 'fixture'), { recursive: true });
+    await fs.writeFile(
+      path.join(changeDir, 'specs', 'fixture', 'spec.md'),
+      '# Fixture target\n\nThis document binds the Native Runtime loop fixture.\n',
+    );
     const prepared = json(
       await runNativeCli([
         'next',
@@ -225,11 +231,18 @@ Run applicable focused checks.
     const status = await runNativeCli(['status', '--help']);
 
     expect(root.stdout).toContain('skill-coordinated');
+    expect(root.stdout).toContain('Agent Quick Start:');
+    expect(root.stdout).toContain('comet native status --json');
+    expect(root.stdout).toContain('agent.continuation.commandArgs');
+    expect(root.stdout).toContain('agent.workspace.cwd');
+    expect(root.stdout).toContain('agent.continuation.inputOptions');
     expect(next.stdout).toContain('continuation.runnerAction');
     expect(next.stdout).toContain('continuation.userCommunication');
     expect(next.stdout).toContain('--runner-input <file>');
     expect(next.stdout).toContain('--validate-only');
     expect(next.stdout).toContain('retry-checks');
+    expect(next.stdout).toContain('verification_checks');
+    expect(next.stdout).toContain('reused without executing the same plan twice');
     expect(next.stdout).toContain('--coordination-mode multi-session|single-session');
     expect(next.stdout).toContain('not trusted identity attestation');
     expect(next.stdout).toContain('Checks completed, but your confirmation is required');
@@ -691,8 +704,9 @@ Run applicable focused checks.
           changeDir: path.join(projectRoot, 'docs', 'comet', 'changes', name),
           supervisorStateRef: null,
           briefRef: 'brief.md',
-          specRefs: [],
+          specRefs: [{ capability: 'fixture', operation: 'create', ref: 'specs/fixture/spec.md' }],
           acceptanceCount: 2,
+          scopeCount: 2,
           scopeIds: ['A1', 'A2'],
           detailsPageArgs: [
             'comet',
@@ -711,7 +725,8 @@ Run applicable focused checks.
           runtimeChecks: [],
           builderReportedChecks: [{ name: { text: 'Focused tests' }, result: 'passed' }],
           builderKnownLimits: [{ text: 'Host Hook not exercised' }],
-          evidenceInstruction: expect.stringContaining('not Runtime receipts'),
+          evidenceInstruction: expect.stringMatching(/scopeIds.*exactly once/iu),
+          responseInstruction: expect.stringMatching(/scopeIds.*no other acceptance IDs/iu),
         },
       },
     });
@@ -1082,7 +1097,7 @@ Run applicable focused checks.
     );
     expect(staleAcceptResult).toMatchObject({
       exitCode: 65,
-      error: { message: expect.stringContaining('stale for state version') },
+      error: { message: expect.stringContaining('Native continuation is stale') },
     });
     expect(json(await runNativeCli(['show', name, '--json', ...projectArgs()])).data).toMatchObject(
       {
@@ -1297,7 +1312,7 @@ Run applicable focused checks.
     );
     expect(staleRevision).toMatchObject({
       exitCode: 65,
-      error: { message: expect.stringContaining('stale for state version') },
+      error: { message: expect.stringContaining('Native continuation is stale') },
     });
   });
 
@@ -1490,6 +1505,185 @@ Run applicable focused checks.
       },
     });
     await expect(fs.readFile(counter, 'utf8')).resolves.toBe('run\n');
+  });
+
+  it('executes handoff verification checks once and reuses them for Verifier dispatch', async () => {
+    const name = 'handoff-runtime-check-reuse';
+    const counter = path.join(projectRoot, '.comet', 'runtime', 'handoff-check-count.txt');
+    const verificationCheck = {
+      id: 'runtime-pass',
+      name: 'Runtime pass',
+      executable: process.execPath,
+      argv: ['-e', `require('fs').appendFileSync(${JSON.stringify(counter)}, 'run\\n')`],
+      cwdRef: '.',
+      timeoutMs: 10_000,
+      repeatable: true,
+    };
+    await prepareBuild(name, ['First behavior works.'], 'zh-CN');
+
+    const checked = await runnerStep(name, {
+      ...builderHandoff(['A1']),
+      verification_checks: [verificationCheck],
+    });
+
+    expect(checked).toMatchObject({
+      exitCode: 0,
+      data: {
+        state: {
+          phase: 'verify',
+          status: 'active',
+          loop: { stage: 'verify-ready', next_action: 'run-required-checks-and-dispatch-verifier' },
+        },
+        checks: [expect.objectContaining({ id: 'runtime-pass', status: 'passed' })],
+        runtimeCheckExecution: { disposition: 'executed' },
+        continuation: {
+          action: 'dispatch-verifier',
+          inputOptions: [
+            expect.objectContaining({
+              template: { kind: 'dispatch-verifier', checks: [verificationCheck] },
+            }),
+          ],
+        },
+      },
+    });
+    await expect(fs.readFile(counter, 'utf8')).resolves.toBe('run\n');
+
+    for (const command of ['status', 'show'] as const) {
+      const resumed = json(await runNativeCli([command, name, '--json', ...projectArgs()]));
+      expect(resumed.data?.continuation).toMatchObject({
+        action: 'dispatch-verifier',
+        inputOptions: [
+          expect.objectContaining({
+            template: { kind: 'dispatch-verifier', checks: [verificationCheck] },
+          }),
+        ],
+      });
+    }
+
+    const dispatched = await runnerStep(name, inputTemplate(checked, 'runner-input'));
+    expect(dispatched).toMatchObject({
+      exitCode: 0,
+      data: {
+        checks: [expect.objectContaining({ id: 'runtime-pass', status: 'passed' })],
+        runtimeCheckExecution: { disposition: 'reused' },
+        verifierDispatch: { runtimeChecks: [expect.objectContaining({ id: 'runtime-pass' })] },
+        continuation: { action: 'await-verifier' },
+      },
+    });
+    await expect(fs.readFile(counter, 'utf8')).resolves.toBe('run\n');
+  });
+
+  it('returns a failed handoff verification check to Build', async () => {
+    const name = 'handoff-runtime-check-failure';
+    await prepareBuild(name, ['First behavior works.'], 'zh-CN');
+
+    const checked = await runnerStep(name, {
+      ...builderHandoff(['A1']),
+      verification_checks: [
+        {
+          id: 'runtime-fail',
+          name: 'Runtime fail',
+          executable: process.execPath,
+          argv: ['-e', 'process.exit(7)'],
+          cwdRef: '.',
+          timeoutMs: 10_000,
+          repeatable: true,
+        },
+      ],
+    });
+
+    expect(checked).toMatchObject({
+      exitCode: 0,
+      data: {
+        state: {
+          phase: 'build',
+          status: 'active',
+          loop: { stage: 'repairing', next_action: 'submit-builder-candidate' },
+        },
+        checks: [expect.objectContaining({ id: 'runtime-fail', status: 'failed', exit_code: 7 })],
+        runtimeCheckExecution: { disposition: 'executed' },
+        continuation: { action: 'repair' },
+      },
+    });
+  });
+
+  it('offers retry-checks when a repeatable handoff verification check is interrupted', async () => {
+    const name = 'handoff-runtime-check-interrupted';
+    await prepareBuild(name, ['First behavior works.'], 'zh-CN');
+
+    const checked = await runnerStep(name, {
+      ...builderHandoff(['A1']),
+      verification_checks: [
+        {
+          id: 'runtime-pass',
+          name: 'Runtime pass',
+          executable: process.execPath,
+          argv: ['-e', 'process.exit(0)'],
+          cwdRef: '.',
+          timeoutMs: 10_000,
+          repeatable: true,
+        },
+        {
+          id: 'runtime-timeout',
+          name: 'Runtime timeout',
+          executable: process.execPath,
+          argv: ['-e', 'setTimeout(() => {}, 10000)'],
+          cwdRef: '.',
+          timeoutMs: 50,
+          repeatable: true,
+        },
+      ],
+    });
+
+    expect(checked).toMatchObject({
+      exitCode: 0,
+      data: {
+        state: {
+          phase: 'verify',
+          status: 'active',
+          loop: { stage: 'verify-ready', next_action: 'run-required-checks-and-dispatch-verifier' },
+        },
+        checks: [
+          expect.objectContaining({ id: 'runtime-pass', status: 'passed' }),
+          expect.objectContaining({ id: 'runtime-timeout', status: 'interrupted' }),
+        ],
+        runtimeCheckExecution: { disposition: 'executed' },
+        continuation: {
+          action: 'retry-checks',
+          inputOptions: [
+            expect.objectContaining({
+              template: { kind: 'retry-checks', check_ids: ['runtime-timeout'] },
+            }),
+          ],
+        },
+      },
+    });
+
+    const retried = await runnerStep(name, inputTemplate(checked, 'runner-input'));
+    expect(retried).toMatchObject({
+      exitCode: 0,
+      data: { continuation: { action: 'retry-checks' } },
+    });
+    const exhausted = await runnerStep(name, inputTemplate(retried, 'runner-input'));
+    expect(exhausted).toMatchObject({
+      exitCode: 0,
+      data: {
+        state: { phase: 'build', loop: { stage: 'repairing' } },
+        continuation: { action: 'repair' },
+      },
+    });
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    const local = await readNativeLocalExecution(nativeLocalExecutionFile(paths, name));
+    expect(local?.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'runtime-pass', status: 'passed', executionCount: 1 }),
+        expect.objectContaining({
+          id: 'runtime-timeout',
+          status: 'interrupted',
+          executionCount: 3,
+        }),
+      ]),
+    );
   });
 
   it('rejects delayed generic Verifier errors and unavailable messages from an older attempt', async () => {

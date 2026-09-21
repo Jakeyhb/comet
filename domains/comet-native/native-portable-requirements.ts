@@ -2,7 +2,12 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { atomicWriteText } from './native-atomic-file.js';
-import { nativeBriefHasBlockingQuestion } from './native-artifacts.js';
+import {
+  nativeBriefHasBlockingQuestion,
+  stripMarkdownHtmlComments,
+  validateNativeBrief,
+  validateNativeSpecDocumentText,
+} from './native-artifacts.js';
 import { readNativeBoundedTextFile } from './native-bounded-file.js';
 import { canonicalHash } from './native-canonical-hash.js';
 import {
@@ -60,6 +65,7 @@ import {
   writeNativeVerificationReportSnapshot,
 } from './native-evidence-storage.js';
 import type { CometProjectConfig, NativeProjectPaths } from './native-types.js';
+import type { NativeArtifactValidation, NativeFinding } from './native-types.js';
 import type { NativeWorkspaceBinding } from './native-workspace.js';
 import { readProjectConfig, writeProjectConfig } from './native-config.js';
 import { parseCapabilityAssociationDraft } from '../project-knowledge/capability-discovery.js';
@@ -67,6 +73,7 @@ import {
   NAME_PATTERN,
   assertPortableWorkspaceBindingCurrent,
   currentBranch,
+  lateBindPortableCurrentWorkspace,
   nativeLocalExecutionFile,
   nativePortableChangeDir,
   nativePortableStateFile,
@@ -75,10 +82,173 @@ import {
   writePortableMutation,
 } from './native-portable-storage.js';
 import { returnNativePortableStateToFinalVerificationLocked } from './native-portable-transitions.js';
+import { assertNoActiveNativeSupervisorTasks } from './native-supervisor-state.js';
 
 export const NATIVE_PORTABLE_BRIEF_TEMPLATE = nativeBriefTemplate('en');
 
 const NATIVE_CAPABILITY_ASSOCIATION_FILE = 'capability-association.yaml';
+
+function normalizedShapeArtifactText(text: string): string {
+  const lines = text.replace(/\r\n?/gu, '\n').split('\n');
+  while (lines.length > 0 && lines.at(-1)?.trim().length === 0) lines.pop();
+  return `${lines.map((line) => line.replace(/[\t ]+$/gu, '')).join('\n')}\n`;
+}
+
+function isPlaceholderExemptionReason(source: string): boolean {
+  const normalized = source
+    .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/u, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (normalized.length === 0) return true;
+  if (/^(?:<[^>\r\n]+>|\{\{[^}\r\n]+\}\})[.!：: -]*$/iu.test(normalized)) return true;
+  const decorated = normalized
+    .replace(/[*_`>#\x5b\x5d()]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (
+    /^(?:todo|tbd|fixme)(?:\s*[:：-]|\s*$)/iu.test(decorated) ||
+    /^(?:fill(?:\s+this\s+in)?|placeholder)\b/iu.test(decorated) ||
+    /^(?:待填写|待补充)/u.test(decorated)
+  ) {
+    return true;
+  }
+  return /^(?:(?:todo|tbd|fixme)\b|fill(?:\s+this\s+in)?\b|placeholder\b|documentation[- ]only\b|no\s+product\s+behavior\s+change\b|待填写|待补充|仅文档|不改变产品行为|不涉及产品行为)[.!。；;：:，,、 -]*$/iu.test(
+    decorated,
+  );
+}
+
+function hasExplicitSpecExemption(source: string): boolean {
+  const visibleLines: string[] = [];
+  let inFence = false;
+  for (const line of stripMarkdownHtmlComments(source).split(/\r?\n/u)) {
+    if (/^\s*(?:```|~~~)/u.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (!inFence && !/^\s*#{1,6}\s+/u.test(line)) visibleLines.push(line);
+  }
+  return visibleLines.some((line) => {
+    const match =
+      /(?:no\s+product\s+behavior\s+change|documentation[- ]only|不改变产品行为|不涉及产品行为|仅文档)\s*[:：]\s*(.*)$/iu.exec(
+        line,
+      );
+    return match !== null && !isPlaceholderExemptionReason(match[1] ?? '');
+  });
+}
+
+export function formatNativeDocumentConstraintFindings(
+  findings: readonly NativeFinding[],
+  options: { change: string; phase: NativePortablePhase },
+): string {
+  const details = findings
+    .map(({ code, message, path: ref }) => `- ${code}${ref ? ` (${ref})` : ''}: ${message}`)
+    .join('\n');
+  return [
+    `Native ${options.phase} document checks failed for ${options.change}.`,
+    details,
+    'Recovery: edit the reported formal file in the configured Native change directory, then rerun the latest continuation command. The current state and existing work are preserved; do not edit comet-state.yaml or bypass the Hook.',
+  ].join('\n');
+}
+
+export async function validateNativePortableDocuments(options: {
+  paths: NativeProjectPaths;
+  state: NativePortableState;
+  specChanges?: readonly NativePortableSpecChange[];
+}): Promise<NativeArtifactValidation> {
+  const changeDir = nativePortableChangeDir(options.paths, options.state.name);
+  const findings: NativeFinding[] = [
+    ...(await validateNativeBrief(changeDir, options.state.brief, { strict: true })).findings,
+  ];
+  let briefSource = '';
+  try {
+    briefSource = (
+      await readNativeBoundedTextFile({
+        root: changeDir,
+        ref: options.state.brief,
+        maxBytes: null,
+        includeHash: false,
+      })
+    ).text;
+  } catch {
+    // validateNativeBrief already reports the bounded/missing read failure.
+  }
+  const specChanges = options.specChanges ?? options.state.spec_changes;
+  const targetSpecs = specChanges.filter(({ operation }) => operation !== 'remove');
+  const declaredTargetSpecs = options.state.spec_changes.filter(
+    ({ operation }) => operation !== 'remove',
+  );
+  const discoveredCapabilities = new Set(targetSpecs.map(({ capability }) => capability));
+  if (options.specChanges !== undefined) {
+    for (const declared of declaredTargetSpecs) {
+      if (discoveredCapabilities.has(declared.capability)) continue;
+      findings.push({
+        code: 'spec-document-missing',
+        message: `Previously declared target Spec is missing: specs/${declared.capability}/spec.md. Restore the complete file or record the intended capability deletion as a formal remove entry.`,
+        path: `specs/${declared.capability}/spec.md`,
+      });
+    }
+  }
+  const formalRemovalsOnly =
+    specChanges.length > 0 && specChanges.every(({ operation }) => operation === 'remove');
+  if (
+    targetSpecs.length === 0 &&
+    declaredTargetSpecs.length === 0 &&
+    !formalRemovalsOnly &&
+    !hasExplicitSpecExemption(briefSource)
+  ) {
+    findings.push({
+      code: 'spec-exemption-missing',
+      message:
+        'This change declares no target Spec. Add a complete target Spec, or record a concrete reason such as “No product behavior change: documentation-only wording.” in brief.md.',
+      path: options.state.brief,
+    });
+  }
+  for (const spec of targetSpecs) {
+    const expectedSource = `specs/${spec.capability}/spec.md`;
+    if (spec.source !== expectedSource) {
+      findings.push({
+        code: 'spec-source-path-invalid',
+        message: `Target Spec must be staged at ${expectedSource}.`,
+        path: spec.source ?? expectedSource,
+      });
+      continue;
+    }
+    try {
+      const source = (
+        await readNativeBoundedTextFile({
+          root: changeDir,
+          ref: expectedSource,
+          maxBytes: null,
+          includeHash: false,
+        })
+      ).text;
+      findings.push(...validateNativeSpecDocumentText(source, expectedSource).findings);
+    } catch (error) {
+      findings.push({
+        code: 'spec-document-missing',
+        message: `Target Spec cannot be read: ${(error as Error).message}. Restore the complete file at ${expectedSource}.`,
+        path: expectedSource,
+      });
+    }
+  }
+  return { valid: findings.length === 0, findings };
+}
+
+export async function assertNativePortableDocuments(options: {
+  paths: NativeProjectPaths;
+  state: NativePortableState;
+  specChanges?: readonly NativePortableSpecChange[];
+}): Promise<void> {
+  const validation = await validateNativePortableDocuments(options);
+  if (!validation.valid) {
+    throw new Error(
+      formatNativeDocumentConstraintFindings(validation.findings, {
+        change: options.state.name,
+        phase: options.state.phase,
+      }),
+    );
+  }
+}
 
 export type NativePortableExpectedContinuationAction =
   | 'prepare-shape-confirmation'
@@ -88,7 +258,8 @@ export type NativePortableExpectedContinuationAction =
   | 'revise-implementation'
   | 'revise-requirements'
   | 'retry-verifier'
-  | 'resolve-verifier-blocker';
+  | 'resolve-verifier-blocker'
+  | 'disassociate-capability';
 
 export interface NativePortableExpectedContinuation {
   stateVersion: number;
@@ -104,7 +275,8 @@ export function assertNativePortableExpectedContinuationLocked(options: {
   if (!expected) return;
   if (options.state.state_version !== expected.stateVersion) {
     throw new Error(
-      `Native continuation is stale for state version ${expected.stateVersion}; current state version is ${options.state.state_version}`,
+      `Native continuation is stale: the change moved on since the referenced response (current phase ${options.state.phase}, next action ${options.state.loop.next_action}, state version ${options.state.state_version}). ` +
+        `Run comet native status ${options.state.name} --json and execute its commandAlternatives with --expected-state-version ${options.state.state_version} --expected-action ${options.state.loop.next_action}.`,
     );
   }
   if (expected.action !== options.action) {
@@ -553,12 +725,18 @@ export async function readNativePortableAcceptance(options: {
           );
         }
       }
-      deltaContentHash = canonicalHash('comet.native.shape-artifact-content.v1', delta.text);
+      deltaContentHash = canonicalHash(
+        'comet.native.shape-artifact-content.v1',
+        normalizedShapeArtifactText(delta.text),
+      );
     }
     specs.push({ capability: spec.capability, source: source.ref, markdown: acceptanceMarkdown });
     specArtifacts.push({
       ...spec,
-      contentHash: canonicalHash('comet.native.shape-artifact-content.v1', source.text),
+      contentHash: canonicalHash(
+        'comet.native.shape-artifact-content.v1',
+        normalizedShapeArtifactText(source.text),
+      ),
       ...(deltaContentHash === null ? {} : { deltaContentHash }),
     });
   }
@@ -596,7 +774,7 @@ export async function readNativePortableAcceptance(options: {
     // stale evidence hash as Shape drift would bypass that safe rebase path.
     associationContentHash = canonicalHash(
       'comet.native.shape-artifact-content.v1',
-      association.text,
+      normalizedShapeArtifactText(association.text),
     );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -606,7 +784,10 @@ export async function readNativePortableAcceptance(options: {
     formalHash: canonicalHash('comet.native.shape-formal-artifacts.v1', {
       brief: {
         source: brief.ref,
-        contentHash: canonicalHash('comet.native.shape-artifact-content.v1', brief.text),
+        contentHash: canonicalHash(
+          'comet.native.shape-artifact-content.v1',
+          normalizedShapeArtifactText(brief.text),
+        ),
       },
       specs: specArtifacts,
       association: {
@@ -634,6 +815,7 @@ export async function prepareNativePortableShapeConfirmation(options: {
   name: string;
   coordinationMode?: NativeSupervisorCoordinationMode;
   expectedContinuation?: NativePortableExpectedContinuation;
+  enforceDocumentConstraints?: boolean;
 }): Promise<NativePortableState> {
   return withNativeMutationLock(
     options.paths,
@@ -649,6 +831,9 @@ export async function prepareNativePortableShapeConfirmation(options: {
         throw new Error('Native Shape confirmation can only be prepared from active Shape');
       }
       const specChanges = await discoverNativePortableSpecChanges({ paths: options.paths, state });
+      if (options.enforceDocumentConstraints === true) {
+        await assertNativePortableDocuments({ paths: options.paths, state, specChanges });
+      }
       const shape = await readNativePortableAcceptance({
         paths: options.paths,
         state,
@@ -663,8 +848,32 @@ export async function prepareNativePortableShapeConfirmation(options: {
           acceptance,
         }),
       });
+      let bound = state;
       if (children && state.workspace.change_branch === null) {
-        throw new Error('Native parent changes require a Git integration branch');
+        await assertNoActiveNativeSupervisorTasks(options.paths, state.name);
+        const workspace = lateBindPortableCurrentWorkspace(
+          state.workspace,
+          options.paths.projectRoot,
+        );
+        if (workspace === null) {
+          throw new Error(
+            'Native parent changes require a Git integration branch; initialize Git, commit to a branch, then rerun the latest continuation to bind the workspace',
+          );
+        }
+        bound = appendNativePortableHistory(
+          { ...state, workspace },
+          {
+            goal_cycle: state.loop.goal_cycle,
+            iteration: state.loop.iteration,
+            attempt: state.loop.attempt,
+            outcome: 'recovery',
+            unresolved_ids: [],
+            summary: toNativePortableText(
+              `Native workspace bound to branch ${workspace.change_branch} at the Supervisor Shape confirmation boundary`,
+            ),
+            completed_at: new Date().toISOString(),
+          },
+        );
       }
       const coordinationRequired =
         (await readNativeSupervisorShapeIntent(
@@ -689,7 +898,7 @@ export async function prepareNativePortableShapeConfirmation(options: {
         );
       }
       const shapeState: NativePortableState = {
-        ...state,
+        ...bound,
         spec_changes: specChanges,
         shape_confirmation_hash: nativePortableShapeConfirmationHash({
           formalHash: shape.formalHash,
@@ -704,6 +913,7 @@ export async function prepareNativePortableShapeConfirmation(options: {
         state: shapeState,
         acceptance: acceptance.map((entry) => ({ ...entry })),
       });
+      if (options.enforceDocumentConstraints === true) next.document_constraints_version = 1;
       if (children) {
         next.children_contract_hash = hashNativeParentContract({
           acceptance: next.acceptance,
@@ -730,6 +940,18 @@ export async function inspectNativePortableAcceptanceDrift(options: {
   state: NativePortableState;
   ignoreSpecOperationFor?: ReadonlySet<string>;
 }): Promise<{ drifted: boolean; reason: string | null }> {
+  if (options.state.document_constraints_version === 1) {
+    const documents = await validateNativePortableDocuments(options);
+    if (!documents.valid) {
+      const first = documents.findings[0];
+      return {
+        drifted: true,
+        reason: first
+          ? `Native formal documents are invalid (${first.code}${first.path ? `: ${first.path}` : ''})`
+          : 'Native formal documents are invalid',
+      };
+    }
+  }
   const specChanges = await discoverNativePortableSpecChanges(options);
   const ignoredOperations =
     options.ignoreSpecOperationFor ??
@@ -803,6 +1025,40 @@ export async function inspectNativePortableAcceptanceDrift(options: {
     : { drifted: true, reason: 'Native child declarations changed' };
 }
 
+export async function recoverNativePortableShapeConfirmationDrift(options: {
+  paths: NativeProjectPaths;
+  name: string;
+}): Promise<{
+  state: NativePortableState;
+  repaired: boolean;
+  reason: string | null;
+}> {
+  return withNativeMutationLock(
+    options.paths,
+    `recover pending Shape confirmation ${options.name}`,
+    async () => {
+      const state = await readNativePortableChange(options.paths, options.name);
+      if (
+        state.phase !== 'shape' ||
+        state.status !== 'await-user' ||
+        state.loop.next_action !== 'confirm-shape'
+      ) {
+        return { state, repaired: false, reason: null };
+      }
+      const drift = await inspectNativePortableAcceptanceDrift({ paths: options.paths, state });
+      if (!drift.drifted) return { state, repaired: false, reason: null };
+      const reason = drift.reason ?? 'Native confirmed requirements changed';
+      const recovered = await returnNativePortableStateToShapeLocked({
+        paths: options.paths,
+        state,
+        reason,
+        keepFailureBudget: true,
+      });
+      return { state: recovered, repaired: true, reason };
+    },
+  );
+}
+
 export async function ensureNativePortableAcceptanceCurrentLocked(options: {
   paths: NativeProjectPaths;
   state: NativePortableState;
@@ -814,6 +1070,7 @@ export async function ensureNativePortableAcceptanceCurrentLocked(options: {
     paths: options.paths,
     state: options.state,
     reason,
+    keepFailureBudget: true,
   });
   throw new Error(`${reason}; Native change returned to Shape and requires confirmation`);
 }
@@ -1105,6 +1362,47 @@ export async function markNativePortableSpecRemoval(options: {
   );
 }
 
+/** Revoke a capability association through Runtime and invalidate its confirmation. */
+export async function disassociateNativePortableCapability(options: {
+  paths: NativeProjectPaths;
+  name: string;
+  expectedContinuation: NativePortableExpectedContinuation;
+}): Promise<NativePortableState> {
+  return withNativeMutationLock(
+    options.paths,
+    `disassociate portable capability ${options.name}`,
+    async () => {
+      const state = await readNativePortableChange(options.paths, options.name);
+      assertNativePortableExpectedContinuationLocked({
+        state,
+        expected: options.expectedContinuation,
+        action: 'disassociate-capability',
+      });
+      if (state.archived) throw new Error(`Native change ${state.name} is already archived`);
+      const associationPath = path.join(
+        nativePortableChangeDir(options.paths, options.name),
+        NATIVE_CAPABILITY_ASSOCIATION_FILE,
+      );
+      let stat;
+      try {
+        stat = await fs.lstat(associationPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return state;
+        throw error;
+      }
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error('Native capability association must be a regular file');
+      }
+      await fs.rm(associationPath);
+      return returnNativePortableStateToShapeLocked({
+        paths: options.paths,
+        state,
+        reason: 'Capability association revoked through comet native spec disassociate',
+      });
+    },
+  );
+}
+
 export async function setNativePortableWorkspaceFinish(options: {
   paths: NativeProjectPaths;
   name: string;
@@ -1150,6 +1448,7 @@ export async function returnNativePortableChangeToShape(options: {
   reason: string;
   allowedPhases?: readonly NativePortablePhase[];
   expectedContinuation?: NativePortableExpectedContinuation;
+  keepFailureBudget?: boolean;
 }): Promise<NativePortableState> {
   return withNativeMutationLock(
     options.paths,
@@ -1169,6 +1468,7 @@ export async function returnNativePortableChangeToShape(options: {
         paths: options.paths,
         state,
         reason: options.reason,
+        ...(options.keepFailureBudget ? { keepFailureBudget: true } : {}),
       });
     },
   );
@@ -1178,6 +1478,7 @@ export async function returnNativePortableStateToShapeLocked(options: {
   paths: NativeProjectPaths;
   state: NativePortableState;
   reason: string;
+  keepFailureBudget?: boolean;
 }): Promise<NativePortableState> {
   const { state } = options;
   if (state.archived) throw new Error(`Native change ${state.name} is already archived`);
@@ -1207,7 +1508,9 @@ export async function returnNativePortableStateToShapeLocked(options: {
       iteration: 0,
       attempt: 0,
       retry_epoch: 0,
-      failed_iteration_count: 0,
+      // Drift recovery remains inside the same goal and keeps the budget.
+      // An explicit requirements revision starts a new goal cycle and clears it.
+      failed_iteration_count: options.keepFailureBudget ? state.loop.failed_iteration_count : 0,
       no_progress_count: 0,
       execution_failure_count: 0,
       previous_unresolved_ids: [],

@@ -73,6 +73,12 @@ function timestampOrNull(value: unknown, label: string): string | null {
   return result;
 }
 
+function timestampValue(value: unknown, label: string): string {
+  const result = stringValue(value, label);
+  if (Number.isNaN(Date.parse(result))) throw new Error(`${label} must be an ISO timestamp`);
+  return result;
+}
+
 function absolutePath(value: unknown, label: string): string {
   const result = stringValue(value, label);
   if (!path.isAbsolute(result)) throw new Error(`${label} must be absolute`);
@@ -98,6 +104,7 @@ function parseCheck(value: unknown, index: number): NativeLocalCheckState {
       'startedAt',
       'completedAt',
       'log',
+      'activeProcess',
       'evidence',
       'evidenceDigest',
     ]),
@@ -130,6 +137,35 @@ function parseCheck(value: unknown, index: number): NativeLocalCheckState {
   }
   const timeoutMs = integerValue(root.timeoutMs, `${label}.timeoutMs`);
   if (timeoutMs < 1) throw new Error(`${label}.timeoutMs must be positive`);
+  let activeProcess: NativeLocalCheckState['activeProcess'];
+  if (Object.hasOwn(root, 'activeProcess')) {
+    if (root.activeProcess === null) {
+      activeProcess = null;
+    } else {
+      const activeRoot = record(root.activeProcess, `${label}.activeProcess`);
+      const activeStatus = enumValue(
+        activeRoot.status,
+        ['starting', 'running'] as const,
+        `${label}.activeProcess.status`,
+      );
+      rejectUnknown(activeRoot, new Set(['status', 'pid', 'identity']), `${label}.activeProcess`);
+      if (activeStatus === 'starting') {
+        if (Object.hasOwn(activeRoot, 'pid') || Object.hasOwn(activeRoot, 'identity')) {
+          throw new Error(`${label}.activeProcess starting state cannot contain process identity`);
+        }
+        activeProcess = { status: 'starting' };
+      } else {
+        const pid = integerValue(activeRoot.pid, `${label}.activeProcess.pid`, 1);
+        activeProcess = {
+          status: 'running',
+          pid,
+          ...(Object.hasOwn(activeRoot, 'identity')
+            ? { identity: stringValue(activeRoot.identity, `${label}.activeProcess.identity`) }
+            : {}),
+        };
+      }
+    }
+  }
   return {
     id: stringValue(root.id, `${label}.id`),
     name: stringValue(root.name, `${label}.name`),
@@ -144,6 +180,7 @@ function parseCheck(value: unknown, index: number): NativeLocalCheckState {
     startedAt,
     completedAt,
     log: stringValue(root.log, `${label}.log`),
+    ...(Object.hasOwn(root, 'activeProcess') ? { activeProcess } : {}),
     ...(Object.hasOwn(root, 'evidence')
       ? { evidence: enumValue(root.evidence, ['runtime'] as const, `${label}.evidence`) }
       : {}),
@@ -164,6 +201,8 @@ export function parseNativeLocalExecution(value: unknown): NativeLocalExecutionS
       'basedOnStateVersion',
       'candidateId',
       'inputFingerprint',
+      'inputFingerprintGate',
+      'candidateInputFingerprintGate',
       'workspace',
       'execution',
       'checks',
@@ -193,6 +232,9 @@ export function parseNativeLocalExecution(value: unknown): NativeLocalExecutionS
         'status',
         'startedAt',
         'requestCheckRounds',
+        'verifierStartedAt',
+        'ownerPid',
+        'ownerIdentity',
       ]),
       'Native local execution',
     );
@@ -224,6 +266,25 @@ export function parseNativeLocalExecution(value: unknown): NativeLocalExecutionS
         executionRoot.requestCheckRounds,
         'Native local execution.requestCheckRounds',
       ),
+      ...(Object.hasOwn(executionRoot, 'verifierStartedAt')
+        ? {
+            verifierStartedAt: timestampValue(
+              executionRoot.verifierStartedAt,
+              'Native local execution.verifierStartedAt',
+            ),
+          }
+        : {}),
+      ...(Object.hasOwn(executionRoot, 'ownerPid')
+        ? { ownerPid: integerValue(executionRoot.ownerPid, 'Native local execution.ownerPid', 1) }
+        : {}),
+      ...(Object.hasOwn(executionRoot, 'ownerIdentity')
+        ? {
+            ownerIdentity: stringValue(
+              executionRoot.ownerIdentity,
+              'Native local execution.ownerIdentity',
+            ),
+          }
+        : {}),
     };
   }
 
@@ -251,6 +312,22 @@ export function parseNativeLocalExecution(value: unknown): NativeLocalExecutionS
           inputFingerprint: nullableString(root.inputFingerprint, 'Native local inputFingerprint'),
         }
       : {}),
+    ...(Object.hasOwn(root, 'inputFingerprintGate')
+      ? {
+          inputFingerprintGate: nullableString(
+            root.inputFingerprintGate,
+            'Native local inputFingerprintGate',
+          ),
+        }
+      : {}),
+    ...(Object.hasOwn(root, 'candidateInputFingerprintGate')
+      ? {
+          candidateInputFingerprintGate: nullableString(
+            root.candidateInputFingerprintGate,
+            'Native local candidateInputFingerprintGate',
+          ),
+        }
+      : {}),
     workspace: {
       projectRoot: absolutePath(workspaceRoot.projectRoot, 'Native local workspace.projectRoot'),
       worktreeRoot: absolutePath(workspaceRoot.worktreeRoot, 'Native local workspace.worktreeRoot'),
@@ -276,6 +353,8 @@ export function rebuildNativeLocalExecution(options: {
     basedOnStateVersion: options.portableState.state_version,
     candidateId: options.portableState.builder_handoff?.candidate_id ?? null,
     inputFingerprint: null,
+    inputFingerprintGate: null,
+    candidateInputFingerprintGate: null,
     workspace: {
       projectRoot: path.resolve(options.projectRoot),
       worktreeRoot: path.resolve(options.worktreeRoot ?? options.projectRoot),
@@ -306,6 +385,37 @@ export async function readNativeLocalExecution(
     });
   }
   return parseNativeLocalExecution(value);
+}
+
+/**
+ * Return the currently running Verifier execution identity only when the
+ * local overlay is bound to this exact portable state and candidate. Status,
+ * Show, and Next must not print an identity from a stale or completed run.
+ */
+export function nativeVerifierExecutionRefForState(
+  state: NativePortableState,
+  local: NativeLocalExecutionState | null,
+): string | undefined {
+  const execution = local?.execution;
+  if (
+    state.phase !== 'verify' ||
+    state.status !== 'active' ||
+    state.loop.next_action !== 'await-verifier-result' ||
+    state.builder_handoff?.candidate_id === undefined ||
+    state.builder_handoff?.candidate_id === null ||
+    local === null ||
+    local.change !== state.name ||
+    local.basedOnStateVersion !== state.state_version ||
+    local.candidateId !== state.builder_handoff.candidate_id ||
+    execution == null ||
+    execution.stage !== 'verifying' ||
+    execution.actor !== 'verifier' ||
+    execution.status !== 'running' ||
+    execution.executionId === null
+  ) {
+    return undefined;
+  }
+  return execution.executionId;
 }
 
 export async function writeNativeLocalExecution(

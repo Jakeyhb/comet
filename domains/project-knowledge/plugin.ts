@@ -42,10 +42,23 @@ import type {
   ProjectKnowledgeResult,
 } from './types.js';
 import { ProjectKnowledgeHostReview } from './host-review.js';
+import {
+  PROJECT_MEMORY_EXPANSION_PREFIX,
+  PROJECT_MEMORY_INDEX_CANDIDATE_ID,
+  readProjectMemory,
+  readProjectMemoryEntries,
+  readProjectMemoryIndex,
+  removeProjectMemory,
+  renderProjectMemoryIndexContext,
+  resolveProjectMemoryDirectory,
+  type ProjectMemoryEntry,
+  type ProjectMemoryIndexEntry,
+} from './project-memory.js';
 import { resolveProjectKnowledgeStorageLocation } from '../../platform/paths/project-knowledge-storage.js';
 import { resolveStableProjectId } from '../../platform/paths/project-identity.js';
 import { RaceSafeReadError } from '../../platform/fs/race-safe-read.js';
 import { readProtectedProjectFile } from '../workflow-contract/protected-project-path.js';
+import { DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG } from '../workflow-contract/project-config.js';
 
 export const PROJECT_KNOWLEDGE_PLUGIN_ID = 'comet.project-knowledge';
 const MAX_RECENT_DIAGNOSTICS = 3;
@@ -78,6 +91,37 @@ function stringList(value: unknown, label: string): string[] {
       throw new Error(`${label}[${index}] must be a non-empty string`);
     return entry.trim();
   });
+}
+
+function positiveInteger(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value;
+}
+
+function nextLocalKnowledgeConfig(
+  current: ProjectKnowledgePluginOptions['knowledgeConfig']['local'],
+  input: Record<string, unknown>,
+) {
+  const maxFileMb = positiveInteger(input.maxFileMb, 'maxFileMb');
+  const maxTotalMb = positiveInteger(input.maxTotalMb, 'maxTotalMb');
+  if (maxFileMb === undefined && maxTotalMb === undefined) {
+    return current === undefined ? undefined : { ...current, include: [...current.include] };
+  }
+  const next = {
+    ...(current ?? { include: [] }),
+    include: [...(current?.include ?? [])],
+    max_file_mb:
+      maxFileMb ?? current?.max_file_mb ?? DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_file_mb,
+    max_total_mb:
+      maxTotalMb ?? current?.max_total_mb ?? DEFAULT_WORKFLOW_KNOWLEDGE_LOCAL_CONFIG.max_total_mb,
+  };
+  if (next.max_file_mb > next.max_total_mb) {
+    throw new Error('maxFileMb must not exceed maxTotalMb');
+  }
+  return next;
 }
 
 function recordSources(value: unknown): ProjectKnowledgeRecordSource[] {
@@ -307,10 +351,42 @@ async function createProjectKnowledgeModule(
           diagnostics.push(diagnostic);
         }
       }
+      let projectMemory: import('./types.js').ProjectMemoryDashboardSummary | undefined;
+      try {
+        const memoryEntries = await readProjectMemoryEntries(
+          options.projectRoot,
+          options.cacheRoot,
+        );
+        const memoryApplications = applications
+          .filter(
+            (entry) =>
+              entry.owner === PROJECT_KNOWLEDGE_PLUGIN_ID &&
+              entry.candidateId === PROJECT_MEMORY_INDEX_CANDIDATE_ID,
+          )
+          .sort((left, right) => right.appliedAt.localeCompare(left.appliedAt));
+        projectMemory = {
+          directory: resolveProjectMemoryDirectory(options.projectRoot, options.cacheRoot),
+          total: memoryEntries.length,
+          entries: memoryEntries,
+          applicationCount: memoryApplications.length,
+          ...(memoryApplications[0] === undefined
+            ? {}
+            : { lastApplication: memoryApplications[0] }),
+          applicationHistory: memoryApplications.slice(0, 10),
+        };
+      } catch (error) {
+        const diagnostic = {
+          code: 'project-memory-unavailable',
+          message: `项目记忆暂不可用：${error instanceof Error ? error.message : String(error)}`,
+        };
+        reportDiagnostic(diagnostic);
+        diagnostics.push(diagnostic);
+      }
       const result = {
         ...snapshot,
         pendingHostReviewCount,
         status,
+        ...(projectMemory === undefined ? {} : { projectMemory }),
         records: dashboardRecords,
         counts: {
           active:
@@ -503,12 +579,11 @@ async function createProjectKnowledgeModule(
           const providerValue = rawValue.provider;
           if (providerValue !== 'local' && providerValue !== 'remote')
             throw new Error('provider must be local or remote');
+          const local = nextLocalKnowledgeConfig(options.knowledgeConfig.local, rawValue);
           if (providerValue === 'local') {
             await options.updateKnowledgeConfig({
               provider: 'local',
-              ...(options.knowledgeConfig.local
-                ? { local: { include: [...options.knowledgeConfig.local.include] } }
-                : {}),
+              ...(local === undefined ? {} : { local }),
             });
           } else {
             const remoteValue = rawValue.remote;
@@ -523,9 +598,7 @@ async function createProjectKnowledgeModule(
               throw new Error('remote timeout must be an integer');
             await options.updateKnowledgeConfig({
               provider: 'remote',
-              ...(options.knowledgeConfig.local
-                ? { local: { include: [...options.knowledgeConfig.local.include] } }
-                : {}),
+              ...(local === undefined ? {} : { local }),
               remote: {
                 endpoint: remote.endpoint.trim(),
                 ...(typeof remote.tokenEnv === 'string' && remote.tokenEnv.trim()
@@ -572,6 +645,23 @@ async function createProjectKnowledgeModule(
             }
             throw new Error('来源文件无法读取', { cause: error });
           }
+        }
+        if (capability === 'memory-get') {
+          if (typeof value.slug !== 'string' || !value.slug.trim())
+            throw new Error('memory-get requires slug');
+          const entry = await readProjectMemory(
+            options.projectRoot,
+            value.slug.trim(),
+            options.cacheRoot,
+          );
+          if (entry === null) throw new Error('项目记忆不存在');
+          return { kind: 'memory', ...entry };
+        }
+        if (capability === 'forget' && typeof value.memory === 'string' && value.memory.trim()) {
+          const slug = value.memory.trim();
+          const removed = await removeProjectMemory(options.projectRoot, slug, options.cacheRoot);
+          if (!removed) throw new Error('项目记忆不存在');
+          return { changed: true, memory: slug, removed };
         }
         activeProvider = await createProvider();
         if (capability === 'list' || capability === 'query')
@@ -696,6 +786,25 @@ async function createProjectKnowledgeModule(
       }
     },
     provideContext: async (request) => {
+      // Project memory is a local file layer independent of the configured
+      // provider. Read it first so a provider outage cannot drop the index,
+      // and keep provider retrieval advisory: report the failure instead of
+      // failing the whole context contribution.
+      const candidates: AgentContextCandidate[] = [];
+      try {
+        const memoryIndex = await readProjectMemoryIndex(options.projectRoot, options.cacheRoot);
+        const indexCandidate = projectMemoryIndexCandidate(
+          memoryIndex,
+          request.projectId,
+          options.language,
+        );
+        if (indexCandidate !== null) candidates.push(indexCandidate);
+      } catch (error) {
+        reportDiagnostic({
+          code: 'project-memory-unavailable',
+          message: `项目记忆索引暂不可用：${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
       let activeProvider: ProjectKnowledgeProvider | null = null;
       try {
         const query = createProjectKnowledgeQuery(request);
@@ -704,20 +813,34 @@ async function createProjectKnowledgeModule(
         const response = await activeProvider.query({ kind: 'search', query, limit: 8 });
         clearRecoveredLocalSearchDiagnostic(response);
         const results = response.kind === 'search' ? response.results : [];
-        if (recentChangedHints.length > 0) {
-          recentChangedHints.splice(0, recentChangedHints.length);
-          persistDiagnostics();
-        }
-        await diagnosticWrite;
-        if (results.length === 0) return null;
-        return results.map((result) =>
-          projectKnowledgeContextCandidate(result, request.projectId, options.language),
+        candidates.push(
+          ...results.map((result) =>
+            projectKnowledgeContextCandidate(result, request.projectId, options.language),
+          ),
         );
+      } catch (error) {
+        reportDiagnostic({
+          code: 'context-provider-unavailable',
+          message: `项目知识检索暂不可用：${error instanceof Error ? error.message : String(error)}`,
+        });
       } finally {
         if (activeProvider instanceof LocalProjectKnowledgeProvider) activeProvider.close();
       }
+      if (recentChangedHints.length > 0) {
+        recentChangedHints.splice(0, recentChangedHints.length);
+        persistDiagnostics();
+      }
+      await diagnosticWrite;
+      if (candidates.length === 0) return null;
+      return candidates;
     },
     resolveContext: async (id, request) => {
+      if (id.startsWith(PROJECT_MEMORY_EXPANSION_PREFIX)) {
+        const slug = id.slice(PROJECT_MEMORY_EXPANSION_PREFIX.length);
+        const entry = await readProjectMemory(options.projectRoot, slug, options.cacheRoot);
+        if (entry === null) return null;
+        return projectMemoryEntryCandidate(entry, request.projectId, options.language);
+      }
       let activeProvider: ProjectKnowledgeProvider | null = null;
       try {
         activeProvider = await createProvider({ discoverCorpus: false });
@@ -893,6 +1016,80 @@ function projectKnowledgeContextCandidate(
     content: result.content,
     selectors: { ...(projectId === undefined ? {} : { projectId }) },
     sources: [{ type: 'repository', source: result.source }],
+    verification: [],
+  };
+}
+
+function projectMemoryIndexCandidate(
+  entries: readonly ProjectMemoryIndexEntry[],
+  projectId: string | undefined,
+  language: 'zh-CN' | 'en' | undefined,
+): AgentContextCandidate | null {
+  const content = renderProjectMemoryIndexContext(entries, language ?? 'zh-CN');
+  if (content === null) return null;
+  const titles = entries
+    .slice(0, 3)
+    .map((entry) => entry.title)
+    .join(language === 'en' ? '; ' : '；');
+  return {
+    id: PROJECT_MEMORY_INDEX_CANDIDATE_ID,
+    owner: PROJECT_KNOWLEDGE_PLUGIN_ID,
+    scope: 'project',
+    memoryType: 'project-policy',
+    kind: 'project-memory',
+    state: 'proven',
+    authority: 'user',
+    title: language === 'en' ? 'Project memory index' : '项目记忆索引',
+    summary:
+      `${entries.length} ${language === 'en' ? 'entries' : '条'}${titles ? `：${titles}` : ''}`.slice(
+        0,
+        400,
+      ),
+    content,
+    selectors: { ...(projectId === undefined ? {} : { projectId }) },
+    sources: [],
+    verification: [],
+    priority: 130,
+    matchReasons: [
+      language === 'en'
+        ? 'Durable lessons the agent recorded for this project; expand entries on demand.'
+        : 'Agent 为本项目沉淀的可复用经验索引；单条内容按需展开。',
+    ],
+  };
+}
+
+function projectMemoryEntryCandidate(
+  entry: ProjectMemoryEntry,
+  projectId: string | undefined,
+  language: 'zh-CN' | 'en' | undefined,
+): AgentContextCandidate {
+  const english = language === 'en';
+  const header = [
+    english ? `Type: ${entry.type}` : `类型：${entry.type}`,
+    english
+      ? `Created: ${entry.created} · Updated: ${entry.updated}`
+      : `创建：${entry.created} · 更新：${entry.updated}`,
+    ...(entry.paths.length > 0
+      ? [english ? `Paths: ${entry.paths.join(', ')}` : `相关路径：${entry.paths.join('、')}`]
+      : []),
+    ...(entry.source === undefined
+      ? []
+      : [english ? `Source: ${entry.source}` : `来源：${entry.source}`]),
+  ];
+  return {
+    id: `${PROJECT_MEMORY_EXPANSION_PREFIX}${entry.slug}`,
+    owner: PROJECT_KNOWLEDGE_PLUGIN_ID,
+    scope: 'project',
+    memoryType: 'project-policy',
+    kind: 'project-memory',
+    state: 'proven',
+    authority: 'user',
+    title: entry.title,
+    summary: entry.description,
+    content: `${entry.description}\n\n${header.join('\n')}\n\n${entry.body}`,
+    selectors: { ...(projectId === undefined ? {} : { projectId }) },
+    sources:
+      entry.source === undefined ? [] : [{ type: 'workflow' as const, source: entry.source }],
     verification: [],
   };
 }

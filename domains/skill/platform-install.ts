@@ -395,6 +395,102 @@ function getAssetsDir(): string {
   return directAssets;
 }
 
+function bundledAssetPath(relativePath: string, label: string): string {
+  if (
+    !relativePath ||
+    relativePath !== relativePath.trim() ||
+    relativePath.includes('\\') ||
+    path.posix.isAbsolute(relativePath) ||
+    path.posix.normalize(relativePath) !== relativePath ||
+    relativePath.split('/').some((part) => !part || part === '.' || part === '..')
+  ) {
+    throw new Error(
+      `Invalid manifest at ${label}: unsafe asset path ${JSON.stringify(relativePath)}`,
+    );
+  }
+  return relativePath;
+}
+
+function manifestStringList(value: unknown, label: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`Invalid manifest at ${label}: expected an array of asset paths`);
+  }
+  return value as string[];
+}
+
+function bundledAssetPaths(manifest: Manifest, manifestPath: string): string[] {
+  const managedSkills = [
+    ...manifestStringList(manifest.skills, `${manifestPath} skills`),
+    ...manifestStringList(manifest.internalSkills, `${manifestPath} internalSkills`),
+  ];
+  const languageRoots = new Set<string>(['skills']);
+  for (const language of manifest.languages ?? []) {
+    if (!language || typeof language.skillsDir !== 'string') {
+      throw new Error(`Invalid manifest at ${manifestPath}: language skillsDir is required`);
+    }
+    languageRoots.add(bundledAssetPath(language.skillsDir, manifestPath));
+  }
+
+  const required = new Set<string>();
+  for (const skillPath of managedSkills) {
+    const safePath = bundledAssetPath(skillPath, manifestPath);
+    if (safePath.includes('/scripts/')) {
+      required.add(`skills/${safePath}`);
+      continue;
+    }
+    for (const languageRoot of languageRoots) required.add(`${languageRoot}/${safePath}`);
+  }
+
+  for (const rulePath of [
+    ...manifestStringList(manifest.rules, `${manifestPath} rules`),
+    ...manifestStringList(manifest.nativeRules, `${manifestPath} nativeRules`),
+  ]) {
+    required.add(`skills/${bundledAssetPath(rulePath, manifestPath)}`);
+  }
+  for (const hookPath of [
+    ...Object.keys(manifest.hooks ?? {}),
+    ...Object.keys(manifest.nativeHooks ?? {}),
+  ]) {
+    required.add(`skills/${bundledAssetPath(hookPath, manifestPath)}`);
+  }
+  return [...required].sort();
+}
+
+async function assertBundledAssetsComplete(assetsDir: string = getAssetsDir()): Promise<void> {
+  const resolvedAssetsDir = path.resolve(assetsDir);
+  const manifestPath = path.join(resolvedAssetsDir, 'manifest.json');
+  let manifest: Manifest;
+  try {
+    manifest = await readJson<Manifest>(manifestPath);
+  } catch (error) {
+    throw new Error(
+      `The installed @rpamis/comet package asset manifest is unavailable at ${manifestPath}. Reinstall the same version from the official npm registry and retry.`,
+      { cause: error },
+    );
+  }
+
+  if (!manifest || !Array.isArray(manifest.skills)) {
+    throw new Error(
+      `The installed @rpamis/comet package asset manifest is invalid at ${manifestPath}. Reinstall the same version from the official npm registry and retry.`,
+    );
+  }
+
+  const missing: string[] = [];
+  for (const relativePath of bundledAssetPaths(manifest, manifestPath)) {
+    const stat = await lstatOrNull(path.join(resolvedAssetsDir, ...relativePath.split('/')));
+    if (!stat?.isFile()) missing.push(relativePath);
+  }
+  if (missing.length === 0) return;
+
+  const preview = missing.slice(0, 5).join(', ');
+  const remainder = missing.length > 5 ? `, and ${missing.length - 5} more` : '';
+  const noun = missing.length === 1 ? 'asset is' : 'assets are';
+  throw new Error(
+    `The installed @rpamis/comet package is incomplete (${missing.length} required ${noun} missing) at ${resolvedAssetsDir}. Missing: ${preview}${remainder}. Reinstall the same version from the official npm registry and retry.`,
+  );
+}
+
 /**
  * Get the central skills directory for symlink mode.
  * Project scope: <project>/.comet/skills/
@@ -515,6 +611,7 @@ async function prepareManagedSkillCopyTarget(
   scope: InstallScope = 'project',
   workflowSelection: InitWorkflowSelection = 'both',
 ): Promise<void> {
+  await assertBundledAssetsComplete();
   const manifest = await readManifest();
   const managedEntries = new Set(getManagedSkillTopLevelEntries(manifest, workflowSelection));
   const skillsRoot = path.join(baseDir, getPlatformSkillsDir(platform, scope), 'skills');
@@ -762,6 +859,7 @@ async function copyCometSkillsForPlatform(
   installMode: InstallMode = 'copy',
   workflowSelection: InitWorkflowSelection = 'both',
 ): Promise<{ copied: number; skipped: number; failed: number }> {
+  await assertBundledAssetsComplete();
   if (installMode === 'symlink') {
     return installSkillsAsSymlink(
       baseDir,
@@ -1249,6 +1347,7 @@ ${content}`;
  *   'kiro' — hooks/*.kiro.hook JSON files
  *   'omp' — .omp/hooks/pre/comet-hook-router.ts extension module
  *   'trae' — hooks.json with version and PreToolUse grouped command hooks
+ *   'zcode' — config.json with hooks.enabled and hooks.events.PreToolUse process hooks
  */
 async function installCometHooksForPlatform(
   baseDir: string,
@@ -1428,6 +1527,15 @@ async function installCometHooksForPlatform(
       }
       case 'trae':
         return await installTraeHooks(
+          baseDir,
+          platformBase,
+          skillsDir,
+          hooksConfig,
+          platform.name,
+          { platformId: platform.id, scope, hookMatcher: platform.hookMatcher },
+        );
+      case 'zcode':
+        return await installZcodeHooks(
           baseDir,
           platformBase,
           skillsDir,
@@ -2008,6 +2116,71 @@ async function installTraeHooks(
 }
 
 /**
+ * ZCode format:
+ * Writes to .zcode/config.json with { hooks: { enabled: true, events: { PreToolUse: [...] } } }.
+ * ZCode nests event groups under `hooks.events` and only runs configuration-file
+ * hooks when `hooks.enabled` is true, so install forces the flag on.
+ */
+async function installZcodeHooks(
+  baseDir: string,
+  platformBase: string,
+  skillsDir: string,
+  hooksConfig: Record<string, HookConfig>,
+  platformName: string,
+  context: HookCommandContext,
+): Promise<HookInstallResult> {
+  const configPath = path.join(platformBase, 'config.json');
+
+  // ZCode `process` hooks run an argument vector without a shell (the most
+  // portable form on Windows) and accept only command/args/timeoutMs.
+  const matcherGroups: Record<
+    string,
+    Array<{ type: string; command: string; args: string[]; timeoutMs: number }>
+  > = {};
+  for (const [scriptRelPath, config] of Object.entries(hooksConfig)) {
+    const matcher = resolveInstalledHookMatcher(context, config.matcher);
+    matcherGroups[matcher] ??= [];
+    const invocation = buildHookInvocation(baseDir, skillsDir, scriptRelPath, context);
+    matcherGroups[matcher].push({
+      type: 'process',
+      command: invocation.command,
+      args: invocation.args,
+      timeoutMs: 60_000,
+    });
+  }
+
+  const preToolUseEntries = Object.entries(matcherGroups).map(([matcher, hooks]) => ({
+    matcher,
+    hooks,
+  }));
+
+  const settings = await readSettingsJsonObject(configPath, platformName);
+
+  const existingHooks = (settings.hooks as Record<string, unknown>) ?? {};
+  const existingEvents =
+    existingHooks.events &&
+    typeof existingHooks.events === 'object' &&
+    !Array.isArray(existingHooks.events)
+      ? (existingHooks.events as Record<string, unknown>)
+      : {};
+  const existingPreToolUse = asHookGroup(existingEvents.PreToolUse);
+  const merged = mergeHookGroups(
+    existingPreToolUse,
+    preToolUseEntries,
+    managedHookScriptPaths(hooksConfig),
+  );
+
+  settings.hooks = {
+    ...existingHooks,
+    enabled: true,
+    events: { ...existingEvents, PreToolUse: merged },
+  };
+  await ensureDir(path.dirname(configPath));
+  await writeFile(configPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  return { status: 'installed' };
+}
+
+/**
  * GitHub Copilot format:
  * Writes to .github/hooks/comet-guard.json with preToolUse hooks config.
  */
@@ -2451,6 +2624,7 @@ async function createWorkingDirs(
 }
 
 export {
+  assertBundledAssetsComplete,
   copyCometSkillsForPlatform,
   copyCometRulesForPlatform,
   installCometHooksForPlatform,

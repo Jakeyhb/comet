@@ -19,10 +19,19 @@ import {
 import { migrateNativeLegacyChangeToPortable } from '../../../domains/comet-native/native-portable-migration-runtime.js';
 import {
   createNativePortableChange,
+  nativeLocalExecutionFile,
   nativePortableChangeDir,
   nativePortableStateFile,
+  prepareNativePortableShapeConfirmation,
   readNativePortableChange,
+  dispatchNativePortableVerifier,
+  executeNativePortableCheckPlan,
+  submitNativePortableBuilderCandidate,
 } from '../../../domains/comet-native/native-portable-runtime.js';
+import {
+  readNativeLocalExecution,
+  writeNativeLocalExecution,
+} from '../../../domains/comet-native/native-local-execution.js';
 import { confirmNativePortableShape } from '../../helpers/native-portable-confirmed-transition.js';
 import { parseNativeChildrenContract } from '../../../domains/comet-native/native-children.js';
 import {
@@ -31,6 +40,7 @@ import {
   writeNativeSupervisorState,
 } from '../../../domains/comet-native/native-supervisor.js';
 import { applyNativeRunnerInput } from '../../../domains/comet-native/native-runner-input.js';
+import { createNativeRunnerChannel } from '../../../domains/comet-native/native-runner-protocol.js';
 import {
   parseNativePortableState,
   writeNativePortableState,
@@ -38,6 +48,13 @@ import {
 import { inspectNativePortableStatus } from '../../../domains/comet-native/native-portable-status.js';
 import { runGitCommand } from '../../../platform/process/git.js';
 import type { NativeProjectPaths } from '../../../domains/comet-native/native-types.js';
+import { ensureCliBuilt } from '../../helpers/ensure-cli-built.js';
+import {
+  processIsAlive,
+  spawnNativePortableProcess,
+  waitForCondition,
+  waitForProcessExit,
+} from '../../helpers/native-portable-process.js';
 
 describe('Native portable Doctor', () => {
   let projectRoot: string;
@@ -189,6 +206,386 @@ children:
         findings: [],
       },
     });
+  });
+
+  it('reports and repairs pending Shape confirmation drift before it is confirmed', async () => {
+    const name = 'pending-shape-drift';
+    await createPortable(name);
+    const changeDir = nativePortableChangeDir(paths, name);
+    const brief = path.join(changeDir, 'brief.md');
+    await fs.mkdir(path.join(changeDir, 'specs', 'fixture'), { recursive: true });
+    await fs.writeFile(
+      path.join(changeDir, 'specs', 'fixture', 'spec.md'),
+      '# Test target\n\nThis target exists only for the Doctor drift regression.\n',
+    );
+    await fs.writeFile(
+      brief,
+      [
+        '# Outcome',
+        '',
+        'Refresh the pending Shape confirmation when its acceptance changes.',
+        '',
+        '# Scope',
+        '',
+        'Only the confirmation boundary is under test.',
+        '',
+        '# Non-goals',
+        '',
+        'No implementation work is performed.',
+        '',
+        '# Acceptance examples',
+        '',
+        '- The original acceptance is recorded.',
+        '',
+        '# Constraints and invariants',
+        '',
+        'The Runtime owns the state transition.',
+        '',
+        '# Decisions',
+        '',
+        'No user decision is pending in this fixture.',
+        '',
+        '# Open questions',
+        '',
+        'None.',
+        '',
+        '# Verification expectations',
+        '',
+        'Doctor must report drift without mutating the state.',
+        '',
+      ].join('\n'),
+    );
+    const waiting = await prepareNativePortableShapeConfirmation({ paths, name });
+    expect(waiting).toMatchObject({
+      phase: 'shape',
+      status: 'await-user',
+      state_version: 2,
+      loop: { next_action: 'confirm-shape' },
+      acceptance: [{ text: 'The original acceptance is recorded.' }],
+    });
+    const stateFile = nativePortableStateFile(paths, name);
+    const beforeDoctor = await fs.readFile(stateFile);
+
+    await fs.writeFile(
+      brief,
+      [
+        '# Outcome',
+        '',
+        'Refresh the pending Shape confirmation when its acceptance changes.',
+        '',
+        '# Scope',
+        '',
+        'Only the confirmation boundary is under test.',
+        '',
+        '# Non-goals',
+        '',
+        'No implementation work is performed.',
+        '',
+        '# Acceptance examples',
+        '',
+        '- The original acceptance is recorded.',
+        '- The changed acceptance is recorded after repair.',
+        '',
+        '# Constraints and invariants',
+        '',
+        'The Runtime owns the state transition.',
+        '',
+        '# Decisions',
+        '',
+        'No user decision is pending in this fixture.',
+        '',
+        '# Open questions',
+        '',
+        'None.',
+        '',
+        '# Verification expectations',
+        '',
+        'Doctor must report drift without mutating the state.',
+        '',
+      ].join('\n'),
+    );
+
+    const diagnosis = await nativeDoctorCommand([name], projectRoot);
+    expect(diagnosis).toMatchObject({
+      exitCode: 65,
+      data: {
+        healthy: false,
+        repaired: false,
+        findings: [
+          expect.objectContaining({
+            code: 'portable-shape-confirmation-drift',
+            repair: 'recover',
+            repairCommand: `comet native doctor ${name} --repair`,
+          }),
+        ],
+      },
+    });
+    await expect(fs.readFile(stateFile)).resolves.toEqual(beforeDoctor);
+
+    const repaired = await nativeDoctorCommand([name, '--repair'], projectRoot);
+    expect(repaired).toMatchObject({
+      exitCode: 0,
+      data: {
+        healthy: true,
+        repaired: true,
+        result: {
+          state: {
+            phase: 'shape',
+            status: 'active',
+            state_version: 3,
+            acceptance: [],
+            loop: { next_action: 'prepare-shape-confirmation' },
+          },
+        },
+      },
+    });
+
+    const refreshed = await nativeNextCommand(
+      [name, '--summary', 'Re-read the changed Shape confirmation'],
+      projectRoot,
+    );
+    expect(refreshed).toMatchObject({
+      exitCode: 0,
+      data: {
+        state: {
+          phase: 'shape',
+          status: 'await-user',
+          acceptance: { total: 2, pending: 2 },
+        },
+      },
+    });
+  });
+
+  it('reports an orphaned Runtime check instead of claiming the change is healthy', async () => {
+    const name = 'orphaned-check-doctor';
+    await fs.mkdir(path.join(projectRoot, '.git'));
+    await createPortable(name);
+    await fs.writeFile(
+      path.join(nativePortableChangeDir(paths, name), 'brief.md'),
+      '# Acceptance examples\n- Doctor reports an orphaned check owner.\n',
+    );
+    await confirmNativePortableShape({ paths, name });
+    const runner = createNativeRunnerChannel();
+    const state = await submitNativePortableBuilderCandidate({
+      paths,
+      name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'orphaned-doctor-builder',
+        }),
+        candidateId: 'orphaned-doctor-candidate',
+        summary: 'Implemented.',
+        addressedAcceptanceIds: ['A1'],
+        review: null,
+      },
+    });
+    const marker = path.join(projectRoot, 'orphaned-doctor-starts.txt');
+    const plan = {
+      id: 'orphaned-doctor-check',
+      name: 'Orphaned Doctor check',
+      executable: process.execPath,
+      argv: [
+        '-e',
+        "require('node:fs').appendFileSync(process.argv[1],'start\\n');setInterval(()=>{},1000)",
+        marker,
+      ],
+      cwdRef: '.',
+      timeoutMs: 60_000,
+      repeatable: true,
+    } as const;
+    const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
+    await ensureCliBuilt(repositoryRoot);
+    const file = nativeLocalExecutionFile(paths, name);
+    const owner = spawnNativePortableProcess({
+      repositoryRoot,
+      payload: { action: 'execute-checks', paths, name: state.name, plans: [plan] },
+    });
+    await waitForCondition(async () => {
+      const local = await readNativeLocalExecution(file);
+      const reserved =
+        local?.execution?.ownerPid === owner.pid &&
+        local.checks[0]?.activeProcess?.status === 'running';
+      const mutationLockReleased = await fs
+        .access(path.join(paths.locksDir, 'root-move.lock'))
+        .then(() => false)
+        .catch(() => true);
+      return reserved && mutationLockReleased;
+    }, 'Runtime owner did not start the orphaned Doctor check');
+    const running = await readNativeLocalExecution(file);
+    const activePid =
+      running?.checks[0]?.activeProcess?.status === 'running'
+        ? running.checks[0].activeProcess.pid
+        : undefined;
+    expect(activePid).toEqual(expect.any(Number));
+    owner.kill('SIGKILL');
+    await waitForProcessExit(owner);
+    if (activePid !== undefined && processIsAlive(activePid)) process.kill(activePid, 'SIGKILL');
+    await waitForCondition(
+      () => activePid !== undefined && !processIsAlive(activePid),
+      'Orphaned Doctor check process did not exit',
+    );
+
+    await expect(nativeDoctorCommand([name], projectRoot)).resolves.toMatchObject({
+      exitCode: 65,
+      data: {
+        healthy: false,
+        findings: [
+          expect.objectContaining({
+            code: 'portable-check-execution-stuck',
+            repair: 'recover',
+          }),
+        ],
+      },
+    });
+    await expect(nativeDoctorCommand([name, '--repair'], projectRoot)).resolves.toMatchObject({
+      exitCode: 0,
+      data: { healthy: true, repaired: true },
+    });
+  });
+
+  it('does not let Doctor repair take over a live Runtime check', async () => {
+    const name = 'live-check-doctor';
+    await fs.mkdir(path.join(projectRoot, '.git'));
+    await createPortable(name);
+    await fs.writeFile(
+      path.join(nativePortableChangeDir(paths, name), 'brief.md'),
+      '# Acceptance examples\n- Doctor preserves a live Runtime check.\n',
+    );
+    await confirmNativePortableShape({ paths, name });
+    const runner = createNativeRunnerChannel();
+    const state = await submitNativePortableBuilderCandidate({
+      paths,
+      name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'live-doctor-builder',
+        }),
+        candidateId: 'live-doctor-candidate',
+        summary: 'Implemented.',
+        addressedAcceptanceIds: ['A1'],
+        review: null,
+      },
+    });
+    const marker = path.join(projectRoot, 'doctor-check-starts.txt');
+    const release = path.join(projectRoot, 'release-doctor-check');
+    const plan = {
+      id: 'live-doctor-check',
+      name: 'Live Doctor check',
+      executable: process.execPath,
+      argv: [
+        '-e',
+        "const fs=require('node:fs');fs.appendFileSync(process.argv[1],'start\\n');setInterval(()=>{if(fs.existsSync(process.argv[2]))process.exit(0)},25)",
+        marker,
+        release,
+      ],
+      cwdRef: '.',
+      timeoutMs: 60_000,
+      repeatable: true,
+    } as const;
+    const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
+    await ensureCliBuilt(repositoryRoot);
+    const owner = spawnNativePortableProcess({
+      repositoryRoot,
+      payload: { action: 'execute-checks', paths, name: state.name, plans: [plan] },
+    });
+    const file = nativeLocalExecutionFile(paths, name);
+    await waitForCondition(async () => {
+      const local = await readNativeLocalExecution(file);
+      const reserved =
+        local?.execution?.ownerPid === owner.pid &&
+        local.checks[0]?.activeProcess?.status === 'running';
+      const mutationLockReleased = await fs
+        .access(path.join(paths.locksDir, 'root-move.lock'))
+        .then(() => false)
+        .catch(() => true);
+      return reserved && mutationLockReleased;
+    }, 'Runtime owner did not start the Doctor test check');
+
+    const repaired = await nativeDoctorCommand([name, '--repair'], projectRoot);
+    const duringRepair = await readNativeLocalExecution(file);
+    const startsDuringRepair = (await fs.readFile(marker, 'utf8')).trim().split(/\r?\n/);
+
+    await fs.writeFile(release, 'release\n');
+    await waitForProcessExit(owner);
+
+    expect(repaired).toMatchObject({
+      exitCode: 0,
+      data: { healthy: true, repaired: false },
+    });
+    expect(duringRepair).toMatchObject({
+      execution: { status: 'running', ownerPid: owner.pid },
+      checks: [{ status: 'running' }],
+    });
+    expect(startsDuringRepair).toHaveLength(1);
+    expect(owner.exitCode).toBe(0);
+    await expect(readNativeLocalExecution(file)).resolves.toMatchObject({
+      execution: { status: 'completed' },
+      checks: [{ status: 'passed' }],
+    });
+  });
+
+  it('takes over a verifier dispatch that never confirmed startup', async () => {
+    const name = 'stale-verifier-dispatch';
+    await createPortable(name);
+    await fs.writeFile(
+      path.join(nativePortableChangeDir(paths, name), 'brief.md'),
+      '# Acceptance examples\n- The verifier can recover after a lost startup.\n',
+    );
+    await confirmNativePortableShape({ paths, name });
+    const runner = createNativeRunnerChannel();
+    await submitNativePortableBuilderCandidate({
+      paths,
+      name,
+      input: {
+        identity: runner.captureExecutionIdentity({
+          identityProvider: 'test-host',
+          executionRef: 'stale-verifier-builder',
+        }),
+        candidateId: 'stale-verifier-candidate',
+        summary: 'Implemented.',
+        addressedAcceptanceIds: ['A1'],
+        review: null,
+      },
+    });
+    const executed = await executeNativePortableCheckPlan({ paths, name, plans: [] });
+    const dispatched = await dispatchNativePortableVerifier({
+      paths,
+      name,
+      checks: executed.checks,
+      verifierExecutionId: 'stale-verifier-execution',
+    });
+    const local = await readNativeLocalExecution(nativeLocalExecutionFile(paths, name));
+    await writeNativeLocalExecution(
+      nativeLocalExecutionFile(paths, name),
+      {
+        ...local!,
+        basedOnStateVersion: dispatched.state_version,
+        execution: {
+          operationId: 'stale-verifier-operation',
+          stage: 'verifying',
+          actor: 'verifier',
+          executionId: 'stale-verifier-execution',
+          status: 'running',
+          startedAt: new Date(Date.now() - 31 * 60 * 1_000).toISOString(),
+          requestCheckRounds: 0,
+        },
+      },
+      { containedRoot: paths.runtimeDir },
+    );
+
+    await expect(nativeDoctorCommand([name, '--repair'], projectRoot)).resolves.toMatchObject({
+      exitCode: 0,
+      data: {
+        healthy: true,
+        repaired: true,
+        result: { verifierTakeover: true, waitedMinutes: expect.any(Number) },
+      },
+    });
+    const recovered = await readNativeLocalExecution(nativeLocalExecutionFile(paths, name));
+    expect(recovered?.execution?.status).toBe('running');
+    expect(recovered?.execution?.verifierStartedAt).toBeUndefined();
   });
 
   it('repairs an exact empty v2 overlay left beside a legacy v1 child contract', async () => {
@@ -368,6 +765,14 @@ children:
 
   it('leaves a valid v2 Supervisor overlay on the normal path', async () => {
     const name = 'current-v2-overlay';
+    // A real Supervisor overlay only exists after a Git-bound confirmation;
+    // seed the repository and the workspace binding the normal path produces.
+    await fs.writeFile(path.join(projectRoot, '.gitignore'), '.comet/runtime/\n');
+    runGitCommand(projectRoot, ['init', '-b', 'main']);
+    runGitCommand(projectRoot, ['config', 'user.email', 'native@example.test']);
+    runGitCommand(projectRoot, ['config', 'user.name', 'Native Test']);
+    runGitCommand(projectRoot, ['add', '.']);
+    runGitCommand(projectRoot, ['commit', '--allow-empty', '-m', 'seed test repository']);
     await createPortable(name);
     const changeDir = nativePortableChangeDir(paths, name);
     const childrenSource = `schema: comet.native.children.v2
@@ -387,6 +792,11 @@ children:
       contract,
     });
     await writeNativeSupervisorState(paths, overlay);
+    const state = await readNativePortableChange(paths, name);
+    await writeNativePortableState(nativePortableStateFile(paths, name), {
+      ...state,
+      workspace: { ...state.workspace, change_branch: 'main', target_branch: 'main' },
+    });
 
     await expect(nativeDoctorCommand([name, '--repair'], projectRoot)).resolves.toMatchObject({
       exitCode: 0,

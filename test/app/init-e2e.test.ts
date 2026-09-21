@@ -8,6 +8,8 @@ import { parse } from 'yaml';
 import { getProjectRegistryPath } from '../../platform/install/project-registry.js';
 import { defaultProjectConfig } from '../../domains/comet-native/native-config.js';
 import { stageOpenSpecSkills, unquoteWindowsArg } from '../helpers/openspec-test-utils.js';
+import * as platformInstall from '../../domains/skill/platform-install.js';
+import { initCommand as runInitCommand } from '../../app/commands/init.js';
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn(),
@@ -22,6 +24,10 @@ vi.mock('@inquirer/prompts', () => ({
 
 vi.mock('../../app/commands/platform-select-prompt.js', () => ({
   platformSelectPrompt: vi.fn(),
+}));
+
+vi.mock('../../app/commands/workflow-select-prompt.js', () => ({
+  workflowSelectPrompt: vi.fn(),
 }));
 
 vi.mock('../../platform/version/version.js', () => ({
@@ -170,14 +176,70 @@ describe('comet init E2E', () => {
     await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  it('offers Native, Classic, and Both with concise user-facing descriptions', async () => {
+  it('offers Native, Classic, and Both with fixed detail rows', async () => {
     const { workflowChoiceNames } = await import('../../app/commands/init.js');
 
     expect(workflowChoiceNames('zh')).toEqual([
-      expect.objectContaining({ value: 'native', name: expect.stringContaining('强模型') }),
-      expect.objectContaining({ value: 'classic', name: expect.stringContaining('Spec/TDD') }),
-      expect.objectContaining({ value: 'both', name: expect.stringContaining('两套独立入口') }),
+      expect.objectContaining({
+        value: 'native',
+        name: 'Native（推荐）',
+        short: 'Native（推荐）',
+        details: [
+          expect.stringMatching(/Loop驱动.*高强度澄清.*ReAct.*执行时Skill/u),
+          expect.stringMatching(/适合：.*GLM 5\.1/u),
+          expect.stringMatching(/对比：.*↓75%.*↓47\.8%/u),
+        ],
+      }),
+      expect.objectContaining({
+        value: 'classic',
+        name: 'Classic',
+        short: 'Classic',
+        details: [
+          expect.stringContaining('经典高约束Spec流程，使用 OpenSpec 与 Superpowers编排工作流'),
+          expect.stringMatching(/适合：.*私有化部署/u),
+          expect.stringMatching(/特点：.*文档更丰富/u),
+        ],
+      }),
+      expect.objectContaining({
+        value: 'both',
+        name: '两者',
+        short: '两者',
+        details: [
+          expect.stringContaining('安装：Native 与 Classic'),
+          expect.stringMatching(/默认：.*Native/u),
+          expect.stringMatching(/切换：.*Classic/u),
+        ],
+      }),
     ]);
+  });
+
+  it('stops before project writes when bundled assets are incomplete', async () => {
+    mockExternalSuccess();
+    await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+    const preflight = vi
+      .spyOn(platformInstall, 'assertBundledAssetsComplete')
+      .mockRejectedValueOnce(
+        new Error(
+          'The installed @rpamis/comet package is incomplete (1 required asset is missing)',
+        ),
+      );
+    try {
+      await expect(
+        runInitCommand(tmpDir, {
+          yes: true,
+          json: true,
+          language: 'en',
+          workflow: 'native',
+          platform: 'codex',
+          codegraph: 'skip',
+        }),
+      ).rejects.toThrow('1 required asset is missing');
+      await expect(fs.access(path.join(tmpDir, '.comet', 'config.yaml'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    } finally {
+      preflight.mockRestore();
+    }
   });
 
   it('enables the banner for text output and disables it for JSON output', async () => {
@@ -1664,7 +1726,7 @@ describe('comet init E2E', () => {
 
   it('stores a project-relative Native artifact template at global scope without creating artifacts', async () => {
     mockExternalSuccess();
-    await fs.mkdir(path.join(tmpDir, '.claude'), { recursive: true });
+    await fs.mkdir(path.join(os.homedir(), '.claude'), { recursive: true });
 
     const { initCommand } = await import('../../app/commands/init.js');
     const result = await captureJsonOutput(() =>
@@ -1674,6 +1736,7 @@ describe('comet init E2E', () => {
         scope: 'global',
         workflow: 'native',
         artifactRoot: 'artifacts',
+        platform: 'claude',
       }),
     );
 
@@ -1719,6 +1782,7 @@ describe('comet init E2E', () => {
           json: true,
           scope: 'global',
           workflow: 'native',
+          platform: 'claude',
         }),
       );
     } finally {
@@ -1752,6 +1816,7 @@ describe('comet init E2E', () => {
         scope: 'global',
         workflow: 'native',
         codegraph: 'skip',
+        platform: 'claude',
       }),
     );
 
@@ -1803,9 +1868,8 @@ describe('comet init E2E', () => {
     'initializes both Native and Classic skills at global scope when explicitly selected',
     async () => {
       mockExternalSuccess();
-      await fs.mkdir(path.join(tmpDir, '.claude'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.claude'), { recursive: true });
 
       const { initCommand } = await import('../../app/commands/init.js');
       const result = await captureJsonOutput(() =>
@@ -1843,7 +1907,9 @@ describe('comet init E2E', () => {
 
       const { checkbox, select } = await import('@inquirer/prompts');
       const { platformSelectPrompt } = await import('../../app/commands/platform-select-prompt.js');
-      vi.mocked(select).mockResolvedValueOnce('both').mockResolvedValueOnce('copy');
+      const { workflowSelectPrompt } = await import('../../app/commands/workflow-select-prompt.js');
+      vi.mocked(workflowSelectPrompt).mockResolvedValueOnce('both');
+      vi.mocked(select).mockResolvedValueOnce('copy');
       vi.mocked(platformSelectPrompt).mockResolvedValue(['codex']);
       vi.mocked(checkbox).mockResolvedValue([]);
 
@@ -1855,8 +1921,7 @@ describe('comet init E2E', () => {
         }),
       );
 
-      expect(select).toHaveBeenNthCalledWith(
-        1,
+      expect(workflowSelectPrompt).toHaveBeenCalledWith(
         expect.objectContaining({
           message: 'Select Comet workflow(s):',
           choices: [
@@ -1889,7 +1954,8 @@ describe('comet init E2E', () => {
 
       const { checkbox, select } = await import('@inquirer/prompts');
       const { platformSelectPrompt } = await import('../../app/commands/platform-select-prompt.js');
-      vi.mocked(select).mockResolvedValueOnce(workflow);
+      const { workflowSelectPrompt } = await import('../../app/commands/workflow-select-prompt.js');
+      vi.mocked(workflowSelectPrompt).mockResolvedValueOnce(workflow);
       if (workflow === 'both') vi.mocked(select).mockResolvedValueOnce('copy');
       vi.mocked(platformSelectPrompt).mockResolvedValue(['codex']);
       vi.mocked(checkbox).mockResolvedValue([]);
@@ -2034,13 +2100,13 @@ describe('comet init E2E', () => {
   );
 
   it(
-    'installs Comet skills at global scope',
+    'detects global platforms from the user home instead of the current project',
     async () => {
       mockExternalSuccess();
 
       await fs.mkdir(path.join(tmpDir, '.claude'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.codex'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -2059,12 +2125,15 @@ describe('comet init E2E', () => {
 
       const manifest = await readManifest();
       for (const skillPath of skillPathsForWorkflow(manifest, 'native')) {
-        const dest = path.join(fakeHome, '.claude', 'skills', skillPath);
+        const dest = path.join(fakeHome, '.agents', 'skills', skillPath);
         await expect(fs.access(dest)).resolves.toBeUndefined();
       }
       await expect(
-        fs.access(path.join(fakeHome, '.claude', 'skills', 'comet-native', 'SKILL.md')),
+        fs.access(path.join(fakeHome, '.agents', 'skills', 'comet-native', 'SKILL.md')),
       ).resolves.toBeUndefined();
+      await expect(
+        fs.access(path.join(fakeHome, '.claude', 'skills', 'comet-native', 'SKILL.md')),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
 
       await expect(fs.stat(path.join(tmpDir, 'docs', 'superpowers', 'specs'))).rejects.toThrow();
     },
@@ -2446,7 +2515,13 @@ describe('comet init E2E', () => {
     try {
       const { initCommand } = await import('../../app/commands/init.js');
       await captureJsonOutput(() =>
-        initCommand(tmpDir, { yes: true, scope: 'project', json: true, language: 'en' }),
+        initCommand(tmpDir, {
+          yes: true,
+          scope: 'project',
+          json: true,
+          language: 'en',
+          platform: 'claude',
+        }),
       );
     } finally {
       homedirSpy.mockRestore();
@@ -2644,7 +2719,7 @@ describe('comet init E2E', () => {
   );
 
   it(
-    'installs all platforms from clean directory with --yes',
+    'does not guess every platform from a clean directory with --yes',
     async () => {
       mockExternalSuccess();
 
@@ -2658,73 +2733,12 @@ describe('comet init E2E', () => {
           initCommand(tmpDir, { yes: true, json: true }),
         );
 
-        expect((result.results as unknown[]).length).toBeGreaterThanOrEqual(35);
-
-        const manifest = await readManifest();
-        const platformDirs = [
-          '.claude',
-          '.cursor',
-          '.opencode',
-          '.devin',
-          '.cline',
-          '.roo',
-          '.continue',
-          '.gemini',
-          '.amazonq',
-          '.qwen',
-          '.kilocode',
-          '.augment',
-          '.kiro',
-          '.kimi-code',
-          '.lingma',
-          '.junie',
-          '.codebuddy',
-          '.workbuddy',
-          '.cospec',
-          '.crush',
-          '.factory',
-          '.iflow',
-          '.pi',
-          '.omp',
-          '.qoder',
-          '.agents',
-          '.bob',
-          '.forge',
-          '.trae',
-          '.trae-cn',
-          '.github',
-          '.zcode',
-          '.mimocode',
-        ];
-        for (const platform of platformDirs) {
-          for (const skillPath of skillPathsForWorkflow(manifest, 'native')) {
-            const dest = path.join(tmpDir, platform, 'skills', skillPath);
-            await expect(fs.access(dest)).resolves.toBeUndefined();
-          }
-        }
-
-        await expect(
-          fs.access(path.join(tmpDir, '.codex', 'skills', 'comet', 'SKILL.md')),
-        ).rejects.toThrow();
-
-        await expect(
-          fs.access(path.join(tmpDir, '.opencode', 'commands', 'comet-any.md')),
-        ).resolves.toBeUndefined();
-        await expect(
-          fs.access(path.join(tmpDir, '.mimocode', 'commands', 'comet-any.md')),
-        ).resolves.toBeUndefined();
-        await expect(
-          fs.access(path.join(tmpDir, '.opencode', 'commands', 'comet-open.md')),
-        ).rejects.toMatchObject({ code: 'ENOENT' });
-        await expect(
-          fs.access(path.join(tmpDir, '.pi', 'extensions', 'comet-commands.ts')),
-        ).resolves.toBeUndefined();
-        await expect(
-          fs.access(path.join(tmpDir, '.omp', 'hooks', 'pre', 'comet-hook-router.ts')),
-        ).resolves.toBeUndefined();
-        await expect(
-          fs.access(path.join(tmpDir, '.omp', 'rules', 'comet-workflow-guard.mdc')),
-        ).resolves.toBeUndefined();
+        expect(result).toMatchObject({
+          status: 'incomplete',
+          selectedPlatforms: [],
+          failures: [{ component: 'Comet', reason: 'no platforms selected' }],
+          results: [],
+        });
       } finally {
         homedirSpy.mockRestore();
       }
@@ -2765,9 +2779,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.agents'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.agents'), { recursive: true });
 
       const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -2799,9 +2812,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.opencode'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.opencode'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -2836,9 +2848,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.mimocode'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.mimocode'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -2873,9 +2884,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.pi'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.pi'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -2907,9 +2917,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.lingma'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.lingma'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -2938,9 +2947,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.kimi-code'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.kimi-code'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -2969,9 +2977,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.zcode'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.zcode'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 
@@ -3012,9 +3019,8 @@ describe('comet init E2E', () => {
     async () => {
       mockExternalSuccess();
 
-      await fs.mkdir(path.join(tmpDir, '.zcode'), { recursive: true });
       const fakeHome = path.join(tmpDir, 'fake-home');
-      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(path.join(fakeHome, '.zcode'), { recursive: true });
 
       vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
 

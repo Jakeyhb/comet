@@ -174,7 +174,7 @@ describe('Native portable Archive', () => {
     ).rejects.toThrow('--serial-first is only valid for portable Native changes');
     await expect(
       nativeArchiveCommand(['archive-change', '--finish', 'keep'], root),
-    ).rejects.toThrow('--finish is only valid with --dry-run');
+    ).rejects.toThrow('--finish without --dry-run requires --confirmed');
   });
 
   it('applies full specs, finalizes YAML/report, moves the change, and removes local Runtime', async () => {
@@ -433,6 +433,55 @@ children:
     await expect(fs.stat(path.join(paths.specsDir, 'sample', 'spec.md'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+  });
+
+  it('clears a pre-Archive workspace finish journal when verification becomes stale', async () => {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'native-test@example.com'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Native Test'], { cwd: root });
+    await fs.writeFile(path.join(root, '.gitignore'), '.comet/runtime/\n');
+    execFileSync('git', ['add', '.'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'seed stale finish recovery'], {
+      cwd: root,
+      stdio: 'ignore',
+    });
+    execFileSync('git', ['switch', '-c', 'comet/stale-finish'], {
+      cwd: root,
+      stdio: 'ignore',
+    });
+
+    const state = await archiveReady('stale-finish');
+    await writeNativePortableState(
+      path.join(nativePortableChangeDir(paths, state.name), 'comet-state.yaml'),
+      {
+        ...state,
+        workspace: {
+          isolation: 'branch',
+          change_branch: 'comet/stale-finish',
+          target_branch: 'main',
+          finish: 'keep',
+        },
+      },
+    );
+    await expect(
+      archiveNativePortableChange({
+        paths,
+        name: state.name,
+        hooks: { afterSpecApplied: () => Promise.reject(new Error('pause-before-finish')) },
+      }),
+    ).rejects.toThrow('pause-before-finish');
+    await fs.writeFile(
+      path.join(paths.specsDir, 'sample', 'spec.md'),
+      '# Sample\n\nThe canonical behavior changed after verification.\n',
+    );
+
+    await expect(nativeArchiveCommand([state.name, '--confirmed'], root)).resolves.toMatchObject({
+      exitCode: 0,
+      data: { archived: false, recovery: { action: 'reverify' } },
+    });
+    await expect(
+      fs.stat(path.join(paths.transactionsDir, `workspace-finish-${state.name}.json`)),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('resumes after final YAML and after directory move without rerunning verification', async () => {
@@ -842,6 +891,48 @@ children:
     ).resolves.toMatchObject({ exitCode: 0, data: { state: { status: 'done' } } });
   });
 
+  it('archives in one step with --confirmed --finish without a second full dry-run', async () => {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'native-test@example.com'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Native Test'], { cwd: root });
+    await fs.writeFile(path.join(root, '.gitignore'), '.comet/runtime/\n');
+    execFileSync('git', ['add', '.'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'seed native archive one-step'], {
+      cwd: root,
+      stdio: 'ignore',
+    });
+    execFileSync('git', ['switch', '-c', 'comet/archive-one-step'], {
+      cwd: root,
+      stdio: 'ignore',
+    });
+
+    const state = await archiveReady('archive-one-step');
+    await writeNativePortableState(
+      path.join(nativePortableChangeDir(paths, state.name), 'comet-state.yaml'),
+      {
+        ...state,
+        workspace: {
+          isolation: 'branch',
+          change_branch: 'comet/archive-one-step',
+          target_branch: 'main',
+          finish: null,
+        },
+      },
+    );
+
+    const archived = await nativeArchiveCommand(
+      [state.name, '--confirmed', '--finish', 'keep'],
+      root,
+    );
+    expect(archived).toMatchObject({
+      exitCode: 0,
+      data: {
+        state: { status: 'done', archived: true },
+        workspaceFinishResult: { status: 'kept', commit: expect.any(String) },
+      },
+    });
+  });
+
   it('allows isolated keep finishes to preserve unrelated files while committing change-owned files', async () => {
     execFileSync('git', ['init', '-b', 'main'], { cwd: root, stdio: 'ignore' });
     execFileSync('git', ['config', 'user.email', 'native-test@example.com'], { cwd: root });
@@ -944,6 +1035,74 @@ children:
     expect(execFileSync('git', ['status', '--short'], { cwd: root, encoding: 'utf8' })).toContain(
       '?? generated-output.txt',
     );
+  });
+
+  it('completes an interrupted Archive by rerunning the returned recovery command', async () => {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'native-test@example.com'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Native Test'], { cwd: root });
+    await fs.writeFile(path.join(root, '.gitignore'), '.comet/runtime/\n');
+    execFileSync('git', ['add', '.'], { cwd: root, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'seed retryable Native archive'], {
+      cwd: root,
+      stdio: 'ignore',
+    });
+    execFileSync('git', ['switch', '-c', 'comet/archive-retry'], {
+      cwd: root,
+      stdio: 'ignore',
+    });
+
+    const remote = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-native-remote-'));
+    await fs.rm(remote, { recursive: true, force: true });
+    try {
+      execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: root });
+      execFileSync('git', ['config', 'branch.comet/archive-retry.remote', 'origin'], { cwd: root });
+      execFileSync(
+        'git',
+        ['config', 'branch.comet/archive-retry.merge', 'refs/heads/comet/archive-retry'],
+        { cwd: root },
+      );
+
+      const state = await archiveReady('archive-retry');
+      await writeNativePortableState(
+        path.join(nativePortableChangeDir(paths, state.name), 'comet-state.yaml'),
+        {
+          ...state,
+          workspace: {
+            isolation: 'branch',
+            change_branch: 'comet/archive-retry',
+            target_branch: 'main',
+            finish: 'push',
+          },
+        },
+      );
+
+      const blocked = await nativeArchiveCommand([state.name, '--confirmed'], root);
+      expect(blocked).toMatchObject({
+        exitCode: 73,
+        data: {
+          workspaceFinishResult: {
+            status: 'blocked',
+            diagnosticArgs: ['git', '-C', root, 'status', '--short'],
+            recoveryArgs: ['comet', 'native', 'archive', state.name, '--confirmed'],
+          },
+          continuation: {
+            commandArgs: ['comet', 'native', 'archive', state.name, '--confirmed'],
+          },
+        },
+      });
+
+      execFileSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
+      await expect(nativeArchiveCommand([state.name, '--confirmed'], root)).resolves.toMatchObject({
+        exitCode: 0,
+        data: {
+          state: { status: 'done', archived: true },
+          workspaceFinishResult: { status: 'completed', pushed: true },
+        },
+      });
+    } finally {
+      await fs.rm(remote, { recursive: true, force: true });
+    }
   });
 
   it('detects capability owners in another registered Git worktree', async () => {

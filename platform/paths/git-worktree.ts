@@ -1,4 +1,5 @@
 import { execFileSync } from 'child_process';
+import fs from 'fs';
 import path from 'path';
 
 interface GitWorktreeContext {
@@ -24,12 +25,25 @@ function runGit(projectPath: string, args: string[]): string {
   }).trim();
 }
 
-function samePath(left: string, right: string): boolean {
-  const normalizedLeft = path.normalize(left);
-  const normalizedRight = path.normalize(right);
-  return process.platform === 'win32'
-    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
-    : normalizedLeft === normalizedRight;
+/**
+ * Compare two paths by identity on disk. On Windows this resolves 8.3 short
+ * names and casing through the filesystem, so the same root observed from
+ * different sources (Node's `path.resolve` versus `git worktree list`) still
+ * compares equal; on other platforms it compares the resolved paths.
+ */
+export function samePath(left: string, right: string): boolean {
+  return canonicalPathForComparison(left) === canonicalPathForComparison(right);
+}
+
+function canonicalPathForComparison(target: string): string {
+  const resolved = path.resolve(target);
+  try {
+    const real = fs.realpathSync.native(resolved);
+    return process.platform === 'win32' ? real.toLowerCase() : real;
+  } catch {
+    // A path that does not exist yet cannot be resolved by the filesystem.
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  }
 }
 
 function inspectGitWorktree(projectPath: string): GitWorktreeContext {

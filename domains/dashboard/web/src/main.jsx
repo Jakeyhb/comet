@@ -5,6 +5,7 @@ import {
   ConfigProvider,
   Form,
   Input,
+  InputNumber,
   Popover,
   Select,
   Skeleton,
@@ -1027,7 +1028,10 @@ function DashboardApp({
           reconcilePluginInvocationResult(current, requestedPluginId, capability, result, input),
         );
       }
-      if (requestedPluginId === 'comet.project-knowledge' && capability === 'read-source') {
+      if (
+        (requestedPluginId === 'comet.project-knowledge' && capability === 'read-source') ||
+        capability === 'memory-get'
+      ) {
         return result;
       }
       const [nextPage] = await Promise.all([
@@ -1072,6 +1076,15 @@ function DashboardApp({
                 modifiedAt: preview.modifiedAt,
                 truncated: false,
               };
+            }
+          }
+          if (pluginId === 'comet.project-knowledge' && capability === 'memory-get') {
+            const memoryEntries = Array.isArray(pluginPage?.data?.projectMemory?.entries)
+              ? pluginPage.data.projectMemory.entries
+              : [];
+            const memory = memoryEntries.find((entry) => entry?.slug === input?.slug);
+            if (memory) {
+              return { kind: 'memory', ...memory };
             }
           }
           if (pluginId === 'comet.project-knowledge' && capability === 'query') {
@@ -1124,6 +1137,12 @@ function DashboardApp({
           );
         } else if (pluginId === 'comet.project-knowledge' && capability === 'create') {
           toast('项目知识已新增');
+        } else if (
+          pluginId === 'comet.project-knowledge' &&
+          capability === 'forget' &&
+          input?.memory
+        ) {
+          toast('项目记忆已删除');
         } else if (pluginId === 'comet.project-knowledge' && capability === 'correct') {
           toast(input?.restore ? '项目知识已更新并恢复使用' : '项目知识已更新');
         } else if (pluginId === 'comet.project-knowledge' && capability === 'forget') {
@@ -1141,7 +1160,7 @@ function DashboardApp({
                   ? '来源或验证入口已变化，记录已替代并停止应用'
                   : '项目知识已刷新',
           );
-        } else if (capability !== 'read-source') {
+        } else if (capability !== 'read-source' && capability !== 'memory-get') {
           toast(capability === 'lifecycle' ? '插件状态已更新' : '操作已完成');
         }
         return result;
@@ -1650,13 +1669,17 @@ function DashboardApp({
             const previousKnowledge = settingsConfig.knowledge ?? {
               provider: 'local',
               localInclude: [],
+              maxFileMb: 1,
+              maxTotalMb: 32,
             };
             const nextKnowledge = config.knowledge ?? previousKnowledge;
-            const knowledgePathsChanged =
+            const localKnowledgeConfigChanged =
               nextKnowledge.provider === 'local' &&
               (previousKnowledge.provider !== 'local' ||
                 JSON.stringify(nextKnowledge.localInclude ?? []) !==
-                  JSON.stringify(previousKnowledge.localInclude ?? []));
+                  JSON.stringify(previousKnowledge.localInclude ?? []) ||
+                nextKnowledge.maxFileMb !== previousKnowledge.maxFileMb ||
+                nextKnowledge.maxTotalMb !== previousKnowledge.maxTotalMb);
             try {
               const next = await saveDashboardProjectConfig(activeProjectId, {
                 expectedRevision: settingsConfig.revision,
@@ -1683,7 +1706,7 @@ function DashboardApp({
               );
               writeDashboardCache(projectConfigStorageKey(activeProjectId), next);
               setSettingsConfig(next);
-              if (knowledgePathsChanged) {
+              if (localKnowledgeConfigChanged) {
                 await invokeActivePlugin('comet.project-knowledge', 'refresh', {}, 'settings');
                 if (pluginSelectionRef.current === 'comet.project-knowledge') {
                   setPluginRefreshToken((value) => value + 1);
@@ -2447,6 +2470,7 @@ function ArtifactDrawer({ artifact, embedded = false, onClose }) {
 
     const preview = artifact.preview;
     const previewPath = preview?.path ?? '';
+    const isNativeStatePreview = artifact.key === 'comet-state.yaml';
     const isYamlPreview = artifact.key === 'cometYaml' || /\.ya?ml$/i.test(previewPath);
     const isJsonPreview =
       artifact.key === 'handoff' || artifact.key === 'checkpoint' || /\.json$/i.test(previewPath);
@@ -2465,11 +2489,17 @@ function ArtifactDrawer({ artifact, embedded = false, onClose }) {
         let html;
         if (preview?.exists && useStructuredPreview) {
           if (!content.trim()) {
-            html = isJsonPreview ? await renderJsonPreview('') : await renderYamlTable('');
+            html = isJsonPreview
+              ? await renderJsonPreview('')
+              : await renderYamlTable('', {
+                  schema: isNativeStatePreview ? 'native-state' : undefined,
+                });
           } else {
             html = isJsonPreview
               ? await renderJsonPreview(content)
-              : await renderYamlTable(content);
+              : await renderYamlTable(content, {
+                  schema: isNativeStatePreview ? 'native-state' : undefined,
+                });
             if (preview.truncated) {
               html += '<p><em>内容过长，已截取前 256KB。</em></p>';
             }
@@ -4249,7 +4279,7 @@ function DashboardSettingsOverlay({
       open={open}
       title="Comet 设置"
       subtitle={readOnly ? '只读预览' : '当前项目'}
-      description="统一管理个人记忆、项目规则与工作流配置"
+      description="统一管理个人记忆、项目知识与工作流配置"
       onClose={onClose}
       footer={
         <div className="dashboard-settings-modal-footer">
@@ -4305,7 +4335,7 @@ function DashboardSettingsPage({
     {
       key: 'comet.project-knowledge',
       icon: <DatabaseOutlined />,
-      label: '项目规则',
+      label: '项目知识',
       disabled: !installedPlugins.has('comet.project-knowledge'),
     },
     { key: 'comet.config', icon: <SettingOutlined />, label: 'Comet 配置' },
@@ -4398,6 +4428,8 @@ function toCometConfigDraft(data) {
     knowledge: {
       provider: data.knowledge?.provider ?? 'local',
       localInclude: [...(data.knowledge?.localInclude ?? [])],
+      maxFileMb: data.knowledge?.maxFileMb ?? 1,
+      maxTotalMb: data.knowledge?.maxTotalMb ?? 32,
     },
     native: {
       ...data.native,
@@ -4429,10 +4461,10 @@ function CometConfigSettings({ data, readOnly = false, onSave }) {
       classic: { ...current.classic, [key]: value },
     }));
   };
-  const setKnowledge = (localInclude) => {
+  const setKnowledge = (key, value) => {
     setDraft((current) => ({
       ...current,
-      knowledge: { ...current.knowledge, localInclude },
+      knowledge: { ...current.knowledge, [key]: value },
     }));
   };
   const save = async () => {
@@ -4443,6 +4475,20 @@ function CometConfigSettings({ data, readOnly = false, onSave }) {
     const maxVerifyFailures = Number(draft.native.maxVerifyFailures);
     if (!Number.isSafeInteger(maxVerifyFailures) || maxVerifyFailures <= 0) {
       setSaveError('Verify 失败上限必须是正整数。');
+      return;
+    }
+    const maxFileMb = Number(draft.knowledge.maxFileMb);
+    const maxTotalMb = Number(draft.knowledge.maxTotalMb);
+    if (!Number.isSafeInteger(maxFileMb) || maxFileMb <= 0) {
+      setSaveError('单文件上限必须是正整数。');
+      return;
+    }
+    if (!Number.isSafeInteger(maxTotalMb) || maxTotalMb <= 0) {
+      setSaveError('语料总预算必须是正整数。');
+      return;
+    }
+    if (maxFileMb > maxTotalMb) {
+      setSaveError('单文件上限不能大于语料总预算。');
       return;
     }
     setSaving(true);
@@ -4459,6 +4505,8 @@ function CometConfigSettings({ data, readOnly = false, onSave }) {
         knowledge: {
           provider: draft.knowledge.provider,
           localInclude: draft.knowledge.localInclude.filter((item) => item.trim()),
+          maxFileMb,
+          maxTotalMb,
         },
         native: { ...draft.native, maxVerifyFailures },
         classic: draft.classic,
@@ -4582,7 +4630,7 @@ function CometConfigSettings({ data, readOnly = false, onSave }) {
                   onChange={(event) => {
                     const next = [...draft.knowledge.localInclude];
                     next[index] = event.target.value;
-                    setKnowledge(next);
+                    setKnowledge('localInclude', next);
                   }}
                 />
                 <Button
@@ -4592,7 +4640,10 @@ function CometConfigSettings({ data, readOnly = false, onSave }) {
                   disabled={draft.knowledge.provider !== 'local'}
                   aria-label={`删除额外知识文档路径 ${index + 1}`}
                   onClick={() =>
-                    setKnowledge(draft.knowledge.localInclude.filter((_, item) => item !== index))
+                    setKnowledge(
+                      'localInclude',
+                      draft.knowledge.localInclude.filter((_, item) => item !== index),
+                    )
                   }
                 />
               </div>
@@ -4601,7 +4652,7 @@ function CometConfigSettings({ data, readOnly = false, onSave }) {
               type="dashed"
               icon={<PlusOutlined />}
               disabled={draft.knowledge.provider !== 'local'}
-              onClick={() => setKnowledge([...draft.knowledge.localInclude, ''])}
+              onClick={() => setKnowledge('localInclude', [...draft.knowledge.localInclude, ''])}
             >
               添加文档路径
             </Button>
@@ -5222,22 +5273,46 @@ function ProjectKnowledgeSettings({ page, data, readOnly = false, onInvoke }) {
   const [tokenEnv, setTokenEnv] = useState(snapshot.remote?.tokenEnv ?? '');
   const [scope, setScope] = useState(snapshot.remote?.scope ?? '');
   const [timeoutMs, setTimeoutMs] = useState(String(snapshot.remote?.timeoutMs ?? 5000));
+  const [maxFileMb, setMaxFileMb] = useState(snapshot.localLimits?.maxFileMb ?? 1);
+  const [maxTotalMb, setMaxTotalMb] = useState(snapshot.localLimits?.maxTotalMb ?? 32);
+  const [saveError, setSaveError] = useState(null);
   useEffect(() => {
     setProviderMode(snapshot.provider ?? 'local');
     setEndpoint(snapshot.remote?.endpoint ?? '');
     setTokenEnv(snapshot.remote?.tokenEnv ?? '');
     setScope(snapshot.remote?.scope ?? '');
     setTimeoutMs(String(snapshot.remote?.timeoutMs ?? 5000));
+    setMaxFileMb(snapshot.localLimits?.maxFileMb ?? 1);
+    setMaxTotalMb(snapshot.localLimits?.maxTotalMb ?? 32);
+    setSaveError(null);
   }, [
     snapshot.provider,
     snapshot.remote?.endpoint,
     snapshot.remote?.tokenEnv,
     snapshot.remote?.scope,
     snapshot.remote?.timeoutMs,
+    snapshot.localLimits?.maxFileMb,
+    snapshot.localLimits?.maxTotalMb,
   ]);
   const saveProvider = async () => {
+    if (providerMode === 'local') {
+      if (!Number.isSafeInteger(maxFileMb) || maxFileMb <= 0) {
+        setSaveError('单文件上限必须是正整数。');
+        return;
+      }
+      if (!Number.isSafeInteger(maxTotalMb) || maxTotalMb <= 0) {
+        setSaveError('语料总预算必须是正整数。');
+        return;
+      }
+      if (maxFileMb > maxTotalMb) {
+        setSaveError('单文件上限不能大于语料总预算。');
+        return;
+      }
+    }
+    setSaveError(null);
     await onInvoke('configure-provider', {
       provider: providerMode,
+      ...(providerMode === 'local' ? { maxFileMb, maxTotalMb } : {}),
       ...(providerMode === 'remote'
         ? {
             remote: {
@@ -5354,6 +5429,57 @@ function ProjectKnowledgeSettings({ page, data, readOnly = false, onInvoke }) {
                 </Button>
               </div>
             </div>
+          </section>
+          {saveError && (
+            <Alert type="error" showIcon message="项目知识配置保存失败" description={saveError} />
+          )}
+          <section className="dashboard-settings-panel" aria-labelledby="knowledge-budget-settings">
+            <div className="dashboard-settings-panel-head">
+              <div>
+                <h4 id="knowledge-budget-settings">Local 语料预算</h4>
+                <p>控制参与本地项目知识检索的单文件大小和全部文档总量，单位为 MB</p>
+              </div>
+              <Tag color={providerMode === 'local' ? 'success' : 'default'}>
+                {providerMode === 'local' ? 'Local 生效' : 'Remote 使用中'}
+              </Tag>
+            </div>
+            <div className="dashboard-memory-setting">
+              <div className="dashboard-memory-setting-copy">
+                <strong>单文件上限</strong>
+                <span>超过此大小的 Markdown 文件不会进入 Local 检索</span>
+              </div>
+              <InputNumber
+                className="dashboard-config-control"
+                min={1}
+                precision={0}
+                value={maxFileMb}
+                disabled={readOnly || providerMode !== 'local'}
+                aria-label="项目知识单文件上限（MB）"
+                addonAfter="MB"
+                onChange={setMaxFileMb}
+              />
+            </div>
+            <div className="dashboard-memory-setting">
+              <div className="dashboard-memory-setting-copy">
+                <strong>语料总预算</strong>
+                <span>所有进入 Local 检索的 Markdown 文件合计不能超过此大小</span>
+              </div>
+              <InputNumber
+                className="dashboard-config-control"
+                min={1}
+                precision={0}
+                value={maxTotalMb}
+                disabled={readOnly || providerMode !== 'local'}
+                aria-label="项目知识语料总预算（MB）"
+                addonAfter="MB"
+                onChange={setMaxTotalMb}
+              />
+            </div>
+            <span className="dashboard-settings-help-text">
+              {providerMode === 'local'
+                ? '保存配置后会按新预算刷新本地语料；单文件上限不能大于语料总预算。'
+                : '当前使用 Remote Provider；这些 Local 预算会保留，切回 Local 后继续生效。'}
+            </span>
           </section>
           {providerMode === 'local' && local && (
             <section
@@ -6456,6 +6582,258 @@ function ContextManifestPreview({
   );
 }
 
+const PROJECT_MEMORY_TYPE_META = {
+  fact: { label: '项目事实', tone: 'blue' },
+  decision: { label: '技术决策', tone: 'purple' },
+  pattern: { label: '工程惯例', tone: 'green' },
+  procedure: { label: '流程步骤', tone: 'cyan' },
+  constraint: { label: '项目约束', tone: 'orange' },
+  'failure-resolution': { label: '故障处理', tone: 'red' },
+};
+
+function projectMemoryTypeLabel(type) {
+  return PROJECT_MEMORY_TYPE_META[type]?.label ?? type ?? '项目记忆';
+}
+
+function ProjectMemoryPanel({ summary, readOnly = false, onInvoke }) {
+  const [searchText, setSearchText] = useState('');
+  const [selectedSlug, setSelectedSlug] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailPending, setDetailPending] = useState(false);
+  const [detailError, setDetailError] = useState(null);
+  const entries = useMemo(
+    () => (Array.isArray(summary?.entries) ? summary.entries : []),
+    [summary?.entries],
+  );
+  const visibleEntries = useMemo(() => {
+    const search = searchText.trim().toLocaleLowerCase('zh-CN');
+    if (!search) return entries;
+    return entries.filter((entry) =>
+      [entry.title, entry.description, entry.slug, projectMemoryTypeLabel(entry.type)]
+        .filter(Boolean)
+        .join(' ')
+        .toLocaleLowerCase('zh-CN')
+        .includes(search),
+    );
+  }, [entries, searchText]);
+  const selectedEntry =
+    visibleEntries.find((entry) => entry.slug === selectedSlug) ?? visibleEntries[0] ?? null;
+  const selectedKey = selectedEntry?.slug ?? null;
+  useEffect(() => {
+    if (selectedKey !== selectedSlug) setSelectedSlug(selectedKey);
+  }, [selectedKey, selectedSlug]);
+  useEffect(() => {
+    let cancelled = false;
+    setDetail(null);
+    setDetailError(null);
+    if (!selectedEntry) {
+      setDetailPending(false);
+      return undefined;
+    }
+    setDetailPending(true);
+    onInvoke('memory-get', { slug: selectedEntry.slug })
+      .then((result) => {
+        if (cancelled) return;
+        if (result?.kind !== 'memory') setDetailError('项目记忆内容读取失败');
+        else setDetail(result);
+      })
+      .catch((error) => {
+        if (!cancelled)
+          setDetailError(error instanceof Error ? error.message : '项目记忆内容读取失败');
+      })
+      .finally(() => {
+        if (!cancelled) setDetailPending(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onInvoke, selectedEntry?.slug, summary?.total]);
+  const directory = summary?.directory ?? '';
+  const emptyDescription = searchText.trim()
+    ? '没有匹配的项目记忆'
+    : '还没有项目记忆。任务结束时 Agent 会把验证过、可复用的经验通过 comet knowledge remember 写入这里。';
+  return (
+    <div className="dashboard-project-memory">
+      <section className="dashboard-memory-registry" aria-label="项目记忆列表">
+        <div className="dashboard-memory-registry-toolbar">
+          <div>
+            <span className="dashboard-contextual-title">
+              <strong>项目记忆</strong>
+              <CompactHelpButton
+                ariaLabel="了解项目记忆"
+                title="项目记忆"
+                description="项目记忆是 Agent 在任务结束时直接写入的可复用经验"
+                example="与项目知识不同：写入不经过评审队列，索引每次任务都会注入给 Agent。"
+              />
+            </span>
+            <span>
+              {visibleEntries.length} 条
+              {typeof summary?.applicationCount === 'number' && summary.applicationCount > 0
+                ? ` · 已随任务注入 ${summary.applicationCount} 次`
+                : ''}
+              {summary?.lastApplication
+                ? ` · 最近注入 ${formatTimestamp(summary.lastApplication.appliedAt)}`
+                : ''}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              className="dashboard-project-memory-search"
+              value={searchText}
+              prefix={<SearchOutlined />}
+              allowClear
+              placeholder="搜索标题、摘要或记忆标识"
+              aria-label="搜索项目记忆"
+              onChange={(event) => setSearchText(event.target.value)}
+            />
+          </div>
+        </div>
+        <div className="dashboard-memory-table-head" aria-hidden="true">
+          <span>记忆标题与摘要</span>
+          <span>类型</span>
+          <span>更新时间</span>
+          <span />
+        </div>
+        <div className="dashboard-memory-table-body">
+          {visibleEntries.length === 0 ? (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={emptyDescription} />
+          ) : (
+            visibleEntries.map((entry) => {
+              const isSelected = selectedEntry?.slug === entry.slug;
+              return (
+                <div
+                  key={entry.slug}
+                  className={`dashboard-memory-table-row dashboard-project-memory-row${
+                    isSelected ? ' is-selected' : ''
+                  }`}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={isSelected}
+                  onClick={() => setSelectedSlug(entry.slug)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      setSelectedSlug(entry.slug);
+                    }
+                  }}
+                >
+                  <div className="dashboard-memory-table-copy">
+                    <div className="dashboard-memory-table-title-row">
+                      <strong>{entry.title}</strong>
+                      <span className="dashboard-record-origin">{entry.slug}</span>
+                    </div>
+                    <p>{entry.description}</p>
+                  </div>
+                  <div className="dashboard-project-memory-type">
+                    <Tag color={PROJECT_MEMORY_TYPE_META[entry.type]?.tone}>
+                      {projectMemoryTypeLabel(entry.type)}
+                    </Tag>
+                  </div>
+                  <div className="dashboard-memory-table-time">
+                    {formatTimestamp(entry.updated)}
+                  </div>
+                  <div className="dashboard-memory-record-actions">
+                    <Tooltip title="删除项目记忆">
+                      <Button
+                        size="small"
+                        type="text"
+                        danger
+                        icon={<DeleteOutlined />}
+                        aria-label={`删除项目记忆 ${entry.title}`}
+                        disabled={readOnly}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onInvoke('forget', { memory: entry.slug });
+                        }}
+                      />
+                    </Tooltip>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+        {directory && (
+          <div className="dashboard-project-memory-foot" title={directory}>
+            存储位置：{directory}
+          </div>
+        )}
+      </section>
+      <aside className="dashboard-memory-inspector" aria-label="项目记忆详情">
+        {selectedEntry ? (
+          <>
+            <div className="dashboard-memory-inspector-head">
+              <span>{projectMemoryTypeLabel(selectedEntry.type)}</span>
+              <strong>{selectedEntry.title}</strong>
+              <p>{selectedEntry.description}</p>
+            </div>
+            {detailPending ? (
+              <Skeleton active paragraph={{ rows: 6 }} />
+            ) : detailError ? (
+              <Alert type="warning" showIcon message="记忆内容暂不可用" description={detailError} />
+            ) : (
+              <section>
+                <h4>记忆内容</h4>
+                <pre className="dashboard-project-memory-body">{detail?.body ?? ''}</pre>
+              </section>
+            )}
+            <section>
+              <h4>记忆信息</h4>
+              <div className="dashboard-memory-inspector-list">
+                <div>
+                  <span>记忆标识</span>
+                  <strong>{selectedEntry.slug}</strong>
+                </div>
+                <div>
+                  <span>创建时间</span>
+                  <strong>{formatTimestamp(selectedEntry.created)}</strong>
+                </div>
+                <div>
+                  <span>更新时间</span>
+                  <strong>{formatTimestamp(selectedEntry.updated)}</strong>
+                </div>
+                {(selectedEntry.paths ?? []).length > 0 && (
+                  <div>
+                    <span>相关路径</span>
+                    <strong>{selectedEntry.paths.join('、')}</strong>
+                  </div>
+                )}
+                {selectedEntry.source && (
+                  <div>
+                    <span>来源</span>
+                    <strong>{selectedEntry.source}</strong>
+                  </div>
+                )}
+              </div>
+            </section>
+            <section>
+              <h4>使用方式</h4>
+              <div className="dashboard-memory-inspector-list">
+                <div>
+                  <span>Agent 展开</span>
+                  <strong>--expand-context &quot;project-memory:{selectedEntry.slug}&quot;</strong>
+                </div>
+              </div>
+            </section>
+            <div className="dashboard-project-memory-inspector-actions">
+              <Button
+                danger
+                icon={<DeleteOutlined />}
+                disabled={readOnly}
+                onClick={() => onInvoke('forget', { memory: selectedEntry.slug })}
+              >
+                删除这条项目记忆
+              </Button>
+            </div>
+          </>
+        ) : (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="选择一条项目记忆查看完整内容" />
+        )}
+      </aside>
+    </div>
+  );
+}
+
 function ProjectKnowledgeCenter({ page, data, readOnly = false, onInvoke }) {
   const snapshot = data && typeof data === 'object' ? data : {};
   const [workspaceTab, setWorkspaceTab] = useState('model');
@@ -6755,6 +7133,10 @@ function ProjectKnowledgeCenter({ page, data, readOnly = false, onInvoke }) {
           toggleLabel: () => '查看项目知识详情',
         }}
         onSelectItem={(item) => {
+          if (item.id === 'project-memory-index') {
+            setWorkspaceTab('memory');
+            return;
+          }
           if (records.some((record) => record.id === item.id)) setSelectedRecordId(item.id);
         }}
       />
@@ -6762,6 +7144,7 @@ function ProjectKnowledgeCenter({ page, data, readOnly = false, onInvoke }) {
         {[
           ['model', '项目概况'],
           ['policy', '项目规范'],
+          ['memory', '项目记忆'],
           ['history', '历史版本'],
           ['sources', '检索语料'],
           ['query', '检索测试'],
@@ -6838,6 +7221,12 @@ function ProjectKnowledgeCenter({ page, data, readOnly = false, onInvoke }) {
           onSelectSource={selectSource}
           onCloseSource={closeSource}
           onSelectRecord={selectSourceRecord}
+        />
+      ) : workspaceTab === 'memory' ? (
+        <ProjectMemoryPanel
+          summary={snapshot.projectMemory}
+          readOnly={readOnly}
+          onInvoke={onInvoke}
         />
       ) : (
         <ProjectKnowledgeQuery
@@ -7072,6 +7461,9 @@ function PersonalMemoryCenter({ data, readOnly = false, onInvoke }) {
   const provider = status.provider?.provider ?? 'local';
   const learningDiagnostic = personalMemoryLearningDiagnostic(status.learning, status);
   const learningDetails = personalMemoryLearningDetails(status.learning, status);
+  const learningCheckedAt = status.learning?.lastCheckedAt
+    ? formatTimestamp(status.learning.lastCheckedAt)
+    : '';
   const profileUsage = status.profile
     ? `个人偏好与事实 ${status.profile.usedChars} 字符 · 单次注入预算 ${status.profile.maxChars}`
     : provider === 'remote'
@@ -7379,11 +7771,22 @@ function PersonalMemoryCenter({ data, readOnly = false, onInvoke }) {
             })}
           </nav>
           <div className="dashboard-memory-filter-summary">
-            <div className="dashboard-memory-learning-diagnostic" role="status">
-              <span>最近学习检查</span>
-              <strong>{learningDiagnostic}</strong>
-              {learningDetails && <small>{learningDetails}</small>}
-            </div>
+            <Tooltip title={learningDetails || undefined} placement="right">
+              <div
+                className="dashboard-memory-learning-diagnostic"
+                role="status"
+                tabIndex={learningDetails ? 0 : undefined}
+              >
+                <span>最近学习检查</span>
+                <strong>{learningDiagnostic}</strong>
+                {learningCheckedAt && <small>{learningCheckedAt}</small>}
+                {learningDetails && (
+                  <span className="dashboard-memory-learning-diagnostic-details">
+                    {learningDetails}
+                  </span>
+                )}
+              </div>
+            </Tooltip>
             <div>
               <span
                 className={`dashboard-tool-state-dot ${
@@ -8037,7 +8440,7 @@ function DashboardChangeList({ visible, selectedId, onSelect, hasMore, pageLoadi
                 <div className="flex w-full items-center gap-2.5 text-left">
                   <div className="min-w-0 flex-1">
                     <strong className="block truncate">{change.displayName}</strong>
-                    <span className="mt-0.5 block text-xs text-meta">
+                    <span className="mt-0.5 block truncate whitespace-nowrap text-xs text-meta">
                       {phaseLabel(change.phase)} · {change.tasks.completed}/{change.tasks.total}
                     </span>
                     {change.workspace && !change.workspace.current ? (

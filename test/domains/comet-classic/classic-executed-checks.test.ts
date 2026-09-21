@@ -45,7 +45,7 @@ describe('Classic executed check evidence', () => {
       '-e',
       'process.exit(0)',
     );
-    const scan = vi.spyOn(checkSnapshot, 'checkInputFingerprint');
+    const scan = vi.spyOn(checkSnapshot, 'collectCheckSnapshot');
     const environment = vi.spyOn(checkSnapshot, 'checkEnvironmentFingerprint');
     const result = await cli(
       'check',
@@ -228,6 +228,33 @@ describe('Classic executed check evidence', () => {
     expect(result.exitCode).not.toBe(0);
   });
 
+  it('reports self-modified input paths and the outputs recovery action', async () => {
+    await readyVerify();
+    const code =
+      'require("fs").writeFileSync("build-id.json", JSON.stringify({ time: Date.now() }))';
+    const result = await cli(
+      'check',
+      'run',
+      'demo',
+      'verify',
+      '--local',
+      '--',
+      process.execPath,
+      '-e',
+      code,
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('Changed inputs: build-id.json');
+    expect(result.stderr).toContain('outputs');
+    expect(result.stderr).toContain('.comet/check-policy.json');
+
+    const guard = await cli('guard', 'demo', 'verify');
+    expect(guard.exitCode).not.toBe(0);
+    expect(guard.stderr).toContain('Changed inputs: build-id.json');
+    expect(guard.stderr).toContain('outputs');
+  });
+
   it('does not share a narrowed recovery snapshot with an unmatched security command', async () => {
     await fs.writeFile(
       path.join(root, '.comet/check-policy.json'),
@@ -296,6 +323,76 @@ describe('Classic executed check evidence', () => {
     expect((await cli('state', 'transition', 'demo', 'verify-pass')).exitCode).not.toBe(0);
   });
 
+  it('keeps evidence reusable across commits, staging and task checkbox ticks', async () => {
+    const git = (...args: string[]) => spawnSync('git', args, { cwd: root, stdio: 'ignore' });
+    const dir = path.join(root, 'openspec', 'changes', 'demo');
+    await readyVerify();
+    await fs.writeFile(path.join(dir, 'tasks.md'), '- [ ] implement\n');
+    git('init');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'Test');
+    git('add', '-A');
+    git('commit', '-m', 'baseline');
+    expect(
+      (await cli('check', 'run', 'demo', 'verify', '--local', '--', process.execPath, 'check.cjs'))
+        .exitCode,
+    ).toBe(0);
+    git('add', '-A');
+    git('commit', '-m', 'progress');
+    await fs.writeFile(path.join(dir, 'tasks.md'), '- [x] implement\n');
+    expect((await cli('guard', 'demo', 'verify')).exitCode).toBe(0);
+    await fs.writeFile(path.join(root, 'input.txt'), 'bad');
+    expect((await cli('guard', 'demo', 'verify')).exitCode).not.toBe(0);
+  });
+
+  it('scopes v2 policy evidence per command', async () => {
+    const dir = path.join(root, 'openspec', 'changes', 'demo');
+    await readyVerify();
+    await fs.writeFile(
+      path.join(root, '.comet', 'check-policy.json'),
+      JSON.stringify({
+        version: 2,
+        commands: [
+          {
+            argv: [process.execPath, 'check.cjs'],
+            cwd: '.',
+            files: ['input.txt', 'check.cjs'],
+            taskCheckboxes: 'include',
+          },
+          { argv: [process.execPath, '-e', 'process.exit(0)'], cwd: '.', files: ['check.cjs'] },
+        ],
+      }),
+    );
+    expect(
+      (await cli('check', 'run', 'demo', 'build', '--local', '--', process.execPath, 'check.cjs'))
+        .exitCode,
+    ).toBe(0);
+    expect(
+      (
+        await cli(
+          'check',
+          'run',
+          'demo',
+          'verify',
+          '--local',
+          '--',
+          process.execPath,
+          '-e',
+          'process.exit(0)',
+        )
+      ).exitCode,
+    ).toBe(0);
+    await fs.writeFile(path.join(root, 'input.txt'), 'changed');
+    // The verify command never declared input.txt, so its evidence survives.
+    expect((await cli('guard', 'demo', 'verify')).exitCode).toBe(0);
+    expect((await cli('guard', 'demo', 'build')).exitCode).not.toBe(0);
+    const recovered = await cli('state', 'check', 'demo', 'verify', '--recover', '--json');
+    expect(JSON.parse(recovered.stdout!).data.evidence.scopes).toEqual({
+      build: 'rerun-required',
+      verify: 'revalidated',
+    });
+  });
+
   it('revalidates local evidence on cold recovery and returns structured context', async () => {
     await readyVerify();
     await cli('check', 'run', 'demo', 'verify', '--local', '--', process.execPath, 'check.cjs');
@@ -309,7 +406,194 @@ describe('Classic executed check evidence', () => {
     expect((await cli('guard', 'demo', 'verify')).exitCode).toBe(0);
   });
 
-  it('shares one input scan across recovery scopes but refreshes it on the next recovery', async () => {
+  it('keeps incremental evidence inside the phase until a full check replaces it', async () => {
+    await readyVerify();
+    const incremental = await cli(
+      'check',
+      'run',
+      'demo',
+      'verify',
+      '--local',
+      '--incremental',
+      '--json',
+      '--',
+      process.execPath,
+      'check.cjs',
+    );
+    expect(incremental.exitCode, incremental.stderr).toBe(0);
+    expect(JSON.parse(incremental.stdout!).data.tier).toBe('incremental');
+    expect((await cli('guard', 'demo', 'verify')).exitCode).toBe(0);
+    const apply = await cli('guard', 'demo', 'verify', '--apply');
+    expect(apply.exitCode).not.toBe(0);
+    expect(`${apply.stdout ?? ''}${apply.stderr ?? ''}`).toContain('Incremental check evidence');
+    const full = await cli(
+      'check',
+      'run',
+      'demo',
+      'verify',
+      '--local',
+      '--json',
+      '--',
+      process.execPath,
+      'check.cjs',
+    );
+    expect(full.exitCode, full.stderr).toBe(0);
+    expect(JSON.parse(full.stdout!).data.tier).toBe('full');
+    expect((await cli('guard', 'demo', 'verify', '--apply')).exitCode).toBe(0);
+  });
+
+  it('explains cwd mismatch instead of reporting generic missing evidence', async () => {
+    await readyVerify();
+    await fs.mkdir(path.join(root, 'ui'));
+    const check = await cli(
+      'check',
+      'run',
+      'demo',
+      'verify',
+      '--local',
+      '--cwd',
+      'ui',
+      '--json',
+      '--',
+      process.execPath,
+      '-e',
+      'process.exit(0)',
+    );
+    expect(check.exitCode, check.stderr).toBe(0);
+    expect(JSON.parse(check.stdout!).data.cwd).toBe('ui');
+    const guard = await cli('guard', 'demo', 'verify');
+    expect(guard.exitCode).not.toBe(0);
+    const text = `${guard.stdout ?? ''}${guard.stderr ?? ''}`;
+    expect(text).toContain('No current Runtime verify evidence from this directory');
+    expect(text).toContain("ran in 'ui'");
+    expect(text).toContain("invocation directory '.'");
+    expect(text).toContain('npm --prefix');
+  });
+
+  it('prefers cwd mismatch guidance over detection hints for build evidence', async () => {
+    await readyVerify();
+    await fs.writeFile(
+      path.join(root, 'openspec', 'changes', 'demo', 'proposal.md'),
+      '# Proposal\n',
+    );
+    expect((await cli('state', 'set', 'demo', 'isolation', 'current')).exitCode).toBe(0);
+    await fs.mkdir(path.join(root, 'ui'));
+    const check = await cli(
+      'check',
+      'run',
+      'demo',
+      'build',
+      '--local',
+      '--cwd',
+      'ui',
+      '--json',
+      '--',
+      process.execPath,
+      '-e',
+      'process.exit(0)',
+    );
+    expect(check.exitCode, check.stderr).toBe(0);
+    const guard = await cli('guard', 'demo', 'build');
+    expect(guard.exitCode).not.toBe(0);
+    const text = `${guard.stdout ?? ''}${guard.stderr ?? ''}`;
+    expect(text).toContain("ran in 'ui'");
+    expect(text).toContain('npm --prefix');
+    expect(text).toContain('.comet/check-policy.json');
+    expect(text).not.toContain('Detection searched');
+  });
+
+  it('accepts subdirectory evidence when a v2 policy entry declares its cwd', async () => {
+    await readyVerify();
+    await fs.mkdir(path.join(root, 'ui'));
+    await fs.writeFile(
+      path.join(root, '.comet/check-policy.json'),
+      JSON.stringify({
+        version: 2,
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], cwd: 'ui' }],
+      }),
+    );
+    const check = await cli(
+      'check',
+      'run',
+      'demo',
+      'verify',
+      '--local',
+      '--cwd',
+      'ui',
+      '--json',
+      '--',
+      process.execPath,
+      '-e',
+      'process.exit(0)',
+    );
+    expect(check.exitCode, check.stderr).toBe(0);
+    expect((await cli('guard', 'demo', 'verify')).exitCode).toBe(0);
+    expect((await cli('guard', 'demo', 'verify', '--apply')).exitCode).toBe(0);
+  });
+
+  it('rejects evidence recorded in an undeclared directory despite other policy entries', async () => {
+    await readyVerify();
+    await fs.mkdir(path.join(root, 'ui'));
+    await fs.mkdir(path.join(root, 'api'));
+    await fs.writeFile(
+      path.join(root, '.comet/check-policy.json'),
+      JSON.stringify({
+        version: 2,
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], cwd: 'ui' }],
+      }),
+    );
+    const check = await cli(
+      'check',
+      'run',
+      'demo',
+      'verify',
+      '--local',
+      '--cwd',
+      'api',
+      '--json',
+      '--',
+      process.execPath,
+      '-e',
+      'process.exit(0)',
+    );
+    expect(check.exitCode, check.stderr).toBe(0);
+    const guard = await cli('guard', 'demo', 'verify');
+    expect(guard.exitCode).not.toBe(0);
+    const text = `${guard.stdout ?? ''}${guard.stderr ?? ''}`;
+    expect(text).toContain("ran in 'api'");
+    expect(text).toContain("declare this command with cwd 'api'");
+  });
+
+  it('requires a full rerun when recovering incremental evidence', async () => {
+    await readyVerify();
+    await cli(
+      'check',
+      'run',
+      'demo',
+      'verify',
+      '--local',
+      '--incremental',
+      '--',
+      process.execPath,
+      'check.cjs',
+    );
+    const recovered = await cli('state', 'check', 'demo', 'verify', '--recover', '--json');
+    expect(JSON.parse(recovered.stdout!).data.evidence.scopes.verify).toBe('rerun-required');
+  });
+
+  it('explains invalidated evidence with the changed input paths', async () => {
+    await readyVerify();
+    await cli('check', 'run', 'demo', 'verify', '--local', '--', process.execPath, 'check.cjs');
+    await fs.writeFile(path.join(root, 'input.txt'), 'bad');
+    const guard = await cli('guard', 'demo', 'verify');
+    expect(guard.exitCode).not.toBe(0);
+    const text = `${guard.stdout ?? ''}${guard.stderr ?? ''}`;
+    expect(text).toContain('Why:');
+    expect(text).toContain('input.txt');
+    expect(text).toContain('default whole-tree inputs');
+  });
+
+  it('revalidates each recovery scope against its recorded inputs and refreshes on change', async () => {
     await readyVerify();
     for (const scope of ['build', 'verify']) {
       const check = await cli(
@@ -324,21 +608,22 @@ describe('Classic executed check evidence', () => {
       );
       expect(check.exitCode, check.stderr).toBe(0);
     }
-    const scan = vi.spyOn(checkSnapshot, 'checkInputFingerprint');
+    const scan = vi.spyOn(checkSnapshot, 'collectCheckSnapshot');
     const first = await cli('state', 'check', 'demo', 'verify', '--recover', '--json');
     expect(first.exitCode, first.stderr).toBe(0);
     expect(JSON.parse(first.stdout!).data.evidence.scopes).toEqual({
       build: 'revalidated',
       verify: 'revalidated',
     });
-    expect(scan).toHaveBeenCalledTimes(1);
+    // Each scope diffs against its own execution-time manifest.
+    expect(scan).toHaveBeenCalledTimes(2);
     await fs.writeFile(path.join(root, 'input.txt'), 'bad');
     const second = await cli('state', 'check', 'demo', 'verify', '--recover', '--json');
     expect(JSON.parse(second.stdout!).data.evidence.scopes).toEqual({
       build: 'rerun-required',
       verify: 'rerun-required',
     });
-    expect(scan).toHaveBeenCalledTimes(2);
+    expect(scan).toHaveBeenCalledTimes(4);
   });
 
   it.each(['non-local', 'changed-input', 'damaged-log'])(
@@ -519,6 +804,58 @@ describe('Classic executed check evidence', () => {
         .exitCode,
     ).not.toBe(0);
     expect((await cli('guard', 'demo', 'verify')).exitCode).not.toBe(0);
+  });
+
+  it('preserves and reruns an interrupted check instead of inferring another build', async () => {
+    const changeDir = path.join(root, 'openspec', 'changes', 'demo');
+    await fs.writeFile(path.join(changeDir, 'tasks.md'), '- [x] implement\n');
+    await fs.writeFile(path.join(changeDir, 'proposal.md'), '# Proposal\n');
+    await cli('state', 'set', 'demo', 'isolation', 'current');
+    const stateFile = path.join(changeDir, '.comet.yaml');
+    await fs.writeFile(
+      stateFile,
+      (await fs.readFile(stateFile, 'utf8')).replace('phase: open', 'phase: build'),
+    );
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({
+        scripts: {
+          build: "node -e \"require('fs').writeFileSync('unexpected-build', 'yes')\"",
+        },
+      }),
+    );
+    // A symbolic link in the input scope makes the snapshot throw after the
+    // started event is written, leaving the interrupted-attempt tombstone
+    // behind. A junction works without Windows developer-mode privileges.
+    await fs.mkdir(path.join(root, 'linked-dir'));
+    await fs.symlink(
+      path.join(root, 'linked-dir'),
+      path.join(root, 'alias-link'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    const check = await cli(
+      'check',
+      'run',
+      'demo',
+      'build',
+      '--local',
+      '--',
+      process.execPath,
+      'check.cjs',
+    );
+    expect(check.exitCode).not.toBe(0);
+    expect(`${check.stdout ?? ''}${check.stderr ?? ''}`).toContain('check-policy.json');
+    const guard = await cli('guard', 'demo', 'build');
+    expect(guard.exitCode).not.toBe(0);
+    expect(`${guard.stdout ?? ''}${guard.stderr ?? ''}`).toContain('did not complete');
+    expect(`${guard.stdout ?? ''}${guard.stderr ?? ''}`).toContain('comet check rerun demo build');
+    await expect(fs.stat(path.join(root, 'unexpected-build'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    await fs.rm(path.join(root, 'alias-link'), { recursive: true, force: true });
+    const rerun = await cli('check', 'rerun', 'demo', 'build');
+    expect(rerun.exitCode, rerun.stderr).toBe(0);
   });
 
   it('does not rebuild after an explicit successful build check', async () => {

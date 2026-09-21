@@ -2,9 +2,14 @@ import { spawnSync } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { ensureCliBuilt } from '../helpers/ensure-cli-built.js';
 
 const temporary: string[] = [];
+
+beforeAll(async () => {
+  await ensureCliBuilt(process.cwd());
+}, 120_000);
 
 async function snapshotTree(root: string): Promise<string[]> {
   const entries: string[] = [];
@@ -74,8 +79,11 @@ async function createPackSource(): Promise<string> {
   if (archived.status !== 0) {
     throw new Error(`git archive failed: ${archived.stderr || archived.stdout}`);
   }
-  const extracted = spawnSync('tar', ['-xf', archive, '-C', source], {
-    cwd: process.cwd(),
+  // Extract with paths relative to the archive directory: GNU tar reads a
+  // leading `C:` in an argument as a remote hostname ("Cannot connect to
+  // C: resolve failed"), so absolute Windows paths must not reach argv.
+  const extracted = spawnSync('tar', ['-xf', 'repository.tar', '-C', 'source'], {
+    cwd: root,
     encoding: 'utf8',
   });
   if (extracted.status !== 0) {

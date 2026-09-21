@@ -2,11 +2,45 @@
 
 All notable changes to @rpamis/comet will be documented in this file.
 
-## What's Changed [0.4.2] - 2026-09-17
+## What's Changed [0.4.2] - 2026-09-21
+
+### Added
+
+- **On-demand Runtime daemon**: Reuse a project-scoped Node process for read-only Classic and Native queries with `comet daemon start|status|stop`, bounded IPC, permission isolation, idle shutdown, and automatic fallback when the daemon is unavailable.
+- **ZCode Hook integration**: `comet init` and `comet update` install the phase guard for project installs in `.zcode/config.json` and for global installs in `~/.zcode/cli/config.json`, preserve unrelated user settings, and let `comet doctor` inspect and repair the managed entry.
+- **Classic check policy v2 and incremental checks**: Declare per-command input files, outputs, working directories, and wildcard scopes in `.comet/check-policy.json`; use `comet check run --incremental` for phase-local evidence while full checks remain required before advancing a phase.
+- **Native document and source coverage rules**: Shape confirmation now requires complete formal documents and canonical Specs, while source review can stay within the user-selected sections and their necessary dependencies with actionable repair guidance.
+- **Native verification handoff**: Builder handoffs can submit a final check plan for Runtime to execute or reuse, and Native status records whether an independently dispatched Verifier actually started.
+- **Monorepo build discovery**: Classic Guard can find the single workspace package that provides the build command and records the exact directory used.
+- **Configurable Project Knowledge limits**: Set Local Provider per-file and total Markdown corpus limits in `.comet/config.yaml` or Dashboard settings.
+- **Project memory commands**: Record durable project-scoped memories with `comet knowledge remember` as a file-based `MEMORY.md` index plus one Markdown per lesson; the index is injected in full with every task context, single entries expand via `--expand-context "project-memory:<slug>"`, and `comet knowledge forget --memory <slug>` removes stale ones. The project-knowledge Dashboard page adds a read-only project memory tab to browse, search, inspect, and delete these memories, and shows when the memory index was delivered to the agent in the recently-used list. The index is read before provider retrieval so a Local/Remote provider outage cannot drop it, `MEMORY.md` is ordered newest first so a tight context budget drops the oldest lessons, and `comet task --complete` reminds the agent in its tool response to record reusable lessons.
+
+### Changed
+
+- **Evidence follows real inputs**: Classic and Native check reuse now tracks the files, generated outputs, working directory, and execution environment that a command actually depends on. Documentation edits are neutral by default, while strict and explicit policies remain available; stale evidence reports changed paths and the exact rerun command.
+- **Large repository support**: Check, archive, and Runtime document hashing streams content and no longer applies the former fixed file-size caps. Native snapshot and generated-input budgets are configurable and default higher for repositories with large assets.
+- **Workflow selection and CLI guidance**: `comet init` recommends Native while explaining when Classic is preferable. `native select`, root help, decision prompts, and stale-state responses now return complete status and executable next steps.
+- **Hook and workflow responsiveness**: Hooks validate only the selected change, attribute protected paths to their owner, read stdin asynchronously, and keep optional context retrieval out of the write path. Repeated selections, checks, and phase transitions avoid redundant scans and executions.
+- **Archive and recovery flow**: Native can record a finish choice and archive in one confirmed command. Lock, subprocess, check, and delivery recovery now reports the owner, workspace, changed inputs, and safe retry command, including cross-device and interrupted-process cases.
+- **Installation lifecycle**: Init, update, and Doctor validate every packaged Skill, Rule, and Hook, recover damaged project registries, and continue safe all-project updates after an individual global update failure.
 
 ### Fixed
 
+- **Workflow convergence**: Stale or interrupted Classic evidence no longer masquerades as success, and `comet check rerun` repeats the recorded command. Native preserves valid candidates through recoverable failures, prevents duplicate recovery loops, and keeps archive selections and delivery fences consistent.
+- **Supervisor and worktree recovery**: Shape revisions no longer mark children ready before dependencies integrate; Doctor can repair the affected child state. Git branch and worktree identity checks also work across late Git initialization, linked worktrees, and Windows path aliases.
+- **Ambient Resume duplication**: Projects where `CLAUDE.md` imports `AGENTS.md` receive one managed recovery block, with update migration when an existing project contains duplicates (#433).
+- **Personal Memory pause and Dashboard summaries**: Paused projects no longer review or persist automatic observations, and the Dashboard keeps learning results and project-scoped totals aligned after switching projects (#440).
+- **Native confirmation and verifier recovery**: Shape drift is detected before stale requirements are confirmed, and a registered but never-started Verifier remains visible with a bounded recovery path.
+- **Package and Hook safety**: Incomplete npm assets fail with one actionable reinstall message; bounded Hook context failures emit a concise diagnostic while allowing the write to proceed; user Hook configuration and unrelated staged, working, and untracked files remain intact during managed operations.
 - **Global Native initialization**: Prepare native skill installation targets and remove legacy managed symlinks or junctions during global initialization, preventing retired-skill safety checks from reporting false failures when upgrading from Symlink mode.
+- **Classic delivery recovery**: Ambient Resume finds archived changes whose authorized delivery is still incomplete and routes the user back to the delivery step instead of treating the change as finished.
+- **Native Supervisor repair safety**: Doctor repairs stale Supervisor dependency states under the mutation lock so concurrent dispatch and integration cannot overwrite the recovery.
+
+### Security
+
+- **Vitest dependency security**: Upgrade Vitest, `@vitest/mocker`, and V8 coverage dependencies to 4.1.11 to remove the reachable path traversal and arbitrary file read vulnerability.
+- **AnyIO dependency security**: Upgrade the evaluation environment to AnyIO 4.14.2, including fixes for IDNA TLS certificate validation, supplementary process-group handling, and process-pool stderr deadlocks.
+- **Native document comment sanitization**: Use complete HTML comment scanning when validating Markdown documents and requirements, preventing malformed comment boundaries from bypassing visible-content checks.
 
 ## What's Changed [0.4.1] - 2026-09-14
 

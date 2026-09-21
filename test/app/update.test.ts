@@ -30,6 +30,7 @@ import {
   writeProjectConfig,
 } from '../../domains/comet-native/native-config.js';
 import { assertClassicLayoutReadable } from '../../domains/comet-classic/classic-layout.js';
+import * as platformInstall from '../../domains/skill/platform-install.js';
 
 // Mock the interactive select prompt so tests don't hang on CI (no TTY).
 vi.mock('@inquirer/prompts', () => ({
@@ -546,6 +547,21 @@ describe('update command helpers', () => {
     expect(JSON.parse(json).skills.targets).toEqual([
       expect.objectContaining({ scope: 'global', platform: 'codex' }),
     ]);
+  });
+
+  it('stops before updating installed assets when bundled assets are incomplete', async () => {
+    const projectDir = path.join(tmpDir, 'incomplete-package-assets');
+    const preflight = vi
+      .spyOn(platformInstall, 'assertBundledAssetsComplete')
+      .mockRejectedValueOnce(new Error('2 required assets are missing; reinstall Comet'));
+
+    await expect(
+      updateCommand(projectDir, { json: true, skipNpm: true, scope: 'global' }),
+    ).rejects.toThrow('2 required assets are missing; reinstall Comet');
+    expect(preflight).toHaveBeenCalledOnce();
+    await expect(fs.access(path.join(projectDir, '.comet'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
   });
 
   it('updates an explicitly scoped WorkBuddy project install and refreshes its project Hook', async () => {
@@ -1824,7 +1840,7 @@ describe('update command helpers', () => {
     expect(installCalls.some((call) => !(call[1]?.slice(1) ?? []).includes('-g'))).toBe(false);
   });
 
-  it('reports global npm update failure before updating all indexed projects', async () => {
+  it('continues updating indexed projects after one global npm update failure', async () => {
     const fakeHome = path.join(tmpDir, 'fake-home-global-npm-failure');
     const projectA = path.join(tmpDir, 'project-a-global-failure');
     const projectB = path.join(tmpDir, 'project-b-global-failure');
@@ -1855,12 +1871,11 @@ describe('update command helpers', () => {
       expect.objectContaining({
         projectPath: path.resolve(projectA),
         status: 'failed',
-        reason: expect.stringContaining('npm package update failed'),
+        reason: expect.stringContaining('EACCES permission denied'),
       }),
       expect.objectContaining({
         projectPath: path.resolve(projectB),
-        status: 'not_attempted',
-        reason: expect.stringContaining('global npm package update failed'),
+        status: 'updated',
       }),
     ]);
     expect(result.status).toBe('incomplete');
@@ -3732,6 +3747,58 @@ describe('update command helpers', () => {
     expect(claude).toContain('# User\n\nAlso keep this.');
     expect(agents).toContain('<comet-ambient-resume>');
     expect(claude).toContain('<comet-ambient-resume>');
+  });
+
+  it('migrates duplicate CLAUDE instructions during update and reports one changed file', async () => {
+    await fs.mkdir(path.join(tmpDir, '.comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(tmpDir, '.comet', 'config.yaml'),
+      [
+        'schema: comet.project.v1',
+        'default_workflow: native',
+        'workflows: [native]',
+        'ambient_resume: true',
+        'native:',
+        '  artifact_root: docs',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await fs.mkdir(path.join(tmpDir, '.claude', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(tmpDir, '.claude', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n\nUse this skill.',
+      'utf8',
+    );
+    await fs.writeFile(path.join(tmpDir, 'AGENTS.md'), '# User\n\nKeep this.\n', 'utf8');
+    const claudePath = path.join(tmpDir, 'CLAUDE.md');
+    await fs.writeFile(claudePath, '# User\n\nAlso keep this.\n', 'utf8');
+
+    const instructions = await import('../../domains/skill/project-instructions.js');
+    await instructions.installCometProjectInstructions(tmpDir, 'en');
+    const legacyClaude = await fs.readFile(claudePath, 'utf8');
+    await fs.writeFile(claudePath, `# User\n\n@AGENTS.md\n\n${legacyClaude}`, 'utf8');
+
+    const fakeHome = path.join(tmpDir, 'fake-home-migrated-instructions');
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    let json: string;
+    try {
+      await updateCommand(tmpDir, { json: true, skipNpm: true });
+      json = log.mock.calls.map((call) => call.join(' ')).join('\n');
+    } finally {
+      log.mockRestore();
+      homedirSpy.mockRestore();
+    }
+
+    const result = JSON.parse(json);
+    expect(result.projectInstructions.updated).toBe(1);
+    await expect(fs.readFile(path.join(tmpDir, 'AGENTS.md'), 'utf8')).resolves.toContain(
+      '<comet-ambient-resume>',
+    );
+    await expect(fs.readFile(claudePath, 'utf8')).resolves.toContain('@AGENTS.md');
+    await expect(fs.readFile(claudePath, 'utf8')).resolves.toContain('Also keep this.');
+    await expect(fs.readFile(claudePath, 'utf8')).resolves.not.toContain('<comet-ambient-resume>');
   });
 
   it('installs ambient resume instructions for Classic-only projects', async () => {

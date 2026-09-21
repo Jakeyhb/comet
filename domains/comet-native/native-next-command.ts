@@ -1,5 +1,11 @@
 import { inspectNativeChildren } from './native-children.js';
-import { nativePortableContinuation } from './native-portable-continuation.js';
+import {
+  nativePortableContinuation,
+  type NativePortableContinuationOptions,
+} from './native-portable-continuation.js';
+import { nativePortableCheckPlansFromLocal } from './native-portable-checks.js';
+import { nativeVerifierExecutionRefForState } from './native-local-execution.js';
+import { readNativeWorkspaceFinishJournal } from './native-workspace-finish.js';
 import { migrateNativeLegacyChangeToPortable } from './native-portable-migration-runtime.js';
 import {
   nativePortableWorkspaceMismatch,
@@ -25,7 +31,9 @@ import {
   inspectNativePortableAcceptanceDrift,
   isNativePortableChange,
   prepareNativePortableShapeConfirmation,
+  assertNativePortableDocuments,
   readNativePortableChange,
+  readNativePortableRuntime,
   recoverNativeSupervisorFinalVerificationOnResume,
   resolveNativePortableVerifierBlocker,
   returnNativePortableChangeToBuild,
@@ -91,7 +99,19 @@ async function portableParentView(
   paths: NativeProjectPaths,
   state: NativePortableState,
   verifierExecutionRef?: string,
+  verificationCheckPlans?: NativePortableContinuationOptions['verificationCheckPlans'],
+  retryCheckIds?: NativePortableContinuationOptions['retryCheckIds'],
 ) {
+  const runtime = await readNativePortableRuntime({ paths, name: state.name });
+  if (runtime.local) {
+    verifierExecutionRef ??= nativeVerifierExecutionRefForState(state, runtime.local);
+    if (verificationCheckPlans === undefined) {
+      verificationCheckPlans = nativePortableCheckPlansFromLocal(
+        runtime.local,
+        runtime.local.workspace.projectRoot,
+      );
+    }
+  }
   const children = await inspectNativeChildren({ paths, state });
   const supervisor = children?.confirmed
     ? await readNativeSupervisorState(paths, state.name, { diagnostics: true })
@@ -116,6 +136,8 @@ async function portableParentView(
       : {}),
     continuation: nativePortableContinuation(state, children, {
       verifierExecutionRef,
+      verificationCheckPlans,
+      retryCheckIds,
       supervisorIntegrationRetryIds,
     }),
   };
@@ -124,7 +146,12 @@ async function portableParentView(
 function compactRunnerResult<T extends { state: NativePortableState }>(result: T) {
   return Object.fromEntries(
     Object.entries(result).filter(
-      ([key]) => key !== 'state' && key !== 'response' && key !== 'supervisorState',
+      ([key]) =>
+        key !== 'state' &&
+        key !== 'response' &&
+        key !== 'supervisorState' &&
+        key !== 'continuationCheckPlans' &&
+        key !== 'continuationRetryCheckIds',
     ),
   ) as Omit<T, 'state' | 'response' | 'supervisorState'>;
 }
@@ -202,7 +229,59 @@ export async function nativeNextCommand(
   assertNoArguments(args);
 
   const configured = await configuredPaths(projectRoot);
+  const finishJournal = await readNativeWorkspaceFinishJournal(configured.paths, name);
   if (!(await isNativePortableChange(configured.paths, name))) {
+    if (finishJournal) {
+      const continuation = {
+        schema: 'comet.native.continuation.v2' as const,
+        skill: 'comet-native' as const,
+        change: name,
+        phase: 'archive' as const,
+        status: 'blocked' as const,
+        disposition: 'blocked' as const,
+        action: 'archive' as const,
+        commandArgs: finishJournal.result?.recoveryArgs ?? [
+          'comet',
+          'native',
+          'archive',
+          name,
+          '--confirmed',
+        ],
+        requiredInputs: [],
+        inputOptions: [],
+        runnerAction: {
+          kind: 'none' as const,
+          candidateId: null,
+          iteration: 0,
+          attempt: 0,
+        },
+        userCommunication: {
+          required: true,
+          message:
+            finishJournal.result?.message ??
+            'Native Archive completed, but workspace finish is still pending.',
+          suggestedReply: 'Retry workspace finish',
+          agentInstruction:
+            'Retry the recorded Native workspace finish command after resolving the Git blocker; do not treat this change as complete until it succeeds.',
+        },
+      };
+      return {
+        command: 'next',
+        exitCode: 73,
+        data: {
+          change: name,
+          archived: true,
+          workspaceFinishResult: finishJournal.result,
+          continuation,
+        },
+        error: {
+          code: 'conflict',
+          message:
+            finishJournal.result?.message ??
+            'Native Archive completed, but workspace finish is still pending',
+        },
+      };
+    }
     if (runnerInputFile) {
       throw new NativeUsageError('--runner-input is only valid for portable Native changes');
     }
@@ -326,6 +405,9 @@ export async function nativeNextCommand(
         input,
         projectRoot,
       });
+      if (initialState.document_constraints_version === 1) {
+        await assertNativePortableDocuments({ paths: configured.paths, state: initialState });
+      }
     } catch (error) {
       return {
         ...errorResult('next', error),
@@ -372,6 +454,7 @@ export async function nativeNextCommand(
           paths: configured.paths,
           name,
           reason: drift.reason ?? 'Native confirmed requirements changed',
+          keepFailureBudget: true,
         });
         return success('next', {
           state: nativePortableStateSummary(state, configured.paths),
@@ -392,6 +475,10 @@ export async function nativeNextCommand(
       input,
       maxVerifyFailures: configured.config.native.max_verify_failures,
     });
+    const continuationCheckPlans =
+      'continuationCheckPlans' in result ? result.continuationCheckPlans : undefined;
+    const continuationRetryCheckIds =
+      'continuationRetryCheckIds' in result ? result.continuationRetryCheckIds : undefined;
     return success('next', {
       ...compactRunnerResult(result),
       state: nativePortableStateSummary(result.state, configured.paths),
@@ -399,6 +486,8 @@ export async function nativeNextCommand(
         configured.paths,
         result.state,
         result.verifierDispatch?.verifierExecutionRef,
+        continuationCheckPlans,
+        continuationRetryCheckIds,
       )),
       coordination: NATIVE_SKILL_COORDINATION,
     });
@@ -514,10 +603,26 @@ export async function nativeNextCommand(
     });
   } else {
     if (recovery.reason !== 'available') {
+      // Recovery early exits must still surface in-flight Supervisor task
+      // packages (runId, worktree, base commit): after a crash the first
+      // `next` call lands here, and status redacts those fields — without
+      // them a multi-session operator cannot cancel or reconnect anything
+      // (issue: the only documented handle was unreachable on the first hop).
+      const children = await inspectNativeChildren({ paths: configured.paths, state: current });
+      const supervisor = children?.confirmed
+        ? await readNativeSupervisorState(configured.paths, current.name, { diagnostics: true })
+        : null;
+      const supervisorTasks =
+        supervisor?.children.flatMap(({ task }) =>
+          task
+            ? [projectNativeSupervisorTask(task, current.name, configured.paths.projectRoot)]
+            : [],
+        ) ?? [];
       return success('next', {
         state: nativePortableStateSummary(current, configured.paths),
         recovery: compactRecoveryResult(recovery),
         ...(await portableParentView(configured.paths, current)),
+        ...(supervisorTasks.length > 0 ? { supervisorTasks } : {}),
       });
     }
     if (current.phase === 'build') {
@@ -530,6 +635,7 @@ export async function nativeNextCommand(
           paths: configured.paths,
           name,
           reason: drift.reason ?? 'Native confirmed requirements changed',
+          keepFailureBudget: true,
         });
       } else {
         const children = await inspectNativeChildren({ paths: configured.paths, state: current });
@@ -596,6 +702,7 @@ export async function nativeNextCommand(
       state = await prepareNativePortableShapeConfirmation({
         paths: configured.paths,
         name,
+        enforceDocumentConstraints: true,
         ...(coordinationMode === undefined ? {} : { coordinationMode }),
         expectedContinuation,
       });

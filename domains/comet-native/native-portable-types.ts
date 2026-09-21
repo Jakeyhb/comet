@@ -160,6 +160,8 @@ export interface NativePortableState {
   status: NativePortableStatus;
   state_version: number;
   brief: 'brief.md';
+  /** Set on changes created or returned to Shape after the document contract was introduced. */
+  document_constraints_version?: 1;
   shape_confirmation_hash?: string;
   children_contract_hash?: string;
   coordination_mode?: NativeSupervisorCoordinationMode;
@@ -186,6 +188,16 @@ export interface NativeLocalExecutionState {
   candidateId?: string | null;
   /** Fingerprint of the candidate, workspace inputs and tool environment. */
   inputFingerprint?: string | null;
+  /**
+   * Gate over the same mutable inputs as the full fingerprint (HEAD, branch,
+   * dirty and untracked content, staged blob ids, ignored generated inputs,
+   * bound environment, machine identity). A matching gate proves the full
+   * fingerprint would recompute to the recorded value, so reuse skips hashing
+   * the clean tracked tree without overlooking generated inputs a check reads.
+   */
+  inputFingerprintGate?: string | null;
+  /** Fingerprint gate for candidate-owned inputs, excluding generated check inputs. */
+  candidateInputFingerprintGate?: string | null;
   workspace: {
     projectRoot: string;
     worktreeRoot: string;
@@ -201,6 +213,16 @@ export interface NativeLocalExecutionState {
     status: 'running' | 'completed' | 'interrupted';
     startedAt: string;
     requestCheckRounds: number;
+    /**
+     * First Runtime contact from the dispatched Verifier itself. Absent until
+     * the Verifier reports startup, so a registered attempt stays
+     * distinguishable from one that actually started.
+     */
+    verifierStartedAt?: string;
+    /** Host process that owns a running Runtime operation. Optional on legacy overlays. */
+    ownerPid?: number;
+    /** Process creation identity used to avoid PID reuse. */
+    ownerIdentity?: string;
   };
   checks: NativeLocalCheckState[];
 }
@@ -219,6 +241,9 @@ export interface NativeLocalCheckState {
   startedAt: string | null;
   completedAt: string | null;
   log: string;
+  /** Child process lifecycle persisted before and after spawn. */
+  activeProcess?:
+    null | { status: 'starting' } | { status: 'running'; pid: number; identity?: string };
   /** Set only by the Runtime after a real process completion. */
   evidence?: 'runtime';
   /** Digest tying the Runtime result fields to the captured log content. */

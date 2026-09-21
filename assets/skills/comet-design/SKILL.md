@@ -25,7 +25,9 @@ comet state select <change-name>
 comet state check <name> design --json
 ```
 
-After a successful check, use the returned layout, configuration, nextAction, and coordination progress summary. Avoid individual field queries or another root show. Normal entry requires only the entry check; follow context-recovery.md when resuming without context or retrieving details. Address the reported cause if validation fails.
+Combine multiple read-only comet commands (for example `state get`, `state next`, `state artifacts`) into a single shell invocation to reduce process startup overhead.
+
+When the previous phase's guard already returned this phase's state, continue from that state and `agent.continuation` without repeating select/check; run the entry checks above only when resuming, after workspace changes, or after external state changes. After a successful check, use the returned layout, configuration, nextAction, and coordination progress summary. Avoid individual field queries or another root show. Normal entry requires only the entry check; follow context-recovery.md when resuming without context or retrieving details. Address the reported cause if validation fails.
 
 **Recovery**: Check existing artifacts and confirmation records, then complete only unfinished steps. Both normal entry and recovery preserve a registered, still-valid design and inspect `data.designReadiness`, `data.issues`, and `data.nextAction`. Restore missing files, correct the change associated with a file, or refresh an outdated handoff without clearing `design_doc`. Once the user has confirmed the design, execute the returned complete-design action; it preserves completed work. If Runtime is already in Build, the command only returns that phase's entry information.
 
@@ -148,7 +150,13 @@ Present the necessary summary:
 - Test strategy.
 - Any Spec Patch changes to write back to delta specs.
 
-Continue to Step 2 only after explicit confirmation. If the user requests changes, continue brainstorming until they confirm the revised design.
+Offer these three options as a single-choice question:
+
+- **Approve the design**: continue to Step 2 with this design.
+- **Request changes**: continue brainstorming until the user confirms the revised design.
+- **Defer confirmation**: keep the brainstorming checkpoint and design proposal without creating the final Design Doc or advancing; the user confirms in a later invocation.
+
+Continue to Step 2 only after the user approves. If the user requests changes, continue brainstorming until they confirm the revised design.
 
 ### 1d. Save the Confirmed Design Summary
 

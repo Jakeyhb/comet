@@ -28,6 +28,7 @@ comet state delivery <change-name>
 comet state delivery <change-name> --verify
 comet state delivery <change-name> --file <json-path>
 comet check run <change-name> <build|verify> --local -- <program> [args...]
+comet check rerun <change-name> <build|verify>
 comet guard <change-name> <phase> --apply
 comet handoff <change-name> design --write
 comet archive <change-name>
@@ -69,6 +70,39 @@ comet state transition <change-name> preset-escalate
 
 Archive through `comet archive <change-name>`. OpenSpec first moves the change into a date-prefixed archive directory; Comet then records state. Update pre-archive confirmation through `archive-confirm` or `archive-reopen`. Do not manually run the `archived` transition outside the archive procedure.
 
+## Check Evidence and Input Declarations
+
+Check evidence reuses by "input scope": the default inputs are working-tree file contents. Commits, staging, ticking tasks.md checkboxes, and environment variable changes no longer invalidate evidence by default; when a build or test actually reads such information, declare the binding through `.comet/check-policy.json`.
+
+The same full command recorded with `--local` (matching argv, cwd, inputs, and environment) can be reused across Build and Verify. Runtime binds the existing evidence to the current phase and returns `reused=true`; do not rerun it merely because the phase name changed. An explicit failure, manual declaration, stale record, or cwd mismatch is reported with its recovery command before any detected build command is considered.
+
+After a Runtime-recorded command fails or is interrupted while snapshotting inputs or launching, use `comet check rerun <change-name> <build|verify>`. Runtime persists argv, cwd, timeout, and reuse tier before execution, so an interrupted attempt retries unchanged instead of running another auto-detected build or reconstructing shell syntax. Guard keeps showing a fresh `comet check run` template only for manual legacy records that have no Runtime argv.
+
+When guard reports evidence as not reusable, it prints the invalidation reason and the changed file list (`Why:`, `Changed inputs:`, `Relevance scope:`). Use that list to decide which command to rerun instead of rerunning everything.
+
+`--incremental` records phase-local evidence: guard previews accept it for quick confirmation, while `--apply` still requires one full rerun of the complete command before advancing the phase. The caller chooses the incremental command (for example, running only related tests); incremental evidence always requires a rerun after cold recovery.
+
+```bash
+comet check run <change-name> build --local -- <program> [args...]
+comet check run <change-name> verify --local --incremental -- <program> [args...]
+```
+
+`.comet/check-policy.json` declares an input scope per command. In the v2 format each command is scoped independently and only the entry matching `argv` and `cwd` applies; editing or adding other entries does not affect this command's existing evidence. `files` accepts literal paths and the `*`, `?`, and `**` wildcards; newly added matching files are picked up automatically without changing the declaration. When a build rewrites files inside its input area, declare those artifacts with `outputs`; Runtime excludes them from that command's input snapshot so the command does not invalidate itself:
+
+```json
+{
+  "version": 2,
+  "commands": [
+    { "argv": ["pnpm", "build"], "cwd": ".", "files": ["src/**", "package.json", "tsconfig.json"], "outputs": ["dist/**"], "git": "all" },
+    { "argv": ["vitest", "run"], "cwd": ".", "files": ["src/**", "test/**"] }
+  ]
+}
+```
+
+Omitted fields keep the defaults: `git` defaults to `none` (no HEAD or index binding), `env` binds no variables (the resolved executable path and its file identity plus the Node version always bind, so switching Node versions still invalidates evidence), and `taskCheckboxes` defaults to `ignore` (ticking tasks does not invalidate evidence; task text changes still do). Declare `git: "all"` when build artifacts embed a commit SHA, list variable names in `env` when the result depends on them, and declare `taskCheckboxes: "include"` when completion marks themselves affect the check result. The older v1 single-command format remains valid and keeps its original semantics.
+
+An entry's `cwd` also declares where that command's evidence belongs. By default the guard reuses only evidence whose cwd matches its own invocation directory; a command matched by a v2 entry may record evidence in the entry's declared `cwd` instead. When a build or verification entry point lives in a subdirectory, declare the command as actually executed (for example `{ "argv": ["npm", "run", "build"], "cwd": "ui/frontend" }`), record it with `--cwd ui/frontend`, and a guard invoked from the project root reuses it. Undeclared commands still require evidence from the guard's invocation directory.
+
 ## Resolving the Next Step
 
 After the phase Guard advances phase, follow auto-transition.md and prefer `agent.continuation` from the successful JSON result. The next phase can use this returned state without repeating next, select, or check. Query only when session recovery lacks context, external state changes, or an older result lacks this information:
@@ -77,7 +111,7 @@ After the phase Guard advances phase, follow auto-transition.md and prefer `agen
 comet state next <change-name>
 ```
 
-Output includes `NEXT: auto|manual|done`, `SKILL: <skill-name>` (omitted for `done`), and `HINT` (only for `manual`). `auto_transition: false` returns `manual`: it prevents automatic invocation of the next Skill without changing the phase already advanced.
+Output includes `NEXT: auto|manual|done|delivery`, `SKILL: <skill-name>` (omitted for `done`), and `HINT` (only for `manual`). `auto_transition: false` returns `manual`: it prevents automatic invocation of the next Skill without changing the phase already advanced. `delivery` means the change is archived: finish delivery from the delivery summary instead of advancing phases.
 
 ## Archive Command
 
@@ -95,7 +129,7 @@ After binding the Classic workspace and reading the current `.comet.yaml` `phase
 
 If `<active_policies>` includes `<verification command="...">`, add those commands to current Verify checks and record their actual results. Only commands that have actually passed can promote the corresponding policy to enforced.
 
-Use `comet memory remember ... --scope global|project` when the user explicitly asks to retain a preference or project convention long-term. Use `comet memory observe` only for stable collaboration habits reusable across tasks without an explicit request. Neither may store task summaries, progress, command output, or test results.
+Use `comet memory remember ... --scope global|project` when the user explicitly asks to retain a preference or project convention long-term. Use `comet memory observe --text "<preference>" --workflow <classic|native> --change <change-id> --candidate-key <change-id>-<behavior-slug>` only for stable collaboration habits reusable across tasks without an explicit request (all three options are required; build `--candidate-key` from the change ID plus a short behavior slug). Neither may store task summaries, progress, command output, or test results.
 
 Before every task ends, complete one learning check. If there is a user correction, preference, or collaboration habit with a clear reuse condition, call `comet memory observe` and pass `--learning-check submitted` to the completion command. If you checked and found no qualifying observation, pass `--learning-check no-observation`; if no check was performed, pass `--learning-check not-run`. The first observation creates only a `trial` candidate, while a second independent successful observation from another change may promote it. Use the observation JSON `learning.result` and `status.learning.lastCheck` to diagnose the result.
 

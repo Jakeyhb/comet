@@ -27,9 +27,11 @@ comet state select <change-name>
 comet state check <change-name> verify --json
 ```
 
-根据入口返回的 layout、configuration、nextAction、任务信息和协作进度摘要继续。已有检查结果和集成审查仍然有效时，只补未完成的工作，不重新执行整个阶段。丢失上下文后恢复任务，需要完整记录时，使用 --recover --details --json。验证失败时，处理返回的具体原因。
+多条只读 comet 命令（如 `state get`、`state next`、`state artifacts`）可以合并成一条 shell 调用依次执行，减少进程启动开销。
 
-若上述 `select` / `check` 输出 `BLOCKED`，且原因是 `bound_branch` 与当前分支不一致，立即按 `comet-classic/reference/decision-point.md` 暂停，让用户单选：切回绑定分支后重新运行入口验证，或在用户明确确认当前分支应接管该 change 后运行 `comet state rebind <change-name>` 并重新入口验证。不得自行切换分支，不得自行换绑。
+上一阶段 guard 已成功返回本阶段状态信息时，直接使用其中的状态与 `agent.continuation` 继续，不重复 select/check；恢复任务、工作区变化或外部状态变化时，才执行上述入口验证。根据入口返回的 layout、configuration、nextAction、任务信息和协作进度摘要继续。已有检查结果和集成审查仍然有效时，只补未完成的工作，不重新执行整个阶段。丢失上下文后恢复任务，需要完整记录时，使用 --recover --details --json。验证失败时，处理返回的具体原因。
+
+若上述 `select` / `check` 输出 `BLOCKED` 或分支绑定 `ERROR`，且原因是 `bound_branch` 与当前分支不一致，立即按 `comet-classic/reference/decision-point.md` 暂停，让用户单选：切回绑定分支后重新运行入口验证，或在用户明确确认当前分支应接管该 change 后运行 `comet state rebind <change-name>` 并重新入口验证。不得自行切换分支，不得自行换绑。
 
 **按已记录结果继续**：`verify_result` 已为 `pass` 时，进入 archive；在归档提交和最终分支处理完成前，`branch_status` 保持 `pending`。`verify_result` 为 `pending` 时，先核对已有报告和检查结果，再从未完成的检查继续。
 
@@ -49,7 +51,7 @@ comet state scale <change-name>
 
 验证开始前，按 `comet-classic/reference/dirty-worktree.md` 协议检查并处理未提交改动。verify 阶段的特殊处理：
 
-1. 未提交改动明确属于当前 change 时，将这些改动纳入本次验证；继续验证，但不在 verify 阶段修改或提交实现、测试、tasks、delta spec 或 Design Doc
+1. 未提交改动明确属于当前 change 时，将这些改动纳入本次验证；继续验证，但不在 verify 阶段修改或提交实现、测试、tasks、delta spec 或 Design Doc。纯文档编辑（comet-build 定义的中性文档集：仓库根目录的 Markdown 与 `LICENSE`/`NOTICE`/`AUTHORS`，以及 `docs/`、`doc/`、`documentation/`、`.github/` 下的 Markdown/`.txt`/`.rst`，OpenSpec 与 Superpowers 产物除外）可以在 verify 阶段正常完成——它们不是实现写入，默认不作废检查证据，也不需要 `verify-fail`
 2. 未提交改动只是 verify 本阶段的产物时，例如验证报告草稿，可以继续在 verify 阶段完成并记录状态
 3. 未提交改动表明代码已经实现、但 tasks.md 尚未勾选时，说明 build 的任务记录落后于实现；直接运行 `verify-fail` 返回 build，核对已有结果并更新任务状态，不得询问是否接受未完成任务
 4. 无法确认未提交改动的归属，或改动属于其他 change 时，按 dirty-worktree 协议说明为何需要停止；不要在尚未确定归属时让用户选择“继续/忽略”
@@ -92,10 +94,12 @@ comet state transition <change-name> verify-fail
 comet handoff <change-name> --hash-only
 ```
 
-- 将当前 hash 与入口的记录值比较；记录值未提供时才运行 `comet state get <change-name> handoff_hash`。两者相等且均非空、非 null 时，仅在上下文仍保留该版本内容的前提下复用；按当前验收点补读缺失章节，tasks 仍须核对勾选。
-- 若 `RECORDED_HASH` 为空、为 `null`、或与 `CURRENT_HASH` 不一致：产物已变化或 hash 未记录，正常读取所有所需文件全文。
+- 读取 stderr 中的 `[HANDOFF] status:` 结论并照此执行（stdout 的裸 hash 供脚本调用方使用，不要自行比对）：
+  - `FRESH`：复用上下文已有的产物内容，只补读当前验收点仍缺的章节，tasks 仍须核对勾选。
+  - `STALE (changed: <files>)`：先完整读取列出的变更产物，再按其内容验收；runtime 的 NEXT 若给出 `comet handoff <change-name> design --write`，先执行它再读取。
+  - 不带清单的 `STALE`：记录的 handoff 缺失或早于当前产物，正常读取所有所需文件全文。
 
-hash 相等不代表当前上下文仍保留该内容。丢失上下文后恢复任务、摘要被截断，或无法确认此前已读取内容时，应重新读取对应源文件；不能用 handoff 摘要代替尚未读取的验收条款。
+FRESH 不代表当前上下文仍保留该内容。丢失上下文后恢复任务、摘要被截断，或无法确认此前已读取内容时，应重新读取对应源文件；不能用 handoff 摘要代替尚未读取的验收条款。
 
 autonomous 直接按本 Skill 执行实际检查并记录结果，不强制加载外部验证 Skill；其他策略使用 Skill 工具加载 Superpowers `verification-before-completion`。任何策略都不能仅凭自评宣布验证通过。
 
@@ -111,14 +115,14 @@ Verify 负责整个 change 的唯一最终集成代码审查。Build 只保留�
 按以下 7 项进行检查：
 
 1. tasks.md 全部任务已完成 `[x]`
-2. 改动文件与 tasks.md 描述一致（`git diff --stat` / `git diff --cached --stat` / `git diff --stat <base-ref>...HEAD` 对照 tasks 内容）
+2. 改动文件与 tasks.md 描述一致（`git diff --stat` / `git diff --cached --stat` / `git diff --stat <base-ref>...HEAD` 对照 tasks 内容）；中性文档集内的纯文档编辑在对照结果旁说明即可，不作为实现不一致处理
 3. 编译通过（复用 Runtime 判定仍有效的 Build 证据；失效时重跑）
 4. 相关测试通过
 5. 无明显安全问题（无硬编码密钥、无新增 unsafe 操作）
 6. 最终集成代码审查已通过，或非 full autonomous 的 `review_mode: off` 跳过原因已记录；full autonomous 不允许跳过独立审查
 7. 核心成功场景、关键失败和边界场景，以及本次涉及的高风险功能要求均已验证通过；小改动也不可省略
 
-复用构建时，用 Build 相同的 cwd、程序和参数再次调用 `comet check run <change-name> build --local -- <program> [args...]`；Runtime 返回 `reused=true` 才算复用，输入或环境已变化时会真正重跑。不得仅凭旧对话中的“构建通过”跳过检查。
+复用构建时，用 Build 相同的 cwd、程序和参数再次调用 `comet check run <change-name> build --local -- <program> [args...]`；Runtime 返回 `reused=true` 才算复用，输入或环境已变化时会真正重跑。证据的 cwd 必须等于之后调用 guard 的目录（通常是项目根）；子目录构建用 `npm --prefix <subdir> run build` 这类从根可执行的形式记录，或在 `.comet/check-policy.json`（v2）中声明该命令的 cwd 后用 `--cwd <subdir>` 记录，否则守卫会拒绝并说明原因。不得仅凭旧对话中的“构建通过”跳过检查。证据按“输入面”判定：默认输入是工作区文件内容，commit、暂存、勾选任务和环境变量变化默认不作废证据；guard 报告证据失效时会给出原因和变化文件清单，按清单处理即可。Build 阶段留下的 `--incremental` 增量证据可用于预览确认，`--apply` 前必须用完整命令重新取得 full 证据。
 
 light/full 均必须通过 Runtime 执行真实验证命令。先记录将要写入的报告路径，避免将报告的修改也算作验证输入的变化；测试和验收检查完成后再填写结果：
 
@@ -129,7 +133,7 @@ comet check run <change-name> verify --local -- <program> [args...]
 
 只有确定性的本地检查才使用 `--local`。外部服务检查省略该参数，其结果只能用于一次成功的阶段转换：Guard 预览不会用掉该结果，`--apply` 会重新核对，并在转换成功后将其标记为不可再次使用。丢失上下文后恢复任务，或输入、环境发生变化时，仍由 Runtime 判断哪些检查需要重跑。
 
-Windows 普通 npm/pnpm shim 由平台适配器处理，包含 shell 元字符的 batch 参数会被拒绝。多条必要命令应通过项目已有验证入口统一执行；任何一条失败，入口都必须返回失败，不能用最后一条命令成功掩盖之前的失败。手工 `record-check` 只保存声明，不能据此自动推进阶段。verify 与 build 的检查结果彼此独立，不能互相替代；`COMET_SKIP_BUILD=1` 不能作为可核实的检查记录。需要查看日志时，按 `logRef` 读取。
+Windows 普通 npm/pnpm shim 由平台适配器处理，包含 shell 元字符的 batch 参数会被拒绝。多条必要命令应通过项目已有验证入口统一执行；任何一条失败，入口都必须返回失败，不能用最后一条命令成功掩盖之前的失败。手工 `record-check` 只保存声明，不能据此自动推进阶段，还会遮蔽之前有效的 Runtime 证据并要求重新 `comet check run`。不同检查要求的证据彼此独立；verify 与 build 的检查结果彼此独立，不能互相替代。只有 argv、cwd、输入、环境和语义完全相同的本地 full 命令才能由 Runtime 在 Build 与 Verify 之间复用。`COMET_SKIP_BUILD=1` 不能作为可核实的检查记录。需要查看日志时，按 `logRef` 读取。首次实际执行就通过 `comet check run` 完成；失败时修复后使用 `comet check rerun` 精确重试，成功后立即运行 guard，中间不插入任何 `comet state` 写入；提交放在 guard 通过之后。
 
 集成代码审查的输入限定为本次改动 diff、tasks.md 和必要测试结果；它不替代 spec 覆盖率、Design Doc 一致性或漂移检查。`review_mode: off` 只跳过自动 code review，不跳过构建、测试、安全检查或异常调试协议。
 
@@ -179,7 +183,7 @@ comet state transition <change-name> verify-fail
 **Spec 漂移处理**（用户决策点）：
 
 - 若检查项 6 发现矛盾（delta spec 有内容但 design doc 未体现），**必须以单选题形式暂停、展示处理方式并等待用户选择**，不得自动选择。选项：
-  - 选项 A：在 design doc 追加 "Implementation Divergence" 节记录偏差原因。选项 A 属于 verify 阶段允许产物；写入后不得因该 design doc 变更再次触发 Step 1b dirty-worktree 决策
+  - 选项 A：在 design doc 追加 "Implementation Divergence" 节记录偏差原因。选项 A 属于 verify 阶段允许产物；写入后不得因该 design doc 变更再次触发 Step 1b dirty-worktree 决策。design doc 属于检查输入（非中性文档），写入后必须重跑 `comet check run <change-name> verify --local -- <命令>`，再运行 `comet guard <change-name> verify --apply`
   - 选项 B：用户选择 B 后，运行 `comet state transition <change-name> verify-fail`，然后调用 `/comet-build`；由 `/comet-build` 的 Spec 增量更新规则加载 Superpowers `brainstorming` 更新 Design Doc + delta spec
   - 选项 C：确认偏差可接受，继续验证（归档时 design doc 将标记为 `superseded-by-main-spec`）
 

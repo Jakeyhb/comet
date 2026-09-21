@@ -1,15 +1,27 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import os from 'node:os';
+
+import { unlinkWithRetry } from './transient-retry.js';
 import path from 'node:path';
+import { inspectProcessLiveness, readProcessIdentity } from '../process/process-identity.js';
 
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const DEFAULT_LOCK_RETRY_MS = 20;
 const DEFAULT_MALFORMED_LOCK_STALE_MS = 5 * 60_000;
+/**
+ * An empty lock file means the creating process crashed between creating the file
+ * and writing its owner record — it never held the lock. A short grace covers the
+ * in-flight write, so waits recover in seconds instead of the malformed-stale span.
+ */
+const EMPTY_LOCK_GRACE_MS = 10_000;
 
 interface PluginStoreLockOwner {
   readonly pid: number;
   readonly nonce: string;
   readonly createdAt: number;
+  readonly hostname?: string;
+  readonly processIdentity?: string;
 }
 
 export interface RecoverableFileLockOptions {
@@ -25,9 +37,11 @@ export interface TextFileStore {
 
 export class JsonFileTextStore implements TextFileStore {
   private readonly filePath: string;
+  private readonly lockOptions: RecoverableFileLockOptions;
 
-  public constructor(filePath: string) {
+  public constructor(filePath: string, lockOptions: RecoverableFileLockOptions = {}) {
     this.filePath = path.resolve(filePath);
+    this.lockOptions = { ...lockOptions };
   }
 
   public async read(): Promise<string | null> {
@@ -47,7 +61,7 @@ export class JsonFileTextStore implements TextFileStore {
   }
 
   public async withLock<T>(operation: () => Promise<T>): Promise<T> {
-    return withRecoverableFileLock(`${this.filePath}.lock`, operation);
+    return withRecoverableFileLock(`${this.filePath}.lock`, operation, this.lockOptions);
   }
 }
 
@@ -62,10 +76,13 @@ export async function withRecoverableFileLock<T>(
   const timeoutMs = options.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? DEFAULT_LOCK_RETRY_MS;
   const malformedLockStaleMs = options.malformedLockStaleMs ?? DEFAULT_MALFORMED_LOCK_STALE_MS;
+  const processIdentity = await readProcessIdentity(process.pid);
   const owner: PluginStoreLockOwner = {
     pid: process.pid,
     nonce: randomUUID(),
     createdAt: Date.now(),
+    hostname: os.hostname(),
+    ...(processIdentity === null ? {} : { processIdentity }),
   };
   let acquired = false;
   while (!acquired) {
@@ -106,9 +123,16 @@ async function recoverAbandonedLock(
     return (error as NodeJS.ErrnoException).code === 'ENOENT';
   }
   const owner = parseLockOwner(content);
-  if (owner !== null && processIsAlive(owner.pid)) return false;
-  if (owner === null && Date.now() - Number(stat.mtimeMs) < malformedLockStaleMs) {
-    return false;
+  if (owner !== null) {
+    if (owner.hostname !== undefined && owner.hostname !== os.hostname()) return false;
+    const liveness = await inspectProcessLiveness(owner.pid, owner.processIdentity);
+    if (liveness !== 'dead') return false;
+  }
+  if (owner === null) {
+    const graceMs = content.trim().length === 0 ? EMPTY_LOCK_GRACE_MS : malformedLockStaleMs;
+    if (Date.now() - Number(stat.mtimeMs) < graceMs) {
+      return false;
+    }
   }
   try {
     if ((await fs.readFile(lockPath, 'utf8')) !== content) return false;
@@ -123,9 +147,16 @@ async function releaseOwnedLock(lockPath: string, nonce: string): Promise<void> 
   try {
     const owner = parseLockOwner(await fs.readFile(lockPath, 'utf8'));
     if (owner?.nonce !== nonce) return;
-    await fs.rm(lockPath);
+    await unlinkWithRetry(lockPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return;
+    // The operation itself already committed; a stuck lock file must not
+    // replace the success result. The empty-lock grace recovers it shortly.
+    process.stderr.write(
+      `[comet] warning: could not remove lock file ${lockPath} (${code ?? error}); it will be recovered automatically
+`,
+    );
   }
 }
 
@@ -137,21 +168,23 @@ function parseLockOwner(content: string): PluginStoreLockOwner | null {
       typeof value.nonce === 'string' &&
       value.nonce.length > 0 &&
       typeof value.createdAt === 'number' &&
-      Number.isFinite(value.createdAt)
-      ? { pid: Number(value.pid), nonce: value.nonce, createdAt: value.createdAt }
+      Number.isFinite(value.createdAt) &&
+      (value.hostname === undefined ||
+        (typeof value.hostname === 'string' && value.hostname.length > 0)) &&
+      (value.processIdentity === undefined ||
+        (typeof value.processIdentity === 'string' && value.processIdentity.length > 0))
+      ? {
+          pid: Number(value.pid),
+          nonce: value.nonce,
+          createdAt: value.createdAt,
+          ...(value.hostname === undefined ? {} : { hostname: value.hostname as string }),
+          ...(value.processIdentity === undefined
+            ? {}
+            : { processIdentity: value.processIdentity as string }),
+        }
       : null;
   } catch {
     return null;
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === 'EPERM' || code !== 'ESRCH';
   }
 }
 
@@ -180,9 +213,11 @@ class JsonFilePluginStorage {
 
 export class JsonFilePluginStorageStore {
   private readonly root: string;
+  private readonly lockOptions: RecoverableFileLockOptions;
 
-  public constructor(root: string) {
+  public constructor(root: string, lockOptions: RecoverableFileLockOptions = {}) {
     this.root = path.resolve(root);
+    this.lockOptions = { ...lockOptions };
   }
 
   public async open(
@@ -191,7 +226,9 @@ export class JsonFilePluginStorageStore {
     projectId?: string,
   ): Promise<JsonFilePluginStorage> {
     const fileName = `${safeSegment(pluginId)}-${safeSegment(scope)}-${safeSegment(projectId ?? 'global')}.json`;
-    return new JsonFilePluginStorage(new JsonFileTextStore(path.join(this.root, fileName)));
+    return new JsonFilePluginStorage(
+      new JsonFileTextStore(path.join(this.root, fileName), this.lockOptions),
+    );
   }
 }
 

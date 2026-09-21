@@ -5,6 +5,8 @@ export type ClassicArtifactLayout = 'legacy' | 'docs';
 export type ProjectConfigLanguage = 'en' | 'zh-CN';
 export type WorkflowNativeClarificationMode = 'sequential' | 'batch';
 export type WorkflowNativeArchiveConfirmation = 'automatic' | 'required';
+export type WorkflowNativeDocumentWrites = 'allow' | 'revert';
+export type WorkflowClassicDocumentEvidence = 'neutral' | 'strict';
 export type WorkflowNativeRootMoveCleanupKind =
   'forward-source' | 'restart-staging' | 'rollback-destination' | 'rollback-staging';
 
@@ -28,6 +30,8 @@ export interface WorkflowNativeSnapshotConfig {
   max_files: number;
   max_total_bytes: number;
   max_duration_ms: number;
+  /** Bounds Git selection records and physical enumeration nodes per snapshot. */
+  max_selection_records: number;
 }
 
 export interface WorkflowNativePullRequestFinishConfig {
@@ -60,6 +64,8 @@ export interface WorkflowKnowledgeRemoteConfig {
 
 export interface WorkflowKnowledgeLocalConfig {
   include: string[];
+  max_file_mb?: number;
+  max_total_mb?: number;
 }
 
 export interface WorkflowKnowledgeProjectConfig {
@@ -74,6 +80,7 @@ export interface WorkflowNativeProjectConfig {
   clarification_mode: WorkflowNativeClarificationMode;
   archive_confirmation: WorkflowNativeArchiveConfirmation;
   max_verify_failures: number;
+  document_writes?: WorkflowNativeDocumentWrites;
   snapshot: WorkflowNativeSnapshotConfig;
   finish?: WorkflowNativeFinishConfig;
   pending_root_move?: WorkflowNativePendingRootMove;
@@ -85,6 +92,7 @@ export interface WorkflowClassicProjectConfig {
   context_compression?: 'off' | 'beta';
   review_mode?: 'off' | 'standard' | 'thorough';
   auto_transition?: boolean;
+  document_evidence?: WorkflowClassicDocumentEvidence;
 }
 
 export interface WorkflowProjectConfig {

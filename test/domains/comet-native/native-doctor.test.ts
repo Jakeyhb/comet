@@ -86,7 +86,7 @@ describe('Native doctor', () => {
     await expect(fs.access(selection)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('reports an oversized selection without reading it unboundedly', async () => {
+  it('rejects an oversized selection before parsing untrusted content', async () => {
     const selection = nativeSelectionFile(paths);
     await fs.mkdir(path.dirname(selection), { recursive: true });
     await fs.writeFile(selection, Buffer.alloc(16 * 1024 + 1, 0x61));

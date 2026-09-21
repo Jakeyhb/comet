@@ -3,7 +3,11 @@ import { promises as fs } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runGitCommand } from '../../platform/process/git.js';
+import { gitStatusPaths, runGitCommand } from '../../platform/process/git.js';
+import {
+  inspectProcessLiveness,
+  readProcessIdentity,
+} from '../../platform/process/process-identity.js';
 import { canonicalHash } from './native-canonical-hash.js';
 import {
   executeNativeCheck,
@@ -77,6 +81,25 @@ export function nativeLocalCheckPlanKey(check: NativeLocalCheckState, projectRoo
   });
 }
 
+export function nativePortableCheckPlansFromLocal(
+  local: NativeLocalExecutionState,
+  projectRoot = local.workspace.projectRoot,
+): NativeCheckPlan[] {
+  return local.checks.map((check) => {
+    const [executable, ...argv] = check.argv;
+    if (!executable) throw new Error(`Native local check ${check.id} has no executable`);
+    return {
+      id: check.id,
+      name: check.name,
+      executable,
+      argv,
+      cwdRef: localCheckCwdRef(projectRoot, check.cwd),
+      timeoutMs: check.timeoutMs,
+      repeatable: check.repeatable,
+    };
+  });
+}
+
 export function sameNativeCheckPlan(
   local: NativeLocalExecutionState,
   plans: readonly NativeCheckPlan[],
@@ -116,6 +139,56 @@ export function sameNativeCheckCommands(
   );
 }
 
+export type NativePortableCheckExecutionLiveness =
+  'not-running' | 'running' | 'orphaned' | 'unknown';
+
+/**
+ * Inspect the owner and active child recorded for a local Runtime check operation.
+ * Missing identity metadata remains unknown so a stale overlay can never trigger a
+ * second check while the original process might still be alive.
+ */
+export async function inspectNativePortableCheckExecution(
+  local: NativeLocalExecutionState,
+): Promise<NativePortableCheckExecutionLiveness> {
+  const execution = local.execution;
+  if (execution === null || execution.status !== 'running') return 'not-running';
+  if (execution.ownerPid === undefined) return 'unknown';
+  // Probe failures land on 'unknown' instead of 'running': the doctor repair path
+  // can take those over, while a host whose probes never succeed no longer parks
+  // the change on an undying zombie owner.
+  const ownerLiveness = await inspectProcessLiveness(execution.ownerPid, execution.ownerIdentity);
+  if (ownerLiveness === 'alive') return 'running';
+
+  let unknown = ownerLiveness === 'unknown';
+  for (const check of local.checks) {
+    if (check.status !== 'running') continue;
+    const active = check.activeProcess;
+    if (!active || active.status === 'starting') {
+      unknown = true;
+      continue;
+    }
+    const liveness = await inspectProcessLiveness(active.pid, active.identity);
+    if (liveness === 'alive') return 'running';
+    if (liveness === 'unknown') unknown = true;
+  }
+  return unknown ? 'unknown' : 'orphaned';
+}
+
+function interruptNativePortableCheckExecution(
+  local: NativeLocalExecutionState,
+): NativeLocalExecutionState {
+  return {
+    ...local,
+    execution:
+      local.execution === null ? null : { ...local.execution, status: 'interrupted' as const },
+    checks: local.checks.map((check) =>
+      check.status === 'planned' || check.status === 'running'
+        ? { ...check, status: 'interrupted' as const, activeProcess: null }
+        : check,
+    ),
+  };
+}
+
 function localCheck(
   plan: NativeCheckPlan,
   operationId: string,
@@ -135,6 +208,7 @@ function localCheck(
     startedAt: null,
     completedAt: null,
     log: `logs/checks/${operationId}-${plan.id}.log`,
+    activeProcess: null,
   };
 }
 
@@ -168,9 +242,49 @@ function digestNativeCheckInput(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/**
+ * Stream-hash a file with the same digest semantics as hashing the base64 of
+ * its full content, without retaining the bytes. The file must stay stable
+ * while read, matching the previous read-then-restat contract.
+ */
+export async function digestNativeInputFileContent(
+  file: string,
+): Promise<{ digest: string; size: number }> {
+  const before = await fs.lstat(file);
+  if (!before.isFile()) {
+    throw new Error('Native check input must be a regular file');
+  }
+  const hash = createHash('sha256');
+  const handle = await fs.open(file, 'r');
+  let total = 0;
+  try {
+    const buffer = Buffer.allocUnsafe(NATIVE_INPUT_BASE64_CHUNK_BYTES);
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      hash.update(buffer.subarray(0, bytesRead).toString('base64'));
+    }
+  } finally {
+    await handle.close();
+  }
+  const after = await fs.lstat(file);
+  if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+    throw new Error('Native check input changed while reading');
+  }
+  return { digest: hash.digest('hex'), size: total };
+}
+
 const NATIVE_IGNORED_INPUT_MAX_FILES = 20_000;
 
-const NATIVE_IGNORED_INPUT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const NATIVE_IGNORED_INPUT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Chunk size for streamed base64 digests. It must stay divisible by 3 so that
+ * concatenating per-chunk base64 output equals base64-encoding the whole file,
+ * keeping the legacy sha256(base64(content)) digest semantics.
+ */
+const NATIVE_INPUT_BASE64_CHUNK_BYTES = 65_535;
 
 const NATIVE_GENERATED_INPUT_DIRECTORIES = [
   'build',
@@ -220,6 +334,70 @@ const NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES = new Set([
   'tmp',
 ]);
 
+// These files are Runtime bookkeeping. They change as a check is reserved and
+// completed, so treating them as candidate input makes the next invocation
+// invalidate its own binding. The project configuration remains an input and is
+// intentionally not excluded.
+const NATIVE_RUNTIME_INPUT_EXCLUSIONS = [
+  ':(exclude).comet/runtime/**',
+  ':(exclude).comet/current-change.json',
+] as const;
+
+const NATIVE_RUNTIME_MANAGED_FILES = new Set([
+  'comet-state.yaml',
+  'children.yaml',
+  'verification.md',
+]);
+
+function nativeRuntimeInputExclusions(projectRoot: string, managedArtifactRoot?: string): string[] {
+  if (!managedArtifactRoot) return [...NATIVE_RUNTIME_INPUT_EXCLUSIONS];
+  const artifactRef = path.relative(projectRoot, managedArtifactRoot).replaceAll('\\', '/');
+  if (path.isAbsolute(artifactRef) || artifactRef === '..' || artifactRef.startsWith('../')) {
+    return [...NATIVE_RUNTIME_INPUT_EXCLUSIONS];
+  }
+  const prefix = artifactRef === '' ? '' : `${artifactRef}/`;
+  return [
+    ...NATIVE_RUNTIME_INPUT_EXCLUSIONS,
+    ...['changes', 'archive'].flatMap((directory) =>
+      [...NATIVE_RUNTIME_MANAGED_FILES].map(
+        (file) => `:(exclude)${prefix}comet/${directory}/**/${file}`,
+      ),
+    ),
+  ];
+}
+
+function isNativeRuntimeInputPath(
+  relative: string,
+  projectRoot?: string,
+  managedArtifactRoot?: string,
+): boolean {
+  const normalized = relative.replaceAll('\\', '/').replace(/^\.\//u, '');
+  if (normalized === '.comet/current-change.json' || normalized.startsWith('.comet/runtime/')) {
+    return true;
+  }
+  if (
+    !projectRoot ||
+    !managedArtifactRoot ||
+    !NATIVE_RUNTIME_MANAGED_FILES.has(path.basename(normalized))
+  ) {
+    return false;
+  }
+  const target = path.resolve(projectRoot, ...normalized.split('/'));
+  const relativeToArtifact = path.relative(path.resolve(managedArtifactRoot), target);
+  if (
+    path.isAbsolute(relativeToArtifact) ||
+    relativeToArtifact === '..' ||
+    relativeToArtifact.startsWith(`..${path.sep}`)
+  ) {
+    return false;
+  }
+  const [, directory] = relativeToArtifact.split(path.sep);
+  return (
+    relativeToArtifact.startsWith(`comet${path.sep}`) &&
+    (directory === 'changes' || directory === 'archive')
+  );
+}
+
 function incompleteNativeIgnoredInputSnapshot(): NativeIgnoredInputSnapshot {
   return { complete: false, files: [] };
 }
@@ -239,6 +417,7 @@ function sensitiveNativeIgnoredInputPath(relative: string): boolean {
 async function nativeIgnoredCheckInputSnapshot(
   projectRoot: string,
   plans: readonly NativeCheckPlan[],
+  managedArtifactRoot?: string,
 ): Promise<NativeIgnoredInputSnapshot> {
   const cwdRefs = [...new Set(plans.map(({ cwdRef }) => cwdRef))];
   if (cwdRefs.length === 0) return { complete: true, files: [] };
@@ -271,6 +450,7 @@ async function nativeIgnoredCheckInputSnapshot(
   const files: NativeIgnoredInputFile[] = [];
   let totalBytes = 0;
   for (const relative of ignoredPaths) {
+    if (isNativeRuntimeInputPath(relative, projectRoot, managedArtifactRoot)) continue;
     const target = path.resolve(projectRoot, ...relative.split('/'));
     if (!isInsidePath(projectRoot, target) || sensitiveNativeIgnoredInputPath(relative)) {
       return incompleteNativeIgnoredInputSnapshot();
@@ -280,17 +460,9 @@ async function nativeIgnoredCheckInputSnapshot(
       if (!before.isFile() || totalBytes + before.size > NATIVE_IGNORED_INPUT_MAX_TOTAL_BYTES) {
         return incompleteNativeIgnoredInputSnapshot();
       }
-      const content = await fs.readFile(target);
-      const after = await fs.lstat(target);
-      if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
-        return incompleteNativeIgnoredInputSnapshot();
-      }
-      totalBytes += before.size;
-      files.push({
-        path: relative,
-        digest: digestNativeCheckInput(content.toString('base64')),
-        size: before.size,
-      });
+      const { digest, size } = await digestNativeInputFileContent(target);
+      totalBytes += size;
+      files.push({ path: relative, digest, size });
     } catch {
       return incompleteNativeIgnoredInputSnapshot();
     }
@@ -301,6 +473,7 @@ async function nativeIgnoredCheckInputSnapshot(
 async function nativePhysicalCheckInputSnapshot(
   projectRoot: string,
   plans: readonly NativeCheckPlan[],
+  managedArtifactRoot?: string,
 ): Promise<NativeIgnoredInputSnapshot> {
   const cwdRefs = [...new Set(plans.map(({ cwdRef }) => cwdRef))];
   const files = new Map<string, NativeIgnoredInputFile>();
@@ -324,6 +497,7 @@ async function nativePhysicalCheckInputSnapshot(
     entries.sort((left, right) => left.name.localeCompare(right.name, 'en'));
     for (const entry of entries) {
       const relative = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+      if (isNativeRuntimeInputPath(relative, projectRoot, managedArtifactRoot)) continue;
       if (entry.isDirectory() && NATIVE_PHYSICAL_INPUT_EXCLUDED_DIRECTORIES.has(entry.name)) {
         continue;
       }
@@ -346,14 +520,12 @@ async function nativePhysicalCheckInputSnapshot(
       try {
         const before = await fs.lstat(target);
         if (totalBytes + before.size > NATIVE_IGNORED_INPUT_MAX_TOTAL_BYTES) return false;
-        const content = await fs.readFile(target);
-        const after = await fs.lstat(target);
-        if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) return false;
-        totalBytes += before.size;
+        const { digest, size } = await digestNativeInputFileContent(target);
+        totalBytes += size;
         files.set(relative, {
           path: relative,
-          digest: digestNativeCheckInput(content.toString('base64')),
-          size: before.size,
+          digest,
+          size,
         });
         if (files.size > NATIVE_IGNORED_INPUT_MAX_FILES) return false;
       } catch {
@@ -411,10 +583,11 @@ function nativeLocalCheckEvidenceDigest(
   });
 }
 
-async function nativeCheckInputFingerprint(options: {
+export async function nativeCheckInputFingerprint(options: {
   state: NativePortableState;
   projectRoot: string;
   plans: readonly NativeCheckPlan[];
+  managedArtifactRoot?: string;
 }): Promise<string> {
   const gitSnapshot = {
     complete: true,
@@ -422,12 +595,16 @@ async function nativeCheckInputFingerprint(options: {
     head: null as string | null,
     branch: null as string | null,
     status: null as string | null,
-    diff: null as string | null,
+    diff: null as Array<{ path: string; digest: string | null }> | null,
     stagedDiff: null as string | null,
     submodules: null as string | null,
     untracked: [] as Array<{ path: string; digest: string | null; size: number | null }>,
     ignored: { complete: true, files: [] as NativeIgnoredInputFile[] },
     physical: { complete: true, files: [] as NativeIgnoredInputFile[] },
+    // An incomplete snapshot is represented deterministically. The fast gate
+    // below remains null in that case, which forces a fresh check execution;
+    // adding a random nonce here would make every retry look like a source edit
+    // and return a stable workspace to Build forever.
     reuseNonce: null as string | null,
   };
   let stableGitView = false;
@@ -441,17 +618,45 @@ async function nativeCheckInputFingerprint(options: {
       '-z',
       '--untracked-files=all',
       '--ignore-submodules=none',
+      '--',
+      ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
     ]);
-    gitSnapshot.diff = digestNativeCheckInput(
-      runGitCommand(options.projectRoot, ['diff', '--binary', 'HEAD', '--submodule=diff', '--']),
-    );
+    // The working-tree binding no longer digests a full `diff --binary` stream
+    // (megabytes of patch text on large trees). HEAD is bound separately, so
+    // naming the changed paths and hashing each one pins the same information:
+    // any working-tree difference changes the path set or one of the digests.
+    const changed = runGitCommand(options.projectRoot, [
+      'diff',
+      '--name-only',
+      '-z',
+      'HEAD',
+      '--',
+      ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
+    ])
+      .split('\0')
+      .filter(Boolean)
+      .sort();
+    gitSnapshot.diff = await mapWithConcurrency(changed, 4, async (relative) => {
+      const target = path.resolve(options.projectRoot, ...relative.split('/'));
+      try {
+        const { digest } = await digestNativeInputFileContent(target);
+        return { path: relative, digest };
+      } catch {
+        return { path: relative, digest: null };
+      }
+    });
+    if (gitSnapshot.diff.some(({ digest }) => digest === null)) {
+      gitSnapshot.complete = false;
+    }
+    // Staged content binds through index blob ids: `ls-files --stage` names each
+    // path with its object id, which Git already defines as the content hash.
     gitSnapshot.stagedDiff = digestNativeCheckInput(
       runGitCommand(options.projectRoot, [
-        'diff',
-        '--cached',
-        '--binary',
-        '--submodule=diff',
+        'ls-files',
+        '--stage',
+        '-z',
         '--',
+        ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
       ]),
     );
     gitSnapshot.submodules = runGitCommand(options.projectRoot, [
@@ -465,6 +670,7 @@ async function nativeCheckInputFingerprint(options: {
       '--exclude-standard',
       '-z',
       '--',
+      ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
     ])
       .split('\0')
       .filter(Boolean)
@@ -472,40 +678,36 @@ async function nativeCheckInputFingerprint(options: {
     gitSnapshot.untracked = await mapWithConcurrency(untracked, 4, async (relative) => {
       const target = path.resolve(options.projectRoot, ...relative.split('/'));
       try {
-        const stat = await fs.stat(target);
-        const content = await fs.readFile(target);
-        return {
-          path: relative,
-          digest: digestNativeCheckInput(content.toString('base64')),
-          size: stat.size,
-        };
+        const { digest, size } = await digestNativeInputFileContent(target);
+        return { path: relative, digest, size };
       } catch {
         return { path: relative, digest: null, size: null };
       }
     });
     if (gitSnapshot.untracked.some(({ digest }) => digest === null)) {
       gitSnapshot.complete = false;
-      gitSnapshot.reuseNonce = randomUUID();
     }
-    gitSnapshot.ignored = await nativeIgnoredCheckInputSnapshot(options.projectRoot, options.plans);
+    gitSnapshot.ignored = await nativeIgnoredCheckInputSnapshot(
+      options.projectRoot,
+      options.plans,
+      options.managedArtifactRoot,
+    );
     if (!gitSnapshot.ignored.complete) {
       gitSnapshot.complete = false;
-      gitSnapshot.reuseNonce = randomUUID();
     }
   } catch {
     // Non-Git projects still receive a candidate/tool fingerprint. They do
     // not receive a Git view, so use a bounded physical snapshot instead.
     if (stableGitView) {
       gitSnapshot.complete = false;
-      gitSnapshot.reuseNonce = randomUUID();
     } else {
       gitSnapshot.capture = 'physical-tree';
       gitSnapshot.physical = await nativePhysicalCheckInputSnapshot(
         options.projectRoot,
         options.plans,
+        options.managedArtifactRoot,
       );
       gitSnapshot.complete = gitSnapshot.physical.complete;
-      if (!gitSnapshot.physical.complete) gitSnapshot.reuseNonce = randomUUID();
     }
   }
   return canonicalHash('comet.native.check-input.v1', {
@@ -521,15 +723,129 @@ async function nativeCheckInputFingerprint(options: {
     arch: process.arch,
     path: process.env.PATH ?? null,
     pathext: process.env.PATHEXT ?? null,
-    environment: Object.entries(process.env)
+    // Only execution-relevant variables bind the fingerprint. Binding every
+    // environment entry made any incidental variable (shell session ids, editor
+    // state, timestamps) break check reuse; this mirrors the Classic manifest
+    // default, which binds no environment variable unless a policy declares it.
+    boundEnvironment: Object.entries(process.env)
+      .filter(([key]) => NATIVE_CHECK_BOUND_ENV.has(key.toUpperCase()))
       .map(([key, value]) => [key, value ?? null] as const)
       .sort(([left], [right]) => left.localeCompare(right)),
   });
 }
 
+const NATIVE_CHECK_BOUND_ENV = new Set([
+  'PATH',
+  'PATHEXT',
+  'NODE_OPTIONS',
+  'NODE_ENV',
+  'NODE_PATH',
+  'LANG',
+  'LC_ALL',
+  'HOME',
+  'USERPROFILE',
+  'SYSTEMROOT',
+  'COMSPEC',
+  'SHELL',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+]);
+
 function completedCheckDuration(check: NativeLocalCheckState): number {
   if (check.startedAt === null || check.completedAt === null) return 0;
   return Math.max(0, Date.parse(check.completedAt) - Date.parse(check.startedAt));
+}
+
+function boundEnvironmentEntries(): Array<[string, string | null]> {
+  return Object.entries(process.env)
+    .filter(([key]) => NATIVE_CHECK_BOUND_ENV.has(key.toUpperCase()))
+    .map(([key, value]) => [key, (value ?? null) as string | null] as [string, string | null])
+    .sort(([left], [right]) => left.localeCompare(right));
+}
+
+/**
+ * Cheap pre-gate over the full fingerprint's decisive inputs. Three fast Git
+ * calls (HEAD, porcelain status, staged blob ids) plus dirty, untracked, and
+ * ignored generated-input content digests cover every mutable input represented
+ * by the full fingerprint. A gate hit therefore proves the full fingerprint
+ * would recompute to its recorded value without hashing the clean tracked tree.
+ */
+export async function nativeCheckInputGate(options: {
+  projectRoot: string;
+  candidateId: string | null;
+  plans?: readonly NativeCheckPlan[];
+  managedArtifactRoot?: string;
+}): Promise<string | null> {
+  try {
+    const head = runGitCommand(options.projectRoot, ['rev-parse', 'HEAD']);
+    const branch = runGitCommand(options.projectRoot, ['branch', '--show-current']);
+    const status = runGitCommand(options.projectRoot, [
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+      '--ignore-submodules=none',
+      '--',
+      ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
+    ]);
+    const staged = runGitCommand(options.projectRoot, [
+      'ls-files',
+      '--stage',
+      '-z',
+      '--',
+      ...nativeRuntimeInputExclusions(options.projectRoot, options.managedArtifactRoot),
+    ]);
+    if (head === null || status === null) return null;
+    const workingTree: Array<{ path: string; digest: string | null }> = [];
+    for (const changedPath of gitStatusPaths(options.projectRoot).filter(
+      (changedPath) =>
+        !isNativeRuntimeInputPath(changedPath, options.projectRoot, options.managedArtifactRoot),
+    )) {
+      const target = path.resolve(options.projectRoot, ...changedPath.split('/'));
+      let digest: string | null = null;
+      try {
+        digest = (await digestNativeInputFileContent(target)).digest;
+      } catch {
+        // A dirty submodule is a directory. Its porcelain entry alone cannot
+        // distinguish two different dirty contents, so disable the fast gate
+        // and let the full fingerprint mark the snapshot non-reusable.
+        return null;
+      }
+      workingTree.push({ path: changedPath, digest });
+    }
+    workingTree.sort((left, right) => left.path.localeCompare(right.path, 'en'));
+    const ignored = await nativeIgnoredCheckInputSnapshot(
+      options.projectRoot,
+      options.plans ?? [],
+      options.managedArtifactRoot,
+    );
+    if (!ignored.complete) return null;
+    return canonicalHash('comet.native.check-input-gate.v1', {
+      candidateId: options.candidateId,
+      head,
+      branch,
+      // Porcelain names dirty files but does not bind their working-tree bytes.
+      // Hash every dirty path so editing an already-dirty tracked file cannot
+      // falsely hit the pre-gate.
+      status,
+      staged,
+      workingTree,
+      ignored,
+      projectRoot: path.resolve(options.projectRoot),
+      machineId: os.hostname(),
+      execPath: process.execPath,
+      node: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      boundEnvironment: boundEnvironmentEntries(),
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function authoritativePortableChecks(options: {
@@ -722,11 +1038,44 @@ async function reserveNativePortableCheckPlan(options: {
           containedRoot: options.paths.runtimeDir,
         })
       ).state;
-      const inputFingerprint = await nativeCheckInputFingerprint({
-        state,
+      const gate = await nativeCheckInputGate({
         projectRoot: options.projectRoot,
+        candidateId: state.builder_handoff?.candidate_id ?? null,
         plans: options.plans,
+        managedArtifactRoot: options.paths.artifactRoot,
       });
+      const candidateGate = await nativeCheckInputGate({
+        projectRoot: options.projectRoot,
+        candidateId: state.builder_handoff?.candidate_id ?? null,
+        plans: [],
+        managedArtifactRoot: options.paths.artifactRoot,
+      });
+      // A null gate means the workspace could not be snapshotted completely
+      // (for example, an ignored generated tree is too large or a submodule
+      // cannot be hashed as a regular file). The full fingerprint remains
+      // deterministic, but the binding below still forces a fresh execution
+      // because incomplete evidence cannot safely reuse a prior result.
+      const inputSnapshotUncertain = gate === null;
+      // Reuse decides before the full fingerprint: a matching gate already
+      // binds dirty, untracked and ignored generated inputs, so only the clean
+      // tracked-tree work in the full fingerprint remains safely skippable.
+      const gateBindingMatches =
+        gate !== null &&
+        local.inputFingerprint !== null &&
+        local.inputFingerprintGate === gate &&
+        local.candidateInputFingerprintGate === candidateGate &&
+        local.candidateId === state.builder_handoff?.candidate_id &&
+        path.resolve(local.workspace.projectRoot) === path.resolve(options.projectRoot) &&
+        path.resolve(local.workspace.worktreeRoot) === path.resolve(options.projectRoot) &&
+        local.workspace.machineId === os.hostname();
+      const inputFingerprint = gateBindingMatches
+        ? local.inputFingerprint!
+        : await nativeCheckInputFingerprint({
+            state,
+            projectRoot: options.projectRoot,
+            plans: options.plans,
+            managedArtifactRoot: options.paths.artifactRoot,
+          });
       const runtimeDir = nativePreferredChangeRuntimeDir(options.paths, state.name);
       const runtimeEvidenceAvailable = await hasNativeRuntimeCheckEvidence(local, runtimeDir);
       const allChecksPassed = local.checks.every((check) => check.status === 'passed');
@@ -738,12 +1087,99 @@ async function reserveNativePortableCheckPlan(options: {
         local.workspace.branch === branch &&
         local.workspace.machineId === os.hostname() &&
         local.inputFingerprint === inputFingerprint;
+      const candidateInputsUnchanged =
+        candidateGate !== null &&
+        local.candidateInputFingerprintGate === candidateGate &&
+        local.candidateId === state.builder_handoff?.candidate_id &&
+        path.resolve(local.workspace.projectRoot) === path.resolve(options.projectRoot) &&
+        path.resolve(local.workspace.worktreeRoot) === path.resolve(options.projectRoot) &&
+        local.workspace.branch === branch &&
+        local.workspace.machineId === os.hostname();
+      const generatedInputsChanged =
+        candidateInputsUnchanged &&
+        local.inputFingerprint !== null &&
+        local.inputFingerprint !== inputFingerprint;
+      const planBindingMatches =
+        sameNativeCheckPlan(
+          local,
+          options.plans,
+          options.projectRoot,
+          state,
+          inputFingerprint,
+          branch,
+        ) ||
+        (candidateInputsUnchanged &&
+          sameNativeCheckCommands(local, options.plans, options.projectRoot));
+      const sameWorkspaceBinding =
+        local.candidateId === state.builder_handoff?.candidate_id &&
+        path.resolve(local.workspace.projectRoot) === path.resolve(options.projectRoot) &&
+        path.resolve(local.workspace.worktreeRoot) === path.resolve(options.projectRoot) &&
+        local.workspace.branch === branch &&
+        local.workspace.machineId === os.hostname();
       const forceReexecuteForMissingEvidence =
         sameBinding && allChecksPassed && !runtimeEvidenceAvailable;
       if (retryIds && retryIds.size === 0) {
         throw new Error('Native check retry list must contain at least one ID');
       }
-      if (!sameBinding) {
+      if (
+        !sameBinding &&
+        local.execution?.stage === 'checking' &&
+        local.execution.actor === 'runtime' &&
+        local.execution.status === 'running'
+      ) {
+        const liveness = await inspectNativePortableCheckExecution(local);
+        if (liveness !== 'orphaned') {
+          throw new Error(
+            liveness === 'unknown'
+              ? 'Native check plan owner could not be proven to have exited; inspect the Runtime overlay before changing its binding'
+              : 'Native check plan is already in progress on another workspace binding',
+          );
+        }
+        local = interruptNativePortableCheckExecution(local);
+        await writeNativeLocalExecution(file, local, { containedRoot: options.paths.runtimeDir });
+      }
+      if (
+        !sameBinding &&
+        sameWorkspaceBinding &&
+        local.inputFingerprint !== null &&
+        (local.execution !== null || local.checks.length > 0)
+      ) {
+        const fingerprintChanged = local.inputFingerprint !== inputFingerprint;
+        if ((inputSnapshotUncertain && !fingerprintChanged) || generatedInputsChanged) {
+          // Fall through to rebuild the local overlay and execute the current
+          // plan again. The uncertain snapshot must never make prior checks
+          // reusable, but it also must not reject the candidate itself.
+        } else {
+          // The candidate was reserved against a different project input. Do not
+          // rebuild the overlay and reset its execution counters: that turns a
+          // source edit or deletion into an unlimited retry loop. The candidate
+          // is no longer the one the Builder produced, so return to Build and
+          // preserve the durable failure history before accepting a new one.
+          const next = returnNativeCandidateToBuild({
+            state,
+            reason:
+              'Native check input changed after the candidate was built; a new Builder candidate is required before checks can run again.',
+          });
+          const written = await writePortableMutation({
+            paths: options.paths,
+            previous: state,
+            next,
+          });
+          await writeNativeLocalExecution(
+            file,
+            rebuildNativeLocalExecution({
+              portableState: written,
+              projectRoot: options.paths.projectRoot,
+              branch,
+            }),
+            { containedRoot: options.paths.runtimeDir },
+          );
+          throw new Error(
+            'Native check input changed after the candidate was built; the change returned to Build for a new candidate',
+          );
+        }
+      }
+      if (!sameBinding && !candidateInputsUnchanged) {
         // A local overlay from another candidate, workspace or host is not
         // evidence for the current candidate. Rebuild the local overlay before
         // reserving a new plan; the portable state remains untouched.
@@ -760,25 +1196,29 @@ async function reserveNativePortableCheckPlan(options: {
         local.execution?.stage === 'checking' &&
         local.execution.actor === 'runtime' &&
         planMatches &&
-        sameNativeCheckPlan(
-          local,
-          options.plans,
-          options.projectRoot,
-          state,
-          inputFingerprint,
-          branch,
-        )
+        planBindingMatches
       ) {
-        const execution = local.execution;
+        let execution = local.execution;
         if (execution.status === 'running') {
-          throw new Error('Native check plan is already in progress');
+          const liveness = await inspectNativePortableCheckExecution(local);
+          if (liveness !== 'orphaned') {
+            throw new Error(
+              liveness === 'unknown'
+                ? 'Native check plan owner could not be proven to have exited; inspect the Runtime overlay before retrying'
+                : 'Native check plan is already in progress',
+            );
+          }
+          local = interruptNativePortableCheckExecution(local);
+          await writeNativeLocalExecution(file, local, { containedRoot: options.paths.runtimeDir });
+          execution = local.execution!;
         }
         const interrupted = local.checks.filter((check) => check.status === 'interrupted');
         if (
           interrupted.length === 0 &&
           execution.status === 'completed' &&
           allChecksPassed &&
-          !forceReexecuteForMissingEvidence
+          !forceReexecuteForMissingEvidence &&
+          !generatedInputsChanged
         ) {
           const requestedNames = new Map(options.plans.map(({ id, name }) => [id, name] as const));
           return {
@@ -796,7 +1236,8 @@ async function reserveNativePortableCheckPlan(options: {
           interrupted.length === 0 &&
           execution.status === 'completed' &&
           !allChecksPassed &&
-          !forceReexecuteForMissingEvidence
+          !forceReexecuteForMissingEvidence &&
+          !generatedInputsChanged
         ) {
           throw new Error(
             `Native check plan contains a failed check (${local.checks
@@ -804,37 +1245,6 @@ async function reserveNativePortableCheckPlan(options: {
               .map(({ id }) => id)
               .join(', ')}); submit a new Builder candidate`,
           );
-        }
-        if (interrupted.length > 0 && retryIds === null && !forceReexecuteForMissingEvidence) {
-          const requestedNames = new Map(options.plans.map(({ id, name }) => [id, name] as const));
-          return {
-            kind: 'reuse',
-            state,
-            checks: authoritativePortableChecks({
-              local,
-              projectRoot: options.projectRoot,
-              supplied: [],
-              requestedNames,
-            }),
-          };
-        }
-        if (retryIds) {
-          const unknown = [...retryIds].filter(
-            (id) => !interrupted.some((check) => check.id === id),
-          );
-          if (unknown.length > 0) {
-            throw new Error(
-              `Native check retry IDs must refer to interrupted checks: ${unknown.join(', ')}`,
-            );
-          }
-          const exhausted = interrupted.filter(
-            (check) => retryIds.has(check.id) && check.executionCount >= 3,
-          );
-          if (exhausted.length > 0) {
-            throw new Error(
-              `Native check retry limit (3) reached: ${exhausted.map(({ id }) => id).join(', ')}`,
-            );
-          }
         }
         if (
           interrupted.length > 0 &&
@@ -866,6 +1276,42 @@ async function reserveNativePortableCheckPlan(options: {
             `Native check ${interrupted.find((check) => !check.repeatable)!.id} was interrupted and is not repeatable; the change returned to Build for a new candidate`,
           );
         }
+        if (
+          interrupted.length > 0 &&
+          retryIds === null &&
+          !forceReexecuteForMissingEvidence &&
+          !generatedInputsChanged
+        ) {
+          const requestedNames = new Map(options.plans.map(({ id, name }) => [id, name] as const));
+          return {
+            kind: 'reuse',
+            state,
+            checks: authoritativePortableChecks({
+              local,
+              projectRoot: options.projectRoot,
+              supplied: [],
+              requestedNames,
+            }),
+          };
+        }
+        if (retryIds) {
+          const unknown = [...retryIds].filter(
+            (id) => !interrupted.some((check) => check.id === id),
+          );
+          if (unknown.length > 0) {
+            throw new Error(
+              `Native check retry IDs must refer to interrupted checks: ${unknown.join(', ')}`,
+            );
+          }
+          const exhausted = interrupted.filter(
+            (check) => retryIds.has(check.id) && check.executionCount >= 3,
+          );
+          if (exhausted.length > 0) {
+            throw new Error(
+              `Native check retry limit (3) reached: ${exhausted.map(({ id }) => id).join(', ')}`,
+            );
+          }
+        }
       }
       if (local.execution !== null && local.checks.length > 0) {
         const sameInterruptedPlan =
@@ -873,20 +1319,24 @@ async function reserveNativePortableCheckPlan(options: {
           local.execution.actor === 'runtime' &&
           local.checks.some((check) => check.status === 'interrupted') &&
           planMatches;
-        if (!sameInterruptedPlan && !forceReexecuteForMissingEvidence) {
+        if (!sameInterruptedPlan && !forceReexecuteForMissingEvidence && !generatedInputsChanged) {
           throw new Error('Native check plan was already resolved with a different plan');
         }
       } else if (
         (local.execution !== null || local.checks.length > 0) &&
-        !forceReexecuteForMissingEvidence
+        !forceReexecuteForMissingEvidence &&
+        !generatedInputsChanged
       ) {
         throw new Error('Native check plan was already resolved with a different plan');
       }
       const operationId = randomUUID();
+      const ownerIdentity = await readProcessIdentity(process.pid);
       const operation: NativeLocalExecutionState = {
         ...local,
         candidateId: state.builder_handoff?.candidate_id ?? null,
         inputFingerprint,
+        inputFingerprintGate: gate,
+        candidateInputFingerprintGate: candidateGate,
         workspace: {
           ...local.workspace,
           projectRoot: path.resolve(options.projectRoot),
@@ -902,9 +1352,14 @@ async function reserveNativePortableCheckPlan(options: {
           status: 'running',
           startedAt: new Date().toISOString(),
           requestCheckRounds: 0,
+          ownerPid: process.pid,
+          ...(ownerIdentity ? { ownerIdentity } : {}),
         },
         checks: options.plans.map((plan) => {
           const previous = local.checks.find((check) => check.id === plan.id);
+          if (generatedInputsChanged && previous) {
+            return localCheck(plan, operationId, options.projectRoot);
+          }
           if (forceReexecuteForMissingEvidence && previous) {
             return resetNativeCheckForExecution(previous, plan, operationId, options.projectRoot);
           }
@@ -914,7 +1369,7 @@ async function reserveNativePortableCheckPlan(options: {
           ) {
             return resetInterruptedCheck(previous, plan, operationId, options.projectRoot);
           }
-          if (previous) return { ...previous, operationId };
+          if (previous) return { ...previous, operationId, activeProcess: null };
           return localCheck(plan, operationId, options.projectRoot);
         }),
       };
@@ -927,6 +1382,7 @@ async function reserveNativePortableCheckPlan(options: {
           const previous = local.checks.find((check) => check.id === plan.id);
           return (
             forceReexecuteForMissingEvidence ||
+            generatedInputsChanged ||
             previous === undefined ||
             (previous.status === 'interrupted' && (retryIds === null || retryIds.has(previous.id)))
           );
@@ -979,7 +1435,11 @@ export async function executeNativePortableCheckPlan(options: {
   plans: NativeCheckPlan[];
   projectRoot?: string;
   retryCheckIds?: readonly string[];
-}): Promise<{ state: NativePortableState; checks: NativePortableCheckSummary[] }> {
+}): Promise<{
+  state: NativePortableState;
+  checks: NativePortableCheckSummary[];
+  disposition: 'executed' | 'reused';
+}> {
   const projectRoot = options.projectRoot ?? options.paths.projectRoot;
   preflightNativeCheckPlans(projectRoot, options.plans);
   const normalizedPlans: NativeCheckPlan[] = [];
@@ -996,7 +1456,7 @@ export async function executeNativePortableCheckPlan(options: {
     plans: normalizedPlans,
     projectRoot,
   });
-  if (reservation.kind === 'reuse') return reservation;
+  if (reservation.kind === 'reuse') return { ...reservation, disposition: 'reused' };
 
   const operationId = reservation.local.execution!.operationId;
   const runtimeDir = nativePreferredChangeRuntimeDir(options.paths, reservation.state.name);
@@ -1016,6 +1476,7 @@ export async function executeNativePortableCheckPlan(options: {
                   status: 'running',
                   executionCount: check.executionCount + 1,
                   startedAt,
+                  activeProcess: { status: 'starting' as const },
                 }
               : check,
           ),
@@ -1026,6 +1487,29 @@ export async function executeNativePortableCheckPlan(options: {
         runtimeDir,
         operationId,
         plan,
+        onSpawn: async ({ pid }) => {
+          const identity = await readProcessIdentity(pid);
+          await updateReservedNativeCheckPlan({
+            paths: options.paths,
+            state: reservation.state,
+            operationId,
+            update: (local) => ({
+              ...local,
+              checks: local.checks.map((check) =>
+                check.id === plan.id
+                  ? {
+                      ...check,
+                      activeProcess: {
+                        status: 'running' as const,
+                        pid,
+                        ...(identity ? { identity } : {}),
+                      },
+                    }
+                  : check,
+              ),
+            }),
+          });
+        },
       });
       const logContent = await fs.readFile(
         path.resolve(runtimeDir, ...result.logRef.split('/')),
@@ -1046,6 +1530,7 @@ export async function executeNativePortableCheckPlan(options: {
               startedAt: result.startedAt,
               completedAt: result.completedAt,
               log: result.logRef,
+              activeProcess: null,
               evidence: 'runtime' as const,
             };
             return {
@@ -1076,7 +1561,7 @@ export async function executeNativePortableCheckPlan(options: {
           execution: { ...local.execution!, status: 'interrupted' },
           checks: local.checks.map((check) =>
             check.status === 'planned' || check.status === 'running'
-              ? { ...check, status: 'interrupted' as const }
+              ? { ...check, status: 'interrupted' as const, activeProcess: null }
               : check,
           ),
         }),
@@ -1098,6 +1583,7 @@ export async function executeNativePortableCheckPlan(options: {
       projectRoot,
       supplied: [],
     }),
+    disposition: 'executed',
   };
 }
 
@@ -1379,6 +1865,7 @@ export async function executeReservedVerifierRequestedChecks(options: {
                   status: 'running',
                   executionCount: check.executionCount + 1,
                   startedAt,
+                  activeProcess: { status: 'starting' as const },
                 }
               : check,
           ),
@@ -1393,6 +1880,28 @@ export async function executeReservedVerifierRequestedChecks(options: {
         runtimeDir,
         operationId: options.reservation.local.execution!.operationId,
         plan,
+        onSpawn: async ({ pid }) => {
+          const identity = await readProcessIdentity(pid);
+          await updateReservedVerifierRequestedChecks({
+            paths: options.paths,
+            reservation: options.reservation,
+            update: (local) => ({
+              ...local,
+              checks: local.checks.map((check) =>
+                check.id === plan.id
+                  ? {
+                      ...check,
+                      activeProcess: {
+                        status: 'running' as const,
+                        pid,
+                        ...(identity ? { identity } : {}),
+                      },
+                    }
+                  : check,
+              ),
+            }),
+          });
+        },
       });
       const logContent = await fs.readFile(
         await resolveContainedNativePath(
@@ -1415,6 +1924,7 @@ export async function executeReservedVerifierRequestedChecks(options: {
               startedAt: result.startedAt,
               completedAt: result.completedAt,
               log: result.logRef,
+              activeProcess: null,
               evidence: 'runtime' as const,
             };
             return {
@@ -1449,7 +1959,7 @@ export async function executeReservedVerifierRequestedChecks(options: {
           execution: { ...local.execution!, status: 'interrupted' },
           checks: local.checks.map((check) =>
             check.status === 'planned' || check.status === 'running'
-              ? { ...check, status: 'interrupted' as const }
+              ? { ...check, status: 'interrupted' as const, activeProcess: null }
               : check,
           ),
         }),

@@ -18,6 +18,7 @@ import {
   type NativeBuilderCandidateInput,
 } from './native-loop-runtime.js';
 import {
+  readNativeLocalExecution,
   readOrRebuildNativeLocalExecution,
   rebuildNativeLocalExecution,
   writeNativeLocalExecution,
@@ -241,6 +242,64 @@ export async function dispatchNativePortableVerifier(options: {
         { containedRoot: options.paths.runtimeDir },
       );
       return written;
+    },
+  );
+}
+
+/**
+ * Record the dispatched Verifier's own startup receipt. Registration at
+ * dispatch only proves the intent to launch; this write is the first Runtime
+ * contact from the Verifier process itself, keeping "registered" and
+ * "actually started" distinguishable while the attempt is awaited.
+ */
+export async function confirmNativePortableVerifierStart(options: {
+  paths: NativeProjectPaths;
+  name: string;
+  candidateId: string;
+  verifierExecutionRef: string;
+}): Promise<NativePortableState> {
+  return withNativeMutationLock(
+    options.paths,
+    `confirm portable verifier start ${options.name}`,
+    async () => {
+      const state = await readNativePortableChange(options.paths, options.name);
+      if (
+        state.phase !== 'verify' ||
+        state.status !== 'active' ||
+        state.loop.next_action !== 'await-verifier-result'
+      ) {
+        throw new Error('Native Verifier start confirmation requires an active Verifier attempt');
+      }
+      const file = nativeLocalExecutionFile(options.paths, options.name);
+      const local = await readNativeLocalExecution(file);
+      const execution = local?.execution;
+      if (
+        local === null ||
+        local.change !== state.name ||
+        local.basedOnStateVersion !== state.state_version ||
+        !execution ||
+        execution.stage !== 'verifying' ||
+        execution.actor !== 'verifier' ||
+        execution.status !== 'running' ||
+        execution.executionId === null ||
+        execution.executionId !== options.verifierExecutionRef
+      ) {
+        throw new Error('Native Verifier start confirmation is stale for the current attempt');
+      }
+      if (state.builder_handoff?.candidate_id !== options.candidateId) {
+        throw new Error('Native Verifier start confirmation is stale for the current candidate');
+      }
+      if (execution.verifierStartedAt === undefined) {
+        await writeNativeLocalExecution(
+          file,
+          {
+            ...local,
+            execution: { ...execution, verifierStartedAt: new Date().toISOString() },
+          },
+          { containedRoot: options.paths.runtimeDir },
+        );
+      }
+      return state;
     },
   );
 }
@@ -625,6 +684,8 @@ export async function returnNativePortableChangeToBuild(options: {
   name: string;
   reason: string;
   expectedContinuation?: NativePortableExpectedContinuation;
+  failureBudget?: { maxVerifyFailures: number };
+  preserveLocalChecks?: boolean;
 }): Promise<NativePortableState> {
   return withNativeMutationLock(
     options.paths,
@@ -637,15 +698,28 @@ export async function returnNativePortableChangeToBuild(options: {
         action: 'revise-implementation',
       });
       if (state.phase === 'build') return state;
-      const next = returnNativeCandidateToBuild({ state, reason: options.reason });
+      const local = options.preserveLocalChecks
+        ? await readCurrentLocalExecution({ paths: options.paths, state })
+        : null;
+      const next = returnNativeCandidateToBuild({
+        state,
+        reason: options.reason,
+        ...(options.failureBudget ? { failureBudget: options.failureBudget } : {}),
+      });
       const written = await writePortableMutation({ paths: options.paths, previous: state, next });
       await writeNativeLocalExecution(
         nativeLocalExecutionFile(options.paths, state.name),
-        rebuildNativeLocalExecution({
-          portableState: written,
-          projectRoot: options.paths.projectRoot,
-          branch: currentBranch(options.paths.projectRoot),
-        }),
+        options.preserveLocalChecks
+          ? preservedLocalChecksForVersion({
+              local,
+              state: written,
+              projectRoot: options.paths.projectRoot,
+            })
+          : rebuildNativeLocalExecution({
+              portableState: written,
+              projectRoot: options.paths.projectRoot,
+              branch: currentBranch(options.paths.projectRoot),
+            }),
         { containedRoot: options.paths.runtimeDir },
       );
       return written;

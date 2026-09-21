@@ -7,10 +7,12 @@ import { readNativeBoundedTextFile } from './native-bounded-file.js';
 import { inspectNativeChildren } from './native-children.js';
 import { readNativeProposedSpecs } from './native-specs.js';
 import { nativePortableContinuation } from './native-portable-continuation.js';
+import { nativePortableCheckPlansFromLocal } from './native-portable-checks.js';
+import { nativeVerifierExecutionRefForState } from './native-local-execution.js';
 import {
   isNativePortableChange,
   nativePortableChangeDir,
-  readNativePortableChange,
+  readNativePortableRuntime,
 } from './native-portable-runtime.js';
 import {
   assertNoArguments,
@@ -20,6 +22,8 @@ import {
   success,
   type DispatchResult,
 } from './native-cli-shared.js';
+import { nativeChangeArtifactPaths } from './native-paths.js';
+import { discoverNativeChangeProjectRoot } from './native-status-discovery.js';
 
 export async function nativeShowCommand(
   args: string[],
@@ -27,9 +31,11 @@ export async function nativeShowCommand(
 ): Promise<DispatchResult> {
   const name = requiredPositional(args, 'change name');
   assertNoArguments(args);
-  const { paths } = await configuredPaths(projectRoot);
+  const executionCwd = await discoverNativeChangeProjectRoot({ projectRoot, name });
+  const { paths } = await configuredPaths(executionCwd);
   if (await isNativePortableChange(paths, name)) {
-    const state = await readNativePortableChange(paths, name);
+    const runtime = await readNativePortableRuntime({ paths, name });
+    const state = runtime.state;
     const changeDir = nativePortableChangeDir(paths, name);
     const brief = await readNativeBoundedTextFile({
       root: changeDir,
@@ -55,24 +61,40 @@ export async function nativeShowCommand(
     }
     const payload = {
       state,
+      artifacts: nativeChangeArtifactPaths(paths, state.name),
       brief: brief.text,
       proposedSpecs,
       continuation: nativePortableContinuation(
         state,
         await inspectNativeChildren({ paths, state }),
+        {
+          verifierExecutionRef: nativeVerifierExecutionRefForState(state, runtime.local),
+          ...(runtime.local
+            ? {
+                verificationCheckPlans: nativePortableCheckPlansFromLocal(
+                  runtime.local,
+                  runtime.local.workspace.projectRoot,
+                ),
+              }
+            : {}),
+        },
       ),
     };
-    return success('show', payload);
+    return { ...success('show', payload), executionCwd };
   }
   const inspection = await inspectNativeChange(paths, name);
   if (inspection.status === 'migration-required') {
-    return success('show', {
-      name,
-      schema: inspection.schema,
-      minimumRuntimeVersion: inspection.minimumRuntimeVersion,
-      migrationRequired: true,
-      message: inspection.message,
-    });
+    return {
+      ...success('show', {
+        name,
+        artifacts: nativeChangeArtifactPaths(paths, name),
+        schema: inspection.schema,
+        minimumRuntimeVersion: inspection.minimumRuntimeVersion,
+        migrationRequired: true,
+        message: inspection.message,
+      }),
+      executionCwd,
+    };
   }
   if (inspection.status !== 'current' || !inspection.state) {
     throw new NativeRuntimeCompatibilityError(inspection.schema, inspection.minimumRuntimeVersion);
@@ -87,11 +109,12 @@ export async function nativeShowCommand(
   });
   const payload = {
     state,
+    artifacts: nativeChangeArtifactPaths(paths, state.name),
     brief: brief.text,
     proposedSpecs,
   };
   if (Buffer.byteLength(JSON.stringify(payload), 'utf8') > NATIVE_SHOW_MAX_SERIALIZED_BYTES) {
     throw new Error('Native show output exceeds its serialized byte budget');
   }
-  return success('show', payload);
+  return { ...success('show', payload), executionCwd };
 }

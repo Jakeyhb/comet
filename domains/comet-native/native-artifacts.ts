@@ -33,6 +33,13 @@ const VERIFICATION_ALL = [
   'conclusion',
 ];
 
+const BRIEF_NONE_ALLOWED = new Set(['nonGoals', 'decisions', 'openQuestions']);
+
+export interface NativeBriefValidationOptions {
+  /** Apply the full completeness rule used at new/reconfirmed Shape boundaries. */
+  strict?: boolean;
+}
+
 export const NATIVE_ARTIFACT_VALIDATION_LIMITS = {
   maxFileBytes: DEFAULT_NATIVE_ARTIFACT_MAX_BYTES,
 } as const;
@@ -74,6 +81,104 @@ async function readContainedFile(root: string, relativeRef: string): Promise<str
 
 function result(findings: NativeFinding[]): NativeArtifactValidation {
   return { valid: findings.length === 0, findings };
+}
+
+export function stripMarkdownHtmlComments(source: string): string {
+  const visible: string[] = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = source.indexOf('<!--', cursor);
+    if (start < 0) {
+      visible.push(source.slice(cursor));
+      break;
+    }
+    visible.push(source.slice(cursor, start));
+    const end = source.indexOf('-->', start + 4);
+    if (end < 0) {
+      // Preserve malformed comments so validation can still inspect their text.
+      visible.push(source.slice(start));
+      break;
+    }
+    cursor = end + 3;
+  }
+  return visible.join('');
+}
+
+function meaningfulMarkdown(source: string): string {
+  return stripMarkdownHtmlComments(source).trim();
+}
+
+function markdownBody(source: string): string {
+  const lines = meaningfulMarkdown(source).split(/\r?\n/u);
+  const body: string[] = [];
+  let inFence = false;
+  for (const line of lines) {
+    if (/^\s*(?:```|~~~)/u.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (!inFence && /^\s*#{1,6}\s*$/u.test(line)) continue;
+    if (!inFence && /^\s*#{1,6}\s+/u.test(line)) continue;
+    if (!inFence && /^\s*(?:[-*+]\s*|\d+[.)]\s*)$/u.test(line)) continue;
+    body.push(line);
+  }
+  return body.join('\n').trim();
+}
+
+function isExplicitNone(source: string): boolean {
+  const normalized = markdownBody(source)
+    .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/gmu, '')
+    .replace(/[*_`>#\x5b\x5d()]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase('en-US');
+  return /^(?:none|n\/a|not applicable|no(?:ne)?(?:\s+at\s+this\s+time)?|no\s+(?:additional\s+)?(?:non-goals?|decisions?|open\s+questions?|questions?)|无|无相关事项|没有(?:额外)?(?:非目标|决定|待解决问题)|不适用|暂无)[.!。；;：:，,、 -]*$/iu.test(
+    normalized,
+  );
+}
+
+function isTemplateOnly(source: string): boolean {
+  const normalized = markdownBody(source)
+    .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/gmu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (normalized.length === 0) return false;
+  const placeholderCandidate = normalized
+    .replace(/[*_`]/gu, '')
+    .replace(/^\s*>+\s?/gmu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (/^(?:<[^>\r\n]+>|\{\{[^}\r\n]+\}\})[.!。；;：:，,、 -]*$/iu.test(placeholderCandidate))
+    return true;
+  const decorated = normalized
+    .replace(/[*_`>#\x5b\x5d()]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return /^(?:(?:todo|tbd|fixme)(?:\s*[:：-]\s*.+)?|fill(?:\s+this\s+in)?(?:\s*[:：-]\s*.+)?|placeholder(?:\s*[:：-]\s*.+)?|待填写\S*|待补充\S*|<[^>]+>|\{\{[^}]+\}\})[.!。；;：:，,、 -]*$/iu.test(
+    decorated,
+  );
+}
+
+export function validateNativeSpecDocumentText(
+  source: string,
+  documentRef: string,
+): NativeArtifactValidation {
+  const findings: NativeFinding[] = [];
+  const body = markdownBody(source);
+  if (body.length === 0) {
+    findings.push({
+      code: 'spec-document-empty',
+      message: `Native target Spec is empty: ${documentRef}. Add the complete target requirements or use an explicit no-product-behavior exemption in brief.md.`,
+      path: documentRef,
+    });
+  } else if (isTemplateOnly(source)) {
+    findings.push({
+      code: 'spec-document-placeholder',
+      message: `Native target Spec contains only template placeholder content: ${documentRef}. Replace it with complete target requirements.`,
+      path: documentRef,
+    });
+  }
+  return result(findings);
 }
 
 export function nativeBriefHasBlockingQuestion(source: string): boolean {
@@ -131,6 +236,7 @@ export function nativeBriefHasBlockingQuestion(source: string): boolean {
 export async function validateNativeBrief(
   changeDir: string,
   briefRef: string,
+  options: NativeBriefValidationOptions = {},
 ): Promise<NativeArtifactValidation> {
   const findings: NativeFinding[] = [];
   let source: string;
@@ -158,11 +264,25 @@ export async function validateNativeBrief(
       });
     }
   }
-  for (const heading of BRIEF_REQUIRED) {
-    if ((sections.get(heading) ?? '').length === 0) {
+  const nonEmptySections = options.strict ? BRIEF_ALL : BRIEF_REQUIRED;
+  for (const heading of nonEmptySections) {
+    const section = sections.get(heading) ?? '';
+    if (markdownBody(section).length === 0) {
       findings.push({
         code: 'brief-section-empty',
         message: `Brief section is empty: ${heading}`,
+        path: briefRef,
+      });
+    } else if (isTemplateOnly(section)) {
+      findings.push({
+        code: 'brief-section-placeholder',
+        message: `Brief section contains only template placeholder content: ${heading}`,
+        path: briefRef,
+      });
+    } else if (options.strict && !BRIEF_NONE_ALLOWED.has(heading) && isExplicitNone(section)) {
+      findings.push({
+        code: 'brief-section-empty',
+        message: `Brief section must describe the confirmed work instead of declaring no items: ${heading}`,
         path: briefRef,
       });
     }

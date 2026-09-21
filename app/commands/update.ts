@@ -13,6 +13,7 @@ import {
   hasSkills,
 } from '../../platform/install/detect.js';
 import {
+  assertBundledAssetsComplete,
   copyCometSkillsForPlatform,
   copyCometRulesForPlatform,
   detectInstalledWorkflowSelection,
@@ -1317,6 +1318,8 @@ async function updateSingleProject(
     }
   }
 
+  await assertBundledAssetsComplete();
+
   const targets = options.platform
     ? await Promise.all(
         (options.targetScopes ?? [options.scope ?? 'project']).map(async (scope) => {
@@ -2166,7 +2169,7 @@ async function updateAllIndexedProjects(
     targetScopes: ['project'],
     currentProject: true,
     allProjects: false,
-    failOnNpmFailure: true,
+    failOnNpmFailure: false,
   };
   if (!options.json && !runOptions.installMode) {
     runOptions.installMode = await selectInstallMode(options, lang);
@@ -2239,15 +2242,7 @@ async function updateAllIndexedProjects(
           : undefined,
       });
       if (npmFailure) {
-        for (const remaining of runnableProjects.slice(index + 1)) {
-          results.push({
-            projectPath: remaining.projectPath,
-            status: 'not_attempted',
-            reason: 'not attempted because the global npm package update failed',
-            targets: summarizeTargets(remaining.targets),
-          });
-        }
-        break;
+        globalNpmAttempted = true;
       }
     }
   }

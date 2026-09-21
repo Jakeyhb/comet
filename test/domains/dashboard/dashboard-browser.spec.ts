@@ -96,14 +96,23 @@ test.describe('Dashboard project selection', () => {
     };
     await assertLabels();
     for (const fraction of [1, 0.5, 0]) {
+      const target = fraction === 1 ? 44 : fraction === 0 ? 0 : 22;
+      // Check visibility first and only nudge scrollTop when the virtual list
+      // has not rendered the target yet. Rewriting scrollTop on every poll
+      // tick fights rc-virtual-list's own re-rendering and can livelock on a
+      // slow runner.
       await expect
-        .poll(async () => {
-          await scroller.evaluate((element, amount) => {
-            element.scrollTop = amount * element.scrollHeight;
-          }, fraction);
-          const target = fraction === 1 ? 44 : fraction === 0 ? 0 : 22;
-          return popup.getByText(`/worktrees/project-${target}`, { exact: true }).isVisible();
-        })
+        .poll(
+          async () => {
+            if (await popup.getByText(`/worktrees/project-${target}`, { exact: true }).isVisible())
+              return true;
+            await scroller.evaluate((element, amount) => {
+              element.scrollTop = amount * element.scrollHeight;
+            }, fraction);
+            return false;
+          },
+          { timeout: 15_000 },
+        )
         .toBe(true);
       await assertLabels();
     }
@@ -112,7 +121,7 @@ test.describe('Dashboard project selection', () => {
     await popup.getByText('/worktrees/project-44', { exact: true }).click();
     await expect(selector.locator('.comet-project-selected-label')).toHaveText('project-44');
     await expect(page.getByRole('button', { name: /^Git 未提交 44 / })).toBeVisible();
-  });
+  }, 60_000);
 
   test('ignores a slow overview response after switching back', async ({ page }) => {
     let release!: () => void;
@@ -401,7 +410,7 @@ test('keeps cached settings visible when fresh revalidation fails', async ({ pag
     workflows: ['native', 'classic'],
     ambientResume: true,
     hookAllowPaths: [],
-    knowledge: { provider: 'local', localInclude: [] },
+    knowledge: { provider: 'local', localInclude: [], maxFileMb: 2, maxTotalMb: 64 },
     native: {
       artifactRoot: 'docs',
       language: 'zh-CN',
@@ -2403,6 +2412,47 @@ test('loads the demo dashboard and previews an artifact', async ({ page }) => {
   expect(consoleErrors).toEqual([]);
 });
 
+test('keeps change summaries single-line and explains Native workflow state', async ({ page }) => {
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.goto('/?demo');
+
+  await page.getByRole('menuitem', { name: 'Native 工作流' }).click();
+  const nativeSummaries = page.locator('.native-change-row .text-meta').filter({ hasText: '·' });
+  await expect(nativeSummaries.first()).toBeVisible();
+  await expect
+    .poll(() =>
+      nativeSummaries.evaluateAll((elements) =>
+        elements.every((element) => getComputedStyle(element).whiteSpace === 'nowrap'),
+      ),
+    )
+    .toBe(true);
+
+  await page.getByRole('button', { name: '工作流状态' }).click();
+  const preview = page.locator('.dashboard-artifact-preview-panel');
+  await expect(preview.getByRole('columnheader', { name: '说明' })).toBeVisible();
+  await expect(preview.getByText('当前所处的工作流阶段。')).toBeVisible();
+  await expect(preview.locator('tbody tr').first().locator('td').first()).toContainText(
+    'Native 状态文件的格式版本。',
+  );
+  await expect(
+    preview.locator('pre.structured-json-value code.language-json').first(),
+  ).toBeVisible();
+
+  await page.locator('.dashboard-artifact-preview-backdrop').click();
+  await page.getByRole('menuitem', { name: 'Classic 工作流' }).click();
+  const classicSummaries = page
+    .locator('.dashboard-change-row .text-meta')
+    .filter({ hasText: '·' });
+  await expect(classicSummaries.first()).toBeVisible();
+  await expect
+    .poll(() =>
+      classicSummaries.evaluateAll((elements) =>
+        elements.every((element) => getComputedStyle(element).whiteSpace === 'nowrap'),
+      ),
+    )
+    .toBe(true);
+});
+
 test('keeps personal memory and project knowledge text readable at desktop density', async ({
   page,
 }) => {
@@ -4325,7 +4375,7 @@ test('keeps Classic and Native side panels within the center panel height', asyn
       await expect(selectedNativeRow).toHaveCSS('min-height', '72px');
       await expect(selectedNativeRow).toHaveCSS('border-color', 'rgba(0, 0, 0, 0)');
       await expect(selectedNativeRow).toHaveCSS('border-radius', '10px');
-      await expect(selectedNativeRow.locator('.truncate')).toHaveCSS('font-size', '14px');
+      await expect(selectedNativeRow.locator('.truncate').first()).toHaveCSS('font-size', '14px');
       await expect(selectedNativeRow.getByText('◇', { exact: true })).toHaveCount(0);
       await expect(selectedNativeRow).toContainText('Build · 1/3 子变更构建中');
       const nativeProgress = selectedNativeRow.getByRole('progressbar');
@@ -4483,4 +4533,47 @@ test('keeps long project names discoverable without widening the selector', asyn
     .locator('.comet-project-select-dropdown .comet-project-option-name')
     .first();
   await expect(projectOption).toHaveAttribute('title', longProjectName);
+});
+
+test('shows the project memory tab on the demo knowledge page', async ({ page }) => {
+  const consoleErrors: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
+
+  await page.goto('/?demo');
+  await page.getByRole('menuitem', { name: '项目知识' }).click();
+
+  const projectManifest = page.getByRole('region', { name: '最近一次任务使用的项目知识' });
+  await expect(projectManifest).toContainText('3 条项目知识');
+  await projectManifest.getByRole('button', { name: '查看使用明细' }).click();
+  const usageDialog = page.getByRole('dialog');
+  await usageDialog.getByRole('button', { name: /项目记忆索引/u }).click();
+  const panel = page.locator('.dashboard-project-memory');
+  await expect(panel).toBeVisible();
+  await page.keyboard.press('Escape');
+
+  const memoryList = page.getByRole('region', { name: '项目记忆列表' });
+  await expect(memoryList).toContainText('Dashboard 改动验证顺序');
+  await expect(memoryList).toContainText('Windows 测试临时目录清理');
+  await expect(memoryList).toContainText('2 条');
+  await expect(memoryList).toContainText('已随任务注入 3 次');
+  await expect(memoryList.getByRole('button', { name: '新增项目记忆' })).toHaveCount(0);
+
+  const inspector = page.getByRole('complementary', { name: '项目记忆详情' });
+  await expect(inspector).toContainText('Dashboard 改动验证顺序');
+  await expect(inspector).toContainText('cacheRoot');
+  await expect(inspector).toContainText(
+    '--expand-context "project-memory:dashboard-change-verification"',
+  );
+
+  await page.getByLabel('搜索项目记忆').fill('Windows');
+  await expect(memoryList).toContainText('Windows 测试临时目录清理');
+  await expect(memoryList).not.toContainText('Dashboard 改动验证顺序');
+
+  await page.getByLabel('搜索项目记忆').fill('');
+  await inspector.getByRole('button', { name: '删除这条项目记忆' }).click();
+  await expect(page.getByText('当前为只读预览，不会写入本地项目')).toBeVisible();
+
+  await expect(consoleErrors).toEqual([]);
 });

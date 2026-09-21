@@ -1,7 +1,7 @@
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { stripUtf8Bom } from '../fs/strip-bom.js';
+import { readStdinTextWithTimeoutAsync, type StdinReadResult } from './stdin-read.js';
 
 export type CometHookIntent = 'context' | 'write' | 'non-write' | 'unknown';
 
@@ -18,6 +18,7 @@ export interface CometHookAdapterDecision {
   allowed: boolean;
   reason: string;
   context?: string;
+  diagnostic?: string;
 }
 
 export interface CometHookProcessOutput {
@@ -73,6 +74,7 @@ export const COMET_HOOK_PLATFORM_IDS = new Set([
   'trae-cn',
   'grok',
   'dsh',
+  'zcode',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -257,12 +259,26 @@ export function parseCometHookRequest(source: string, filePath?: string): CometH
   };
 }
 
-export function readCometHookRequest(): CometHookRequest {
+export async function readCometHookRequest(
+  options: {
+    readStdin?: () => StdinReadResult | Promise<StdinReadResult>;
+  } = {},
+): Promise<CometHookRequest> {
   const filePath = process.env.FILE_PATH;
   if (filePath?.trim()) return parseCometHookRequest('', filePath);
   if (process.stdin.isTTY) return parseCometHookRequest('', filePath);
+  const stdin = await (options.readStdin ?? readStdinTextWithTimeoutAsync)();
+  if (stdin.text === null) {
+    // A host that neither writes nor closes the hook's stdin is broken; failing
+    // fast with a diagnostic beats hanging on every tool call. Not injectable as
+    // a plain return because every consumer is a short-lived hook entry point.
+    process.stderr.write(
+      '[COMET-HOOK] stdin timeout: the host did not provide hook input within the expected window\n',
+    );
+    process.exit(1);
+  }
   try {
-    return parseCometHookRequest(readFileSync(0, 'utf8'), filePath);
+    return parseCometHookRequest(stdin.text, filePath);
   } catch {
     return parseCometHookRequest('', filePath);
   }
@@ -288,7 +304,7 @@ export function renderCometHookDecision(
             permissionDecision: 'deny',
             permissionDecisionReason: decision.reason,
           })}\n`,
-      stderr: '',
+      stderr: decision.diagnostic ? `${decision.diagnostic}\n` : '',
     };
   }
   if (decision.allowed && decision.context) {
@@ -300,9 +316,14 @@ export function renderCometHookDecision(
           additionalContext: decision.context,
         },
       })}\n`,
-      stderr: '',
+      stderr: decision.diagnostic ? `${decision.diagnostic}\n` : '',
     };
   }
-  if (decision.allowed) return { exitCode: 0, stdout: '', stderr: '' };
+  if (decision.allowed)
+    return {
+      exitCode: 0,
+      stdout: '',
+      stderr: decision.diagnostic ? `${decision.diagnostic}\n` : '',
+    };
   return { exitCode: 2, stdout: '', stderr: `${decision.reason}\n` };
 }

@@ -77,6 +77,10 @@ const PLATFORM_FIXTURES = [
     id: 'dsh',
     single: { tool_name: 'Write', tool_input: { file_path: 'src/dsh.ts' } },
   },
+  {
+    id: 'zcode',
+    single: { tool_name: 'Write', tool_input: { file_path: 'src/zcode.ts' } },
+  },
 ] as const;
 
 describe('Comet Hook platform adapter', () => {
@@ -306,6 +310,23 @@ describe('Comet Hook platform adapter', () => {
         stderr: '',
       },
     );
+  });
+
+  it('emits an allowed context diagnostic on stderr without changing host protocols', () => {
+    expect(
+      renderCometHookDecision('github-copilot', {
+        allowed: true,
+        reason: 'context unavailable',
+        diagnostic: 'bounded diagnostic',
+      }),
+    ).toEqual({ exitCode: 0, stdout: '{}\n', stderr: 'bounded diagnostic\n' });
+    expect(
+      renderCometHookDecision('claude', {
+        allowed: true,
+        reason: 'context unavailable',
+        diagnostic: 'bounded diagnostic',
+      }),
+    ).toEqual({ exitCode: 0, stdout: '', stderr: 'bounded diagnostic\n' });
   });
 
   it.each(PLATFORM_FIXTURES.filter(({ id }) => id !== 'github-copilot'))(

@@ -12,7 +12,7 @@ comet state check <change-name> <phase> --json
 
 普通入口和恢复入口都会返回 layout、configuration、`configurationReadiness`、nextAction、taskState、coordination 和 delivery。`configurationReadiness` 的 `missingFields` 与 `invalidFields` 为空时，表示当前执行配置可沿用；只根据其中列出的字段补问或修复，不逐字段重新查询。taskState 为 `{authority, revision, total, completed, needsIds, next}`；coordination 为 `{path, stale, taskIds, stage, sessionId, reviewRounds, unresolved}`。按 classic-layout.md 确定各逻辑路径对应的目录，根据实际 phase 进入对应阶段。摘要中已有的字段不再逐个查询。状态写入，或工作区、需求发生变化后，重新读取受影响的状态。
 
-nextAction 为 `{kind, reason, taskId?}`。先阅读 reason，再根据 kind 完成对应步骤：reconcile-task 表示核对实际成果，review 表示补充审查，checkoff 表示补记任务完成状态，check 表示补充检查，reconcile-plan 表示补齐旧计划与任务的对应关系或同步状态，plan 表示补充有效计划，configure 表示补齐配置，workspace 表示修复工作区归属，delivery 表示完成已授权的交付。nextAction 不允许跳过验收；其中的 taskId 必须对应 tasks.md 中的任务。
+nextAction 为 `{kind, reason, taskId?}`。先阅读 reason，再根据 kind 完成对应步骤：reconcile-task 表示核对实际成果，review 表示补充审查，checkoff 表示补记任务完成状态，check 表示补充检查，reconcile-plan 表示补齐旧计划与任务的对应关系或同步状态，plan 表示补充有效计划，configure 表示补齐配置，workspace 表示修复工作区归属，delivery 表示完成已授权的交付，continue-phase 表示按当前阶段继续未完成步骤，repair-design 表示修正设计文档关联，design/complete-design 表示补充或完成设计 handoff，transition/verify/archive/confirm-archive 表示按 reason 推进对应阶段动作，paused 表示按 reason 等待恢复条件。nextAction 不允许跳过验收；其中的 taskId 必须对应 tasks.md 中的任务。
 
 仅在新会话没有先前上下文、对话被压缩或恢复证据不足时使用：
 
@@ -30,7 +30,15 @@ comet state check <change-name> <phase> --recover --details --json
 
 ## Ambient Resume
 
-用户未明确调用 Classic，但仓库可能存在未归档的 change 时，按 scripts.md 将当前请求通过 stdin 传给 `comet resume-probe . --stdin --json`。返回 auto_resume 才自动恢复；返回 ask_user 时向用户提出一个简短问题；返回 out_of_scope/none 时不进入流程。
+用户未明确调用 Classic，但仓库可能存在未归档的 change 时，按 scripts.md 将当前请求通过 stdin 传给 `comet resume-probe . --stdin --json`。返回 auto_resume 才自动恢复；返回 ask_user 时按 `reason` 选择下面的问题和选项提问（遵循 `comet-classic/reference/decision-point.md`，优先使用 AskUserQuestion；选项必须是真实可选的动作，不得问没有选项的"是否继续"）；返回 out_of_scope/none 时不进入流程。
+
+| reason                                      | 问题与选项                                                                                                                  |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| 多个 active change 需要点名                 | 单选：列出全部活跃 change 名称与当前 phase，选择继续哪一个；用户也可以直接说明是哪个 change。                             |
+| 未提交改动需要归属                         | 单选：归入当前 change；属于另一个 change（请用户说明名称）；请用户自己说明归属。没有归属信息前不修改、不提交这些改动。       |
+| active change 停在决策点                    | 说明该 change 停在哪个阶段的确认项（按各阶段 skill 的确认清单），选项：恢复该阶段继续处理确认项；用户直接给出决定。         |
+| OpenSpec change 缺少 Comet 状态             | 说明缺失内容，选项：按「入口错误与恢复」为它建立 Comet 状态；用户说明这不是 Comet 需求。                                    |
+| 请求看似与现有 change 无关                  | 单选：恢复现有 change（列出名称与 phase）；本次请求是新的工作（请用户确认走新流程）。                                      |
 
 ## 入口错误与恢复
 

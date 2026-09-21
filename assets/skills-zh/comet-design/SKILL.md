@@ -25,7 +25,9 @@ comet state select <change-name>
 comet state check <name> design --json
 ```
 
-验证通过后，使用入口返回的 layout、configuration、nextAction 和协作进度摘要继续，不逐字段查询，也不重复 root show。正常进入本阶段时，只做入口检查；丢失上下文后恢复任务或需要读取详情时，按 context-recovery.md 处理。验证失败时，处理返回的具体原因。
+多条只读 comet 命令（如 `state get`、`state next`、`state artifacts`）可以合并成一条 shell 调用依次执行，减少进程启动开销。
+
+上一阶段 guard 已成功返回本阶段状态信息时，直接使用其中的状态与 `agent.continuation` 继续，不重复 select/check；恢复任务、工作区变化或外部状态变化时，才执行上述入口验证。验证通过后，使用入口返回的 layout、configuration、nextAction 和协作进度摘要继续，不逐字段查询，也不重复 root show。正常进入本阶段时，只做入口检查；丢失上下文后恢复任务或需要读取详情时，按 context-recovery.md 处理。验证失败时，处理返回的具体原因。
 
 **恢复**：先核对现有产物和用户确认记录，只补未完成的步骤。无论正常进入还是恢复任务，都要保留已登记且仍然有效的设计，并读取 `data.designReadiness`、`data.issues` 和 `data.nextAction`。补回缺失文件、纠正文件关联的 change，或更新过期 handoff，不清空 `design_doc`。用户已确认设计后，可以执行返回的 complete-design 动作；该命令会保留已完成的步骤。如果已经进入 Build，则只返回当前阶段的入口信息。
 
@@ -148,7 +150,13 @@ brainstorming 产出设计方案后，**必须按 `comet-classic/reference/decis
 - 测试策略
 - 如有 Spec Patch，列出将回写的 delta spec 变更
 
-用户明确确认后，才继续 Step 2。若用户要求调整，继续 brainstorming 迭代，直到用户确认。
+以单选题给出以下三个选项：
+
+- **确认本设计**：以该设计继续 Step 2
+- **要求调整**：继续 brainstorming 迭代，直到用户确认修改后的方案
+- **暂缓确认**：保留 brainstorming 检查点和方案，不创建最终 Design Doc、不推进阶段，留待后续再确认
+
+用户确认本设计后，才继续 Step 2。若用户要求调整，继续 brainstorming 迭代，直到用户确认。
 
 ### 1d. 保存已确认的设计摘要
 

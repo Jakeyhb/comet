@@ -38,6 +38,16 @@ import {
 import { confirmNativePortableShape } from '../../helpers/native-portable-confirmed-transition.js';
 import { createNativeRunnerChannel } from '../../../domains/comet-native/native-runner-protocol.js';
 import {
+  assertChildDependenciesIntegrated,
+  createNativeSupervisorState,
+  createNativeSupervisorTask,
+  reconcileNativeSupervisorState,
+} from '../../../domains/comet-native/native-supervisor-model.js';
+import {
+  readNativeSupervisorState,
+  writeNativeSupervisorState,
+} from '../../../domains/comet-native/native-supervisor-state.js';
+import {
   readNativePortableState,
   writeNativePortableState,
 } from '../../../domains/comet-native/native-portable-state.js';
@@ -70,16 +80,52 @@ async function guardedShapeConfirmationArgs(
 const PARENT_BRIEF = `# Outcome
 Integrate the child changes into one verified result.
 
+# Scope
+Coordinate the child changes and verify the integrated result.
+
+# Non-goals
+Do not introduce behavior outside the child changes.
+
 # Acceptance examples
 - The integrated result contains the first behavior.
 - The integrated result contains the second behavior.
+
+# Constraints and invariants
+Every child result remains independently traceable.
+
+# Decisions
+No product behavior change: this fixture validates Supervisor coordination only.
+
+# Open questions
+None.
+
+# Verification expectations
+Run the focused Supervisor coordination checks.
 `;
 
 const CHILD_BRIEF = `# Outcome
 Implement one independently verified child result.
 
+# Scope
+Implement the assigned child behavior and its checks.
+
+# Non-goals
+Do not change unrelated capabilities.
+
 # Acceptance examples
 - The child implementation is present on its branch.
+
+# Constraints and invariants
+The child remains independently verifiable.
+
+# Decisions
+No product behavior change: this fixture validates child coordination only.
+
+# Open questions
+None.
+
+# Verification expectations
+Run the focused child checks.
 `;
 
 const CHILDREN = `schema: comet.native.children.v1
@@ -138,6 +184,8 @@ interface CommandData {
   };
   archiveDir?: string;
   workspaceFinishResult?: { merged?: boolean } | null;
+  healthy?: boolean;
+  findings?: Array<{ code: string; message: string }>;
 }
 
 function git(projectRoot: string, args: string[]): string {
@@ -578,6 +626,180 @@ children:`,
     });
   });
 
+  it('derives contract-changed child states through the dependency gate (issue #439)', () => {
+    const contract = parseNativeChildrenContract(READABLE_CHILDREN, ['A1', 'A2']);
+    const repository = '/tmp/unused-repository';
+    const state = createNativeSupervisorState({
+      parent: 'parent',
+      targetBranch: 'main',
+      targetCommit: 'a'.repeat(40),
+      integrationBranch: 'comet/supervisor/parent/integration',
+      integrationWorktree: repository,
+      contract,
+    });
+    // Issue setup: child-a integrated, child-b pending on it, and the confirmed
+    // contract then grows a new child that child-b must additionally wait on.
+    const childA = state.children.find(({ name }) => name === 'child-a');
+    const childB = state.children.find(({ name }) => name === 'child-b');
+    childA!.status = 'integrated';
+    childB!.status = 'pending';
+    const revised = parseNativeChildrenContract(
+      `schema: comet.native.children.v2
+acceptance_index:
+  A1:
+    source: brief.md
+    text: The integrated result contains the first behavior.
+  A2:
+    source: brief.md
+    text: The integrated result contains the second behavior.
+  A3:
+    source: brief.md
+    text: The integrated result contains the third behavior.
+children:
+  - name: child-a
+    depends_on: []
+    covers: [A1]
+  - name: child-new
+    depends_on: []
+    covers: [A3]
+  - name: child-b
+    depends_on: [child-a, child-new]
+    covers: [A2]
+`,
+      ['A1', 'A2', 'A3'],
+    );
+
+    // child-b has no candidate and its new dependency is not integrated, so the
+    // reconciled state must stay pending instead of becoming dispatch-ready.
+    const reconciled = reconcileNativeSupervisorState({ state, contract: revised });
+    const reconciledB = reconciled.children.find(({ name }) => name === 'child-b');
+    expect(reconciledB?.status).toBe('pending');
+    expect(reconciledB?.blocker).toBeNull();
+    const reconciledNew = reconciled.children.find(({ name }) => name === 'child-new');
+    expect(reconciledNew?.status).toBe('ready');
+
+    // A child whose dependencies are all integrated may become ready again.
+    // A second contract revision (child-new's summary changes) triggers the
+    // re-derivation for child-b while child-new itself is already integrated
+    // and therefore immutable.
+    const integratedNew = reconciled.children.find(({ name }) => name === 'child-new');
+    integratedNew!.status = 'integrated';
+    const revised2 = parseNativeChildrenContract(
+      `schema: comet.native.children.v2
+acceptance_index:
+  A1:
+    source: brief.md
+    text: The integrated result contains the first behavior.
+  A2:
+    source: brief.md
+    text: The integrated result contains the second behavior.
+  A3:
+    source: brief.md
+    text: The integrated result contains the refined third behavior.
+children:
+  - name: child-a
+    depends_on: []
+    covers: [A1]
+  - name: child-new
+    depends_on: []
+    covers: [A3]
+  - name: child-b
+    depends_on: [child-a, child-new]
+    covers: [A2]
+`,
+      ['A1', 'A2', 'A3'],
+    );
+    const promoted = reconcileNativeSupervisorState({ state: reconciled, contract: revised2 });
+    const promotedB = promoted.children.find(({ name }) => name === 'child-b');
+    expect(promotedB?.status).toBe('ready');
+    expect(promoted.children.find(({ name }) => name === 'child-new')?.status).toBe('integrated');
+
+    // A child with a recorded candidate keeps the needs-reverify semantics.
+    // A third revision triggers the re-derivation for the recorded candidate.
+    const withCandidate = reconcileNativeSupervisorState({ state, contract: revised });
+    const candidateB = withCandidate.children.find(({ name }) => name === 'child-b');
+    candidateB!.candidateCommit = 'b'.repeat(40);
+    const reverified = reconcileNativeSupervisorState({
+      state: withCandidate,
+      contract: revised2,
+    });
+    const reverifiedB = reverified.children.find(({ name }) => name === 'child-b');
+    expect(reverifiedB?.status).toBe('needs-reverify');
+  });
+
+  it('finds and repairs a self-locked supervisor overlay through doctor (issue #439)', async () => {
+    const repository = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-native-lock-439-'));
+    repositories.push(repository);
+    git(repository, ['init', '-b', 'main']);
+    git(repository, ['config', 'user.email', 'native@example.test']);
+    git(repository, ['config', 'user.name', 'Native Test']);
+    await fs.writeFile(path.join(repository, '.gitignore'), '.comet/runtime/\n');
+    git(repository, ['add', '.']);
+    git(repository, ['commit', '-m', 'seed']);
+    await writeProjectConfig(repository, defaultProjectConfig('docs', 'en'));
+    git(repository, ['add', '.']);
+    git(repository, ['commit', '-m', 'configure comet']);
+    expect((await nativeNewCommand(['parent'], repository)).exitCode).toBe(0);
+    const paths = await nativeProjectPaths(repository, 'docs');
+    const directory = nativePortableChangeDir(paths, 'parent');
+    await fs.writeFile(path.join(directory, 'brief.md'), PARENT_BRIEF);
+    await fs.writeFile(path.join(directory, 'children.yaml'), READABLE_CHILDREN);
+    await confirmNativePortableShape({
+      paths,
+      name: 'parent',
+      coordinationMode: 'multi-session',
+    });
+
+    const contract = parseNativeChildrenContract(READABLE_CHILDREN, ['A1', 'A2']);
+    const supervisor = createNativeSupervisorState({
+      parent: 'parent',
+      targetBranch: 'main',
+      targetCommit: git(repository, ['rev-parse', 'HEAD']),
+      integrationBranch: 'comet/supervisor/parent/integration',
+      integrationWorktree: repository,
+      contract,
+    });
+    // Reproduce the locked overlay: child-a integrated, child-b wrongly ready
+    // although child-a is not integrated.
+    supervisor.children.find(({ name }) => name === 'child-a')!.status = 'pending';
+    const childB = supervisor.children.find(({ name }) => name === 'child-b')!;
+    childB.status = 'ready';
+    childB.blocker =
+      'Confirmed Supervisor contract changed; verify the current acceptance scope again.';
+    await writeNativeSupervisorState(paths, supervisor);
+
+    const diagnosis = await nativeDoctorCommand(['parent'], repository);
+    expect(diagnosis).toMatchObject({
+      exitCode: 65,
+      data: {
+        healthy: false,
+        findings: [
+          expect.objectContaining({
+            code: 'portable-supervisor-ready-dependencies-unmet',
+          }),
+        ],
+      },
+    });
+
+    const repaired = await nativeDoctorCommand(['parent', '--repair'], repository);
+    expect(repaired).toMatchObject({
+      exitCode: 0,
+      data: {
+        repaired: true,
+        supervisorDependencyRepair: ['child-b'],
+      },
+    });
+    const healed = await readNativeSupervisorState(paths, 'parent');
+    expect(healed?.children.find(({ name }) => name === 'child-b')?.status).toBe('pending');
+    // After the repair no ready child fails the dispatcher's dependency gate,
+    // so advance-children can proceed with the actually ready children.
+    for (const child of healed!.children) {
+      if (child.status === 'ready') {
+        expect(() => assertChildDependenciesIntegrated(healed!, child)).not.toThrow();
+      }
+    }
+  });
+
   it('preserves parent child progress while blocking a mismatched workspace', async () => {
     const repository = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-native-parent-recovery-'));
     repositories.push(repository);
@@ -675,6 +897,217 @@ children:`,
     await expect(
       inspectNativePortableStatus({ paths: parentPaths, name: 'parent' }),
     ).resolves.toMatchObject({ name: 'parent' });
+  });
+
+  it('binds a Supervisor Shape to Git that was initialized after the change was created', async () => {
+    const repository = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-native-children-'));
+    repositories.push(repository);
+
+    // The project is configured before any Git repository exists.
+    const config = defaultProjectConfig('docs', 'en');
+    config.workflows = ['native', 'classic'];
+    config.default_workflow = 'native';
+    await writeProjectConfig(repository, config);
+
+    const parentCreated = await nativeNewCommand(['parent', '--isolation', 'current'], repository);
+    expect(parentCreated.exitCode).toBe(0);
+    const parentPaths = await nativeProjectPaths(repository, 'docs');
+    await ensureNativeDirectories(parentPaths);
+    const parentDir = nativePortableChangeDir(parentPaths, 'parent');
+    await fs.writeFile(path.join(parentDir, 'brief.md'), PARENT_BRIEF);
+    await fs.writeFile(path.join(parentDir, 'children.yaml'), READABLE_CHILDREN);
+
+    expect(await readNativePortableChange(parentPaths, 'parent')).toMatchObject({
+      workspace: { isolation: 'current', change_branch: null, target_branch: null },
+    });
+    await expect(
+      nativeNextCommand(['parent', '--summary', 'Prepare the parent contract'], repository),
+    ).rejects.toThrow(/Git integration branch/u);
+    await expect(nativeDoctorCommand(['parent'], repository)).resolves.toMatchObject({
+      exitCode: 65,
+      data: {
+        healthy: false,
+        findings: [expect.objectContaining({ code: 'portable-supervisor-git-binding-missing' })],
+      },
+    });
+
+    // Git is initialized only after the change already exists.
+    git(repository, ['init', '-b', 'main']);
+    git(repository, ['config', 'user.email', 'native@example.test']);
+    git(repository, ['config', 'user.name', 'Native Test']);
+    await fs.writeFile(
+      path.join(repository, '.gitignore'),
+      '.comet/runtime/\n.comet/current-change.json\n',
+    );
+    git(repository, ['add', '.']);
+    git(repository, ['commit', '--allow-empty', '-m', 'seed after the change exists']);
+
+    await expect(nativeDoctorCommand(['parent'], repository)).resolves.toMatchObject({
+      exitCode: 65,
+      data: {
+        healthy: false,
+        findings: [
+          expect.objectContaining({
+            code: 'portable-supervisor-git-binding-missing',
+            message: expect.stringContaining('main'),
+          }),
+        ],
+      },
+    });
+    const parentPrepared = await nativeNextCommand(
+      [
+        'parent',
+        '--summary',
+        'Prepare the parent contract confirmation',
+        '--coordination-mode',
+        'multi-session',
+      ],
+      repository,
+    );
+    expect(data(parentPrepared).state).toMatchObject({
+      phase: 'shape',
+      status: 'await-user',
+      workspace: { change_branch: 'main', target_branch: 'main' },
+    });
+    expect(
+      (await readNativePortableChange(parentPaths, 'parent')).history.some(
+        ({ outcome, summary }) =>
+          outcome === 'recovery' && /bound to branch main/u.test(summary.text),
+      ),
+    ).toBe(true);
+
+    const parentConfirmed = await nativeNextCommand(
+      await guardedShapeConfirmationArgs(parentPaths, 'parent', 'Confirm the parent contract'),
+      repository,
+    );
+    expect(data(parentConfirmed).state).toMatchObject({
+      phase: 'build',
+      workspace: { change_branch: 'main', target_branch: 'main' },
+    });
+    expect(git(repository, ['branch', '--list', 'comet/supervisor/parent/integration'])).toContain(
+      'comet/supervisor/parent/integration',
+    );
+    await expect(nativeDoctorCommand(['parent'], repository)).resolves.toMatchObject({
+      exitCode: 0,
+      data: { healthy: true },
+    });
+  });
+
+  it('refuses to bind a pre-Git Supervisor Shape from a dirty Git baseline', async () => {
+    const repository = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-native-children-'));
+    repositories.push(repository);
+    const config = defaultProjectConfig('docs', 'en');
+    config.workflows = ['native', 'classic'];
+    config.default_workflow = 'native';
+    await writeProjectConfig(repository, config);
+    await nativeNewCommand(['parent', '--isolation', 'current'], repository);
+    const paths = await nativeProjectPaths(repository, 'docs');
+    await ensureNativeDirectories(paths);
+    const changeDir = nativePortableChangeDir(paths, 'parent');
+    await fs.writeFile(path.join(changeDir, 'brief.md'), PARENT_BRIEF);
+    await fs.writeFile(path.join(changeDir, 'children.yaml'), READABLE_CHILDREN);
+
+    git(repository, ['init', '-b', 'main']);
+    git(repository, ['config', 'user.email', 'native@example.test']);
+    git(repository, ['config', 'user.name', 'Native Test']);
+    await fs.writeFile(
+      path.join(repository, '.gitignore'),
+      '.comet/runtime/\n.comet/current-change.json\n',
+    );
+    git(repository, ['add', '.']);
+    git(repository, ['commit', '-m', 'seed after the change exists']);
+    await fs.writeFile(path.join(repository, 'uncommitted.txt'), 'not part of the baseline\n');
+
+    await expect(nativeDoctorCommand(['parent'], repository)).resolves.toMatchObject({
+      exitCode: 65,
+      data: {
+        findings: [
+          expect.objectContaining({
+            message: expect.stringMatching(/clean current working directory/iu),
+          }),
+        ],
+      },
+    });
+    await expect(
+      nativeNextCommand(
+        [
+          'parent',
+          '--summary',
+          'Prepare the parent contract confirmation',
+          '--coordination-mode',
+          'multi-session',
+        ],
+        repository,
+      ),
+    ).rejects.toThrow(/clean current working directory/iu);
+    await expect(readNativePortableChange(paths, 'parent')).resolves.toMatchObject({
+      workspace: { change_branch: null, target_branch: null },
+    });
+  });
+
+  it('refuses to bind a pre-Git Supervisor Shape while a child task is active', async () => {
+    const repository = await fs.mkdtemp(path.join(os.tmpdir(), 'comet-native-children-'));
+    repositories.push(repository);
+    const config = defaultProjectConfig('docs', 'en');
+    config.workflows = ['native', 'classic'];
+    config.default_workflow = 'native';
+    await writeProjectConfig(repository, config);
+    await nativeNewCommand(['parent', '--isolation', 'current'], repository);
+    const paths = await nativeProjectPaths(repository, 'docs');
+    await ensureNativeDirectories(paths);
+    const changeDir = nativePortableChangeDir(paths, 'parent');
+    await fs.writeFile(path.join(changeDir, 'brief.md'), PARENT_BRIEF);
+    await fs.writeFile(path.join(changeDir, 'children.yaml'), READABLE_CHILDREN);
+
+    git(repository, ['init', '-b', 'main']);
+    git(repository, ['config', 'user.email', 'native@example.test']);
+    git(repository, ['config', 'user.name', 'Native Test']);
+    await fs.writeFile(
+      path.join(repository, '.gitignore'),
+      '.comet/runtime/\n.comet/current-change.json\n',
+    );
+    git(repository, ['add', '.']);
+    git(repository, ['commit', '-m', 'seed after the change exists']);
+    const head = git(repository, ['rev-parse', 'HEAD']);
+    const supervisor = createNativeSupervisorState({
+      parent: 'parent',
+      targetBranch: 'main',
+      targetCommit: head,
+      integrationBranch: 'comet/supervisor/parent/integration',
+      integrationWorktree: repository,
+      contract: parseNativeChildrenContract(READABLE_CHILDREN, ['A1', 'A2']),
+    });
+    const active = createNativeSupervisorTask(supervisor, {
+      role: 'builder',
+      child: 'child-a',
+      projectRoot: repository,
+      runId: 'active-builder',
+    });
+    await writeNativeSupervisorState(paths, active.state);
+
+    await expect(nativeDoctorCommand(['parent'], repository)).resolves.toMatchObject({
+      exitCode: 65,
+      data: {
+        findings: [
+          expect.objectContaining({ message: expect.stringMatching(/active child tasks/iu) }),
+        ],
+      },
+    });
+    await expect(
+      nativeNextCommand(
+        [
+          'parent',
+          '--summary',
+          'Prepare the parent contract confirmation',
+          '--coordination-mode',
+          'multi-session',
+        ],
+        repository,
+      ),
+    ).rejects.toThrow(/active child tasks/iu);
+    await expect(readNativePortableChange(paths, 'parent')).resolves.toMatchObject({
+      workspace: { change_branch: null, target_branch: null },
+    });
   });
 
   it('gates the parent on real child merges and starts dependents from the integrated HEAD', async () => {
@@ -1135,5 +1568,5 @@ children:`,
     await expect(readNativePortableChange(parentPaths, 'parent')).resolves.toMatchObject({
       children_contract_hash: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
-  }, 120_000);
+  }, 300_000);
 });

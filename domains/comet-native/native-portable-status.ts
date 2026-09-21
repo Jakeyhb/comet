@@ -7,10 +7,14 @@ import { inspectNativeChildren } from './native-children.js';
 import { readNativeSupervisorState, type NativeSupervisorState } from './native-supervisor.js';
 import { inspectNativeSupervisorOverlay } from './native-supervisor-overlay.js';
 import { nativePortableContinuation } from './native-portable-continuation.js';
+import { nativePortableCheckPlansFromLocal } from './native-portable-checks.js';
+import { nativeVerifierExecutionRefForState } from './native-local-execution.js';
 import { nativePortableChangeDir, readNativePortableRuntime } from './native-portable-runtime.js';
 import { nativePortableStateSummary } from './native-portable-summary.js';
 import type { NativeLocalExecutionState, NativePortableState } from './native-portable-types.js';
-import type { NativeProjectPaths } from './native-types.js';
+import { nativeChangeArtifactPaths } from './native-paths.js';
+import type { NativeProjectPaths, NativeChangeArtifactPaths } from './native-types.js';
+import type { NativeWorkspaceFinishJournal } from './native-workspace-finish.js';
 
 export interface NativePortableAcceptanceCounts {
   total: number;
@@ -23,6 +27,7 @@ export interface NativePortableAcceptanceCounts {
 export interface NativePortableStatusProjection {
   schema: 'comet.native.status.v2';
   name: string;
+  artifacts: NativeChangeArtifactPaths;
   phase: NativePortableState['phase'];
   status: NativePortableState['status'];
   stateVersion: number;
@@ -46,6 +51,18 @@ export interface NativePortableStatusProjection {
   localExecution: {
     status: 'available' | 'missing' | 'invalid' | 'stale' | 'not-expected';
     operation: NativeLocalExecutionState['execution'];
+    /**
+     * Present while a dispatched Verifier attempt is awaited. Distinguishes a
+     * registered dispatch from a Verifier that actually contacted Runtime.
+     */
+    verifierStartup?: {
+      attempt: number;
+      registeredAt: string;
+      confirmedAt: string | null;
+      confirmation: 'unconfirmed' | 'confirmed';
+      /** Whole minutes since registration while never confirmed (unconfirmed only). */
+      waitingMinutes?: number;
+    };
   };
   childSummary?: Record<string, number>;
   readyChildren?: string[];
@@ -184,6 +201,40 @@ function counts(state: NativePortableState): NativePortableAcceptanceCounts {
   );
 }
 
+function verifierStartupProjection(
+  state: NativePortableState,
+  local: NativeLocalExecutionState | null | undefined,
+): NativePortableStatusProjection['localExecution']['verifierStartup'] {
+  const execution = local?.execution;
+  if (
+    state.phase !== 'verify' ||
+    state.status !== 'active' ||
+    state.loop.next_action !== 'await-verifier-result' ||
+    !execution ||
+    execution.stage !== 'verifying' ||
+    execution.actor !== 'verifier' ||
+    execution.status !== 'running'
+  ) {
+    return undefined;
+  }
+  const confirmedAt = execution.verifierStartedAt ?? null;
+  const confirmed = confirmedAt !== null || execution.requestCheckRounds > 0;
+  return {
+    attempt: state.loop.attempt,
+    registeredAt: execution.startedAt,
+    confirmedAt,
+    confirmation: confirmed ? 'confirmed' : 'unconfirmed',
+    ...(confirmed
+      ? {}
+      : {
+          waitingMinutes: Math.max(
+            0,
+            Math.round((Date.now() - Date.parse(execution.startedAt)) / 60_000),
+          ),
+        }),
+  };
+}
+
 export function projectNativePortableWorkspace(
   paths: NativeProjectPaths,
   state: NativePortableState,
@@ -221,9 +272,42 @@ export function projectNativeArchivedStatus(options: {
   file: string;
   details?: boolean;
   cursor?: string;
+  finishJournal?: NativeWorkspaceFinishJournal | null;
 }): NativePortableStatusProjection {
   const { state, paths } = options;
+  const finishJournal = options.finishJournal ?? null;
   const summary = nativePortableStateSummary(state);
+  const finishBlocked = finishJournal !== null;
+  const finishMessage =
+    finishJournal?.result?.message ??
+    'Native Archive completed, but workspace finish is still pending; retry the recorded finish command.';
+  const continuation = finishBlocked
+    ? {
+        ...nativePortableContinuation(state),
+        disposition: 'blocked' as const,
+        action: 'archive' as const,
+        commandArgs: finishJournal?.result?.recoveryArgs ?? [
+          'comet',
+          'native',
+          'archive',
+          state.name,
+          '--confirmed',
+        ],
+        requiredInputs: [],
+        inputOptions: [],
+        userCommunication: {
+          required: true,
+          message: finishMessage,
+          suggestedReply: 'Retry workspace finish',
+          agentInstruction:
+            'Retry the recorded Native workspace finish command after resolving the reported Git blocker; do not treat this archived change as complete until it succeeds.',
+        },
+        runnerAction: {
+          ...nativePortableContinuation(state).runnerAction,
+          kind: 'none' as const,
+        },
+      }
+    : nativePortableContinuation(state);
   const all = options.details ? detailItems(state, null, []) : [];
   const offset = detailsOffset(options.cursor, state.state_version, 0);
   const items = all.slice(offset, offset + 32);
@@ -234,8 +318,9 @@ export function projectNativeArchivedStatus(options: {
   return {
     schema: 'comet.native.status.v2',
     name: state.name,
+    artifacts: nativeChangeArtifactPaths(paths, state.name),
     phase: state.phase,
-    status: state.status,
+    status: finishBlocked ? 'blocked' : state.status,
     stateVersion: state.state_version,
     archived: true,
     archiveRef: path.relative(paths.projectRoot, options.file).replaceAll('\\', '/'),
@@ -243,7 +328,17 @@ export function projectNativeArchivedStatus(options: {
     acceptance: counts(state),
     unresolvedAcceptanceIds: summary.unresolved_acceptance_ids,
     verificationResult: state.verification_result,
-    blockers: summary.blockers,
+    blockers: finishBlocked
+      ? [
+          ...summary.blockers,
+          {
+            owner: 'runtime' as const,
+            reason: finishMessage,
+            acceptance_ids: [],
+            resolution_action: 'wait-external' as const,
+          },
+        ]
+      : summary.blockers,
     workspace: {
       projectRoot: paths.projectRoot,
       isolation: state.workspace.isolation,
@@ -254,7 +349,7 @@ export function projectNativeArchivedStatus(options: {
       message: null,
     },
     localExecution: { status: 'not-expected', operation: null },
-    continuation: nativePortableContinuation(state),
+    continuation,
     ...(options.details
       ? {
           details: {
@@ -361,7 +456,17 @@ export async function inspectNativePortableStatus(options: {
         projectRoot: '.',
       }
     : projectNativePortableWorkspace(options.paths, runtime.state, options.gitContext);
-  const continuation = nativePortableContinuation(runtime.state, children);
+  const continuation = nativePortableContinuation(runtime.state, children, {
+    verifierExecutionRef: nativeVerifierExecutionRefForState(runtime.state, runtime.local),
+    ...(runtime.local
+      ? {
+          verificationCheckPlans: nativePortableCheckPlansFromLocal(
+            runtime.local,
+            runtime.local.workspace.projectRoot,
+          ),
+        }
+      : {}),
+  });
   const effectiveContinuation =
     workspace.bindingState === 'mismatch'
       ? {
@@ -379,22 +484,31 @@ export async function inspectNativePortableStatus(options: {
   const supervisorRoots = supervisor ? supervisorPublicRoots(options.paths, supervisor) : [];
   const supervisorSummary = supervisor
     ? (() => {
+        const projectedStatuses = new Map(
+          children?.children.map((child) => [child.name, child.status]) ?? [],
+        );
+        const effectiveStatus = (child: NativeSupervisorState['children'][number]) =>
+          projectedStatuses.get(child.name) ?? child.status;
         const waiting = supervisor.children.filter(
-          ({ status }) => status === 'pending' || status === 'ready',
+          (child) => effectiveStatus(child) === 'pending' || effectiveStatus(child) === 'ready',
         ).length;
         const working = supervisor.children.filter(
-          ({ status }) => status === 'active' || status === 'verified',
+          (child) => effectiveStatus(child) === 'active' || effectiveStatus(child) === 'verified',
         ).length;
         const integrated = supervisor.children.filter(
-          ({ status }) => status === 'integrated' || status === 'archived',
+          (child) =>
+            effectiveStatus(child) === 'integrated' || effectiveStatus(child) === 'archived',
         ).length;
         const blocked = supervisor.children.filter(
-          ({ status }) => status === 'blocked' || status === 'needs-reverify',
+          (child) =>
+            effectiveStatus(child) === 'blocked' || effectiveStatus(child) === 'needs-reverify',
         ).length;
         const active = supervisor.children
           .filter(
-            ({ status }) =>
-              status === 'active' || status === 'blocked' || status === 'needs-reverify',
+            (child) =>
+              effectiveStatus(child) === 'active' ||
+              effectiveStatus(child) === 'blocked' ||
+              effectiveStatus(child) === 'needs-reverify',
           )
           .slice(0, 16)
           .map((child) => ({
@@ -475,6 +589,7 @@ export async function inspectNativePortableStatus(options: {
   return {
     schema: 'comet.native.status.v2',
     name: runtime.state.name,
+    artifacts: nativeChangeArtifactPaths(options.paths, runtime.state.name),
     phase: runtime.state.phase,
     status: runtime.state.status,
     stateVersion: runtime.state.state_version,
@@ -487,10 +602,17 @@ export async function inspectNativePortableStatus(options: {
     verificationResult: runtime.state.verification_result,
     blockers: supervisor ? [] : stateSummary.blockers,
     workspace,
-    localExecution: {
-      status: localExpected ? runtime.localStatus : 'not-expected',
-      operation: runtime.localStatus === 'available' ? (runtime.local?.execution ?? null) : null,
-    },
+    localExecution: (() => {
+      const startup = verifierStartupProjection(
+        runtime.state,
+        runtime.localStatus === 'available' ? runtime.local : null,
+      );
+      return {
+        status: localExpected ? runtime.localStatus : 'not-expected',
+        operation: runtime.localStatus === 'available' ? (runtime.local?.execution ?? null) : null,
+        ...(startup ? { verifierStartup: startup } : {}),
+      };
+    })(),
     ...(children
       ? {
           childSummary: children.children.reduce<Record<string, number>>(

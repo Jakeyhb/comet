@@ -8,6 +8,7 @@ import {
   acquireNativeLock,
   diagnoseNativeLock,
   isProcessAlive,
+  NATIVE_LOCK_UNKNOWN_TAKEOVER_MS,
   readNativeLock,
   releaseNativeLock,
   takeOverNativeStaleLock,
@@ -140,22 +141,31 @@ describe('Native operation locks', () => {
     },
   );
 
-  it.each([
-    {
-      fileName: 'root-move.lock',
-      run: (work: () => Promise<void>) =>
-        withNativeMutationLock(paths, 'mutate after stale owner', work),
-    },
-    {
-      fileName: 'transition-example.lock',
-      run: (work: () => Promise<void>) =>
-        withNativeTransitionLock(paths, 'example', 'transition after stale owner', work),
-    },
-  ])('requires doctor takeover for a stale $fileName', async ({ fileName, run }) => {
+  it('takes over a same-host stale root-move lock automatically instead of failing', async () => {
     await fs.mkdir(paths.locksDir, { recursive: true });
-    const file = path.join(paths.locksDir, fileName);
+    const file = path.join(paths.locksDir, 'root-move.lock');
     const stale = {
-      id: `stale-${fileName}`,
+      id: 'stale-root-move',
+      pid: 2_147_483_647,
+      hostname: os.hostname(),
+      createdAt: '2026-07-17T00:00:00.000Z',
+      operation: 'interrupted operation',
+    };
+    await fs.writeFile(file, JSON.stringify(stale));
+    let entered = false;
+
+    await withNativeMutationLock(paths, 'mutate after stale owner', async () => {
+      entered = true;
+    });
+    expect(entered).toBe(true);
+    expect(await readNativeLock(file)).toBeNull();
+  });
+
+  it('requires doctor takeover for a stale transition lock', async () => {
+    await fs.mkdir(paths.locksDir, { recursive: true });
+    const file = path.join(paths.locksDir, 'transition-example.lock');
+    const stale = {
+      id: 'stale-transition',
       pid: 2_147_483_647,
       hostname: os.hostname(),
       createdAt: '2026-07-17T00:00:00.000Z',
@@ -165,7 +175,7 @@ describe('Native operation locks', () => {
     let entered = false;
 
     await expect(
-      run(async () => {
+      withNativeTransitionLock(paths, 'example', 'transition after stale owner', async () => {
         entered = true;
       }),
     ).rejects.toThrow(/already held/u);
@@ -190,6 +200,24 @@ describe('Native operation locks', () => {
     await fs.writeFile(file, JSON.stringify({ ...stale, hostname: 'another-host' }));
     expect(await diagnoseNativeLock(file)).toMatchObject({ status: 'unknown' });
     expect(await fs.readFile(file, 'utf8')).toContain('another-host');
+  });
+
+  it('does not treat a reused live pid with a different process identity as the lock owner', async () => {
+    await fs.mkdir(paths.locksDir, { recursive: true });
+    const file = path.join(paths.locksDir, 'archive.lock');
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        id: 'reused-pid-owner',
+        pid: process.pid,
+        hostname: os.hostname(),
+        createdAt: '2026-07-14T00:00:00.000Z',
+        operation: 'archive old-change',
+        processIdentity: 'different-process-instance',
+      }),
+    );
+
+    await expect(diagnoseNativeLock(file)).resolves.toMatchObject({ status: 'stale' });
   });
 
   it('fails closed for missing, malformed, oversized, and non-lock takeover targets', async () => {
@@ -223,11 +251,11 @@ describe('Native operation locks', () => {
         operation: 'active operation',
       }),
     );
-    const active = await diagnoseNativeLock(missing);
-    expect(active.status).toBe('active');
-    await expect(takeOverNativeStaleLock(paths, missing, active)).resolves.toMatchObject({
+    const unknown = await diagnoseNativeLock(missing);
+    expect(unknown.status).toBe('unknown');
+    await expect(takeOverNativeStaleLock(paths, missing, unknown)).resolves.toMatchObject({
       status: 'changed',
-      diagnosis: { status: 'active' },
+      diagnosis: { status: 'unknown' },
     });
 
     await expect(
@@ -258,6 +286,70 @@ describe('Native operation locks', () => {
       owner: stale,
     });
     expect(await readNativeLock(file)).toBeNull();
+  });
+
+  it('takes over an unknown lock under explicit repair only once its owner record has aged', async () => {
+    await fs.mkdir(paths.locksDir, { recursive: true });
+    const file = path.join(paths.locksDir, 'archive.lock');
+    const writeUnknownLock = (createdAt: string) =>
+      fs.writeFile(
+        file,
+        JSON.stringify({
+          id: 'remote-owner',
+          pid: 2_147_483_647,
+          hostname: 'another-host',
+          createdAt,
+          operation: 'archive old-change',
+        }),
+      );
+
+    await writeUnknownLock(new Date(Date.now() - 10 * 60 * 1_000).toISOString());
+    let diagnosis = await diagnoseNativeLock(file);
+    expect(diagnosis.status).toBe('unknown');
+    await expect(
+      takeOverNativeStaleLock(paths, file, diagnosis, { allowAgedUnknown: true }),
+    ).resolves.toMatchObject({ status: 'changed', diagnosis: { status: 'unknown' } });
+    expect(await readNativeLock(file)).not.toBeNull();
+
+    await writeUnknownLock(
+      new Date(Date.now() - NATIVE_LOCK_UNKNOWN_TAKEOVER_MS - 1_000).toISOString(),
+    );
+    diagnosis = await diagnoseNativeLock(file);
+    expect(diagnosis.status).toBe('unknown');
+    await expect(takeOverNativeStaleLock(paths, file, diagnosis)).resolves.toMatchObject({
+      status: 'changed',
+      diagnosis: { status: 'unknown' },
+    });
+    expect(await readNativeLock(file)).not.toBeNull();
+    await expect(
+      takeOverNativeStaleLock(paths, file, diagnosis, { allowAgedUnknown: true }),
+    ).resolves.toMatchObject({ status: 'removed', owner: { id: 'remote-owner' } });
+    expect(await readNativeLock(file)).toBeNull();
+  });
+
+  it('routes a legacy same-host owner without process identity through explicit aged repair', async () => {
+    await fs.mkdir(paths.locksDir, { recursive: true });
+    const file = path.join(paths.locksDir, 'archive.lock');
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        id: 'legacy-local-owner',
+        pid: process.pid,
+        hostname: os.hostname(),
+        createdAt: new Date(Date.now() - NATIVE_LOCK_UNKNOWN_TAKEOVER_MS - 1_000).toISOString(),
+        operation: 'archive old-change',
+      }),
+    );
+
+    const diagnosis = await diagnoseNativeLock(file);
+    expect(diagnosis.status).toBe('unknown');
+    await expect(takeOverNativeStaleLock(paths, file, diagnosis)).resolves.toMatchObject({
+      status: 'changed',
+      diagnosis: { status: 'unknown' },
+    });
+    await expect(
+      takeOverNativeStaleLock(paths, file, diagnosis, { allowAgedUnknown: true }),
+    ).resolves.toMatchObject({ status: 'removed', owner: { id: 'legacy-local-owner' } });
   });
 
   it('reports process liveness without turning invalid signals into a false stale result', () => {

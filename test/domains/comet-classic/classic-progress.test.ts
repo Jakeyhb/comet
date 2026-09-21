@@ -9,6 +9,7 @@ import {
   writeClassicCheckpoint,
   readClassicDelivery,
   writeClassicDelivery,
+  reauthorizeClassicDelivery,
   invalidateClassicDelivery,
 } from '../../../domains/comet-classic/classic-progress.js';
 import { classicTaskRevision } from '../../../domains/comet-classic/classic-tasks.js';
@@ -21,6 +22,9 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 const actualChildProcess =
   await vi.importActual<typeof import('node:child_process')>('node:child_process');
+function commandName(command: string): string {
+  return path.basename(command).replace(/\.(?:bat|cmd|exe)$/iu, '');
+}
 function resetCommands() {
   vi.mocked(childProcess.execFileSync)
     .mockReset()
@@ -299,6 +303,29 @@ describe('Classic structured progress', () => {
     ).rejects.toThrow('current and bound branch');
   });
 
+  it('allows an explicit post-archive reauthorization to move delivery to the current branch', async () => {
+    await archivedDelivery('push');
+    await writeFile(path.join(change, '.comet.yaml'), yaml(true) + 'bound_branch: main\n');
+    git('add', '.');
+    git('commit', '-m', 'bind archive branch');
+    git('checkout', '-b', 'release');
+    const reauthorized = await reauthorizeClassicDelivery(
+      root,
+      change,
+      { action: 'push', targetBranch: 'release', remote: 'origin' },
+      { ...state, archived: true },
+    );
+    expect(reauthorized.delivery).toMatchObject({
+      action: 'push',
+      targetBranch: 'release',
+    });
+    expect(reauthorized.verification).toMatchObject({
+      status: 'needsVerification',
+      currentBranch: 'release',
+      archiveCommitted: true,
+    });
+  });
+
   it.each([true, false])(
     'keeps post-commit receipts out of tracked authorization (runtime ignored: %s)',
     async (ignored) => {
@@ -396,7 +423,7 @@ describe('Classic structured progress', () => {
       args: string[],
       options: unknown,
     ) => {
-      if (command === 'git' && args.includes('ls-remote')) {
+      if (commandName(command) === 'git' && args.includes('ls-remote')) {
         expect(args.slice(-2)).toEqual(['origin', 'refs/heads/main']);
         expect(options).toMatchObject({ timeout: 5000, env: { GIT_TERMINAL_PROMPT: '0' } });
         expect(options).toMatchObject({
@@ -406,7 +433,7 @@ describe('Classic structured progress', () => {
         if (output instanceof Error) throw output;
         return output ?? `${commit}\trefs/heads/main`;
       }
-      if (command === 'gh') {
+      if (commandName(command) === 'gh') {
         expect(options).toMatchObject({ env: { GH_CONFIG_DIR: root, GH_PROMPT_DISABLED: '1' } });
         if (args[1] === 'list')
           expect(args).toEqual([
@@ -537,6 +564,75 @@ describe('Classic structured progress', () => {
       ).rejects.toThrow('verified archive commit');
       await rm(path.join(change, 'unexpected.md'));
     });
+    expect(git('status', '--porcelain')).toBe('');
+  });
+
+  it('names untracked files when the sealed change directory breaks archive integrity', async () => {
+    const commit = await archivedDelivery('push');
+    await writeFile(path.join(change, 'delivery-input.json'), '{"action":"local"}');
+    await expect(
+      writeClassicDelivery(
+        root,
+        change,
+        { action: 'push', targetBranch: 'main', commit },
+        { ...state, archived: true },
+      ),
+    ).rejects.toThrow('untracked files: changes/demo/delivery-input.json');
+    await rm(path.join(change, 'delivery-input.json'));
+    expect(git('status', '--porcelain')).toBe('');
+  });
+
+  it('reports an identifiable timeout instead of a fake archive mismatch', async () => {
+    const commit = await archivedDelivery('push');
+    const timeout = Object.assign(new Error('spawn git ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    let diffAttempts = 0;
+    const original = actualChildProcess.execFileSync;
+    vi.mocked(childProcess.execFileSync).mockImplementation(((
+      command: string,
+      args: string[],
+      options: unknown,
+    ) => {
+      if (commandName(command) === 'git' && args.includes('diff')) {
+        diffAttempts += 1;
+        throw timeout;
+      }
+      return original(command, args, options);
+    }) as typeof original);
+    await expect(
+      writeClassicDelivery(
+        root,
+        change,
+        { action: 'push', targetBranch: 'main', commit },
+        { ...state, archived: true },
+      ),
+    ).rejects.toThrow('Classic delivery git command timed out');
+    expect(diffAttempts).toBe(2);
+  });
+
+  it('accepts a verification git call that answers on the retry', async () => {
+    const commit = await archivedDelivery('push');
+    const timeout = Object.assign(new Error('spawn git ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    let diffAttempts = 0;
+    const original = actualChildProcess.execFileSync;
+    vi.mocked(childProcess.execFileSync).mockImplementation(((
+      command: string,
+      args: string[],
+      options: unknown,
+    ) => {
+      if (commandName(command) === 'git' && args.includes('diff')) {
+        diffAttempts += 1;
+        if (diffAttempts === 1) throw timeout;
+      }
+      return original(command, args, options);
+    }) as typeof original);
+    const result = await writeClassicDelivery(
+      root,
+      change,
+      { action: 'push', targetBranch: 'main', commit },
+      { ...state, archived: true },
+    );
+    expect(diffAttempts).toBeGreaterThanOrEqual(2);
+    expect(result.verification.archiveCommitted).toBe(true);
     expect(git('status', '--porcelain')).toBe('');
   });
 

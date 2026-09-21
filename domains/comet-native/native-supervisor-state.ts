@@ -135,6 +135,12 @@ function assertSupervisorState(value: unknown): asserts value is NativeSuperviso
       throw new Error(`Native Supervisor child ${child.name} summary is invalid`);
     }
     if (
+      child.builderFailureCount !== undefined &&
+      (!Number.isSafeInteger(child.builderFailureCount) || child.builderFailureCount < 0)
+    ) {
+      throw new Error(`Native Supervisor child ${child.name} Builder failure count is invalid`);
+    }
+    if (
       child.projectRoot !== undefined &&
       child.projectRoot !== null &&
       (typeof child.projectRoot !== 'string' || child.projectRoot.length === 0)
@@ -268,6 +274,26 @@ export async function readNativeSupervisorState(
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
+}
+
+export async function assertNoActiveNativeSupervisorTasks(
+  paths: Pick<NativeProjectPaths, 'changesRuntimeDir'>,
+  parent: string,
+): Promise<void> {
+  const active = await activeNativeSupervisorTaskNames(paths, parent);
+  if (active.length > 0) {
+    throw new Error(
+      `Native Supervisor Git binding cannot change while active child tasks exist: ${active.join(', ')}`,
+    );
+  }
+}
+
+export async function activeNativeSupervisorTaskNames(
+  paths: Pick<NativeProjectPaths, 'changesRuntimeDir'>,
+  parent: string,
+): Promise<string[]> {
+  const state = await readNativeSupervisorState(paths, parent, { diagnostics: true });
+  return state?.children.filter(({ task }) => task !== null).map(({ name }) => name) ?? [];
 }
 
 export async function writeNativeSupervisorState(

@@ -4,6 +4,7 @@ import {
   NATIVE_SUPERVISOR_COORDINATION_MODES,
   type NativePortableState,
 } from './native-portable-types.js';
+import { NATIVE_MAX_SUPERVISOR_BUILDER_FAILURES } from './native-supervisor-model.js';
 
 type NativePortableContinuationInputOption = {
   name: string;
@@ -63,7 +64,6 @@ export interface NativePortableContinuation {
     | 'resolve-verifier-blocker'
     | 'resolve-loop-stop'
     | 'advance-children'
-    | 'advance-parent'
     | 'builder-handoff'
     | 'dispatch-verifier'
     | 'retry-checks'
@@ -82,9 +82,20 @@ export interface NativePortableContinuation {
 
 export type NativePortableArchiveContinuationMode = 'archive-ready' | 'preview' | 'blocked';
 
+export interface NativePortableCheckPlanTemplate {
+  id: string;
+  name: string;
+  executable: string;
+  argv: readonly string[];
+  cwdRef: string;
+  timeoutMs: number;
+  repeatable: boolean;
+}
+
 export interface NativePortableContinuationOptions {
   verifierExecutionRef?: string;
   retryCheckIds?: readonly string[];
+  verificationCheckPlans?: readonly NativePortableCheckPlanTemplate[];
   supervisorIntegrationRetryIds?: readonly string[];
   archiveMode?: NativePortableArchiveContinuationMode;
   archiveBlockers?: readonly string[];
@@ -97,6 +108,7 @@ function localized(state: NativePortableState, english: string, chinese: string)
 function nativePortableUserCommunication(
   state: NativePortableState,
   coordinationChoiceRequired: boolean,
+  children?: NativeChildrenInspection | null,
 ): NativePortableUserCommunication {
   const noUserUpdate = (agentInstruction: string): NativePortableUserCommunication => ({
     required: false,
@@ -179,6 +191,25 @@ function nativePortableUserCommunication(
     state.status === 'blocked' &&
     state.blockers.some(({ resolution_action }) => resolution_action === 'retry-verifier')
   ) {
+    if (state.loop.retry_epoch >= 3) {
+      return state.language === 'zh-CN'
+        ? {
+            required: true,
+            message:
+              '自动重试验收已连续多轮未能取得结果，验证环境很可能不可用。请人工检查验证环境（subagent 配额、平台任务队列、网络），或使用 doctor --repair 评估该 change 状态。',
+            suggestedReply: '人工检查验证环境',
+            agentInstruction:
+              '只向用户转述 message，等待用户完成人工检查后再继续。不要自动重试验收。',
+          }
+        : {
+            required: true,
+            message:
+              'Automatic verification retries have failed across multiple rounds; the verification environment is likely unavailable. Inspect the environment manually (subagent quota, platform task queue, network), or use doctor --repair to assess the change state.',
+            suggestedReply: 'Inspect the verification environment',
+            agentInstruction:
+              'Relay message to the user and wait for a manual environment check before continuing. Do not retry verification automatically.',
+          };
+    }
     return state.language === 'zh-CN'
       ? {
           required: true,
@@ -258,7 +289,7 @@ function nativePortableUserCommunication(
     const stalled = stopReason === 'stalled';
     const zhMessage = stalled
       ? '验证已连续三轮失败且未通过的验收场景一直没有减少，本次修改已暂停，以避免在同一个问题上反复循环。你的代码和已经完成的检查都已安全保留。可以让 Builder 换一种修复思路继续，也可以回到需求阶段调整验收项。'
-      : '本次修改的验证失败次数已用完配置的预算，因此暂停等待你的决定，而不是自动重试。你的代码和已经完成的检查都已安全保留。可以让 Builder 换一种修复思路继续，也可以回到需求阶段调整验收项。';
+      : '本次修改的验证失败次数已用完配置的预算，因此暂停等待你的决定，而不是自动重试。你的代码和已经完成的检查都已安全保留。可以让 Builder 换一种修复思路继续，也可以回到需求阶段调整验收项。注意：预算不会重置，选择继续修复后，下一次验收失败会再次暂停。';
     const enMessage = stalled
       ? 'Verification has failed three times in a row without the unresolved scenarios shrinking, so this change is paused to avoid looping on the same problem. Your code and completed checks are safely preserved. You can have the Builder try a different repair approach, or go back and adjust the requirements.'
       : 'Verification for this change has used its configured failure budget, so it is paused for your decision instead of retrying automatically. Your code and completed checks are safely preserved. You can have the Builder continue with a different repair approach, or go back and adjust the requirements.';
@@ -302,6 +333,42 @@ function nativePortableUserCommunication(
   }
 
   if (state.phase === 'build' && state.status === 'active') {
+    const hardBlockedChildren =
+      children?.children.some(({ status }) => status === 'blocked') ?? false;
+    const reverifyChildren =
+      children?.children.some(({ status }) => status === 'needs-reverify') ?? false;
+    const progressingChildren =
+      children?.children.some(({ status }) => status === 'ready' || status === 'active') ?? false;
+    const explicitBuilderRetryAvailable =
+      children?.children.some(
+        ({ status, builderFailureCount }) =>
+          status === 'blocked' &&
+          (builderFailureCount ?? 0) >= NATIVE_MAX_SUPERVISOR_BUILDER_FAILURES,
+      ) ?? false;
+    if (
+      hardBlockedChildren &&
+      !reverifyChildren &&
+      !progressingChildren &&
+      !explicitBuilderRetryAvailable
+    ) {
+      return state.language === 'zh-CN'
+        ? {
+            required: true,
+            message:
+              'Supervisor 子任务暂时无法启动，已暂停自动重试以避免流程循环。请先根据子任务 blocker 修复工作区、分支或依赖；修复完成后重新运行最新的 next 继续流程。代码和已有证据已保留。',
+            suggestedReply: '修复 blocker 后继续',
+            agentInstruction:
+              '向用户说明子任务 blocker 和需要先完成的外部修复；不要反复执行 next，也不要创建替代任务。用户确认工作区或依赖已修复后，再重新读取 status 并执行最新 continuation。',
+          }
+        : {
+            required: true,
+            message:
+              'Supervisor child dispatch is paused because every remaining child is blocked. Automatic retries are stopped to avoid a loop. Resolve the recorded child blocker (workspace, branch, or dependency) first, then read the latest status and continue; code and completed evidence are preserved.',
+            suggestedReply: 'Resolve the blocker and continue',
+            agentInstruction:
+              'Explain the child blocker and the required external repair to the user. Do not repeatedly run next or spawn replacement tasks. After the user confirms the workspace or dependency is fixed, read status again and execute the latest continuation.',
+          };
+    }
     return noUserUpdate(
       localized(
         state,
@@ -437,6 +504,18 @@ function textInput(name: string, flag: string): NativePortableContinuationInputO
   return { name, flag, valueKind: 'text', required: true, template: null };
 }
 
+function nativeCheckPlanTemplate(): NativePortableCheckPlanTemplate {
+  return {
+    id: '<check-id>',
+    name: '<check-name>',
+    executable: '<executable>',
+    argv: [],
+    cwdRef: '.',
+    timeoutMs: 120000,
+    repeatable: true,
+  };
+}
+
 function confirmationInput(name: string, flag: string): NativePortableContinuationInputOption {
   return { name, flag, valueKind: 'confirmation', required: true, template: null };
 }
@@ -502,6 +581,35 @@ function nativeNextDecisionAlternative(options: {
   };
 }
 
+function nativePortableArchiveRepairAlternatives(
+  state: NativePortableState,
+  blockers: readonly string[],
+): NativePortableCommandAlternative[] {
+  const reportNeedsRepair = blockers.some((blocker) =>
+    /^verification\.md is (?:missing|stale|invalid)$/u.test(blocker),
+  );
+  if (!reportNeedsRepair) return [];
+  return [
+    {
+      name: 'repair-verification-report',
+      stateVersion: state.state_version,
+      expectedAction: 'archive-preview',
+      commandArgs: ['comet', 'native', 'doctor', state.name, '--repair'],
+      requiredInputs: [],
+      inputOptions: [],
+      description: localized(
+        state,
+        'Rebuild the Runtime-managed verification report, then rerun the Archive dry-run.',
+        '重建由 Runtime 管理的 verification.md，然后重新运行 Archive 预检。',
+      ),
+    },
+  ];
+}
+
+function isVerificationReportBlocker(blocker: string): boolean {
+  return /^verification\.md is (?:missing|stale|invalid)$/u.test(blocker);
+}
+
 function nativeNextRevisionAlternatives(options: {
   change: string;
   stateVersion: number;
@@ -560,7 +668,7 @@ export function nativePortableContinuation(
 ): NativePortableContinuation {
   const coordinationRequired =
     supervisorCoordinationRequired(children) && state.coordination_mode === undefined;
-  const userCommunication = nativePortableUserCommunication(state, coordinationRequired);
+  const userCommunication = nativePortableUserCommunication(state, coordinationRequired, children);
   const base = {
     schema: 'comet.native.continuation.v2' as const,
     skill: 'comet-native' as const,
@@ -717,6 +825,25 @@ export function nativePortableContinuation(
       disposition: 'await-user',
       action: 'none',
       commandArgs: null,
+      // Fallback for uncovered await-user states: surface the blocker message
+      // and the revision alternatives so the agent always has an executable
+      // next step instead of a dead `action: none` with no options.
+      commandAlternatives: nativeNextRevisionAlternatives({
+        change: state.name,
+        stateVersion: state.state_version,
+      }),
+      userCommunication: {
+        ...base.userCommunication,
+        required: true,
+        message:
+          state.blockers.length > 0
+            ? state.blockers.map(({ reason }) => reason).join('; ')
+            : base.userCommunication.message,
+        suggestedReply:
+          state.blockers.length > 0
+            ? (state.blockers[0]?.resolution_action ?? null)
+            : base.userCommunication.suggestedReply,
+      },
       requiredInputs: ['resolve-blocker'],
       runnerAction: runner('none'),
     };
@@ -810,9 +937,21 @@ export function nativePortableContinuation(
           ...base,
           disposition: 'continue',
           action: 'repair',
-          commandArgs: null,
+          // The repair loop continues by editing children.yaml and running
+          // `next`; the children-contract drift detection then returns the
+          // change to Shape for confirmation (issue: an actionless repair
+          // continuation left agents with no executable step).
+          commandArgs: ['comet', 'native', 'next', state.name, '--summary', '<summary>'],
           requiredInputs: ['repair-child'],
-          inputOptions: [],
+          inputOptions: [
+            {
+              name: 'summary',
+              flag: '--summary',
+              valueKind: 'text' as const,
+              required: true,
+              template: null,
+            },
+          ],
           runnerAction: runner('none'),
         };
       }
@@ -841,6 +980,7 @@ export function nativePortableContinuation(
                 summary: '<summary>',
                 addressed_acceptance_ids: ['<acceptance-id>'],
                 checks: [{ name: '<check-name>', result: 'not-run', note: null }],
+                verification_checks: [nativeCheckPlanTemplate()],
                 known_limits: [],
               },
             },
@@ -896,24 +1036,66 @@ export function nativePortableContinuation(
       const blocked = children.children.some(
         ({ status }) => status === 'blocked' || status === 'needs-reverify',
       );
+      const reverifyPending = children.children.some(({ status }) => status === 'needs-reverify');
       const progressing = children.children.some(
         ({ status }) => status === 'ready' || status === 'active',
       );
+      const exhaustedBuilder =
+        children.supervisorStateVersion === undefined
+          ? null
+          : (children.children.find(
+              (child) =>
+                child.status === 'blocked' &&
+                (child.builderFailureCount ?? 0) >= NATIVE_MAX_SUPERVISOR_BUILDER_FAILURES,
+            ) ?? null);
+      const builderRetryOption =
+        exhaustedBuilder === null
+          ? null
+          : {
+              name: 'runner-input',
+              flag: '--runner-input' as const,
+              valueKind: 'json-file' as const,
+              required: true,
+              template: {
+                kind: 'supervisor-retry-builder',
+                child: exhaustedBuilder.name,
+                stateVersion: children.supervisorStateVersion,
+              },
+              description: localized(
+                state,
+                'Explicitly authorize one fresh Builder attempt after the Builder failure budget was exhausted.',
+                'Builder 失败预算已耗尽；明确授权后才能重新开始一次 Builder 尝试。',
+              ),
+            };
+      const blockedWithoutBuilderRetry =
+        blocked && !reverifyPending && !progressing && builderRetryOption === null;
       return {
         ...base,
-        disposition: blocked && !progressing ? 'blocked' : 'continue',
+        disposition: blockedWithoutBuilderRetry ? 'blocked' : 'continue',
         action: 'advance-children',
-        commandArgs: [
-          'comet',
-          'native',
-          'next',
-          state.name,
-          '--summary',
-          '<summary>',
-          ...(state.coordination_mode === 'single-session' ? ['--max-parallel', '1'] : []),
-        ],
-        requiredInputs: blocked && !progressing ? ['resolve-child-blocker'] : ['ready-children'],
-        inputOptions: [textInput('summary', '--summary')],
+        commandArgs: blockedWithoutBuilderRetry
+          ? null
+          : builderRetryOption !== null
+            ? ['comet', 'native', 'next', state.name, '--runner-input', '<temporary-json-file>']
+            : [
+                'comet',
+                'native',
+                'next',
+                state.name,
+                '--summary',
+                '<summary>',
+                ...(state.coordination_mode === 'single-session' ? ['--max-parallel', '1'] : []),
+              ],
+        requiredInputs: blockedWithoutBuilderRetry
+          ? []
+          : builderRetryOption !== null
+            ? ['supervisor-builder-retry-json-file']
+            : ['ready-children'],
+        inputOptions: blockedWithoutBuilderRetry
+          ? []
+          : builderRetryOption !== null
+            ? [builderRetryOption]
+            : [textInput('summary', '--summary')],
         runnerAction: runner('none'),
       };
     }
@@ -941,6 +1123,7 @@ export function nativePortableContinuation(
             summary: '<summary>',
             addressed_acceptance_ids: ['<acceptance-id>'],
             checks: [{ name: '<check-name>', result: 'not-run', note: null }],
+            verification_checks: [],
             known_limits: [],
           },
         },
@@ -951,15 +1134,7 @@ export function nativePortableContinuation(
   if (state.phase === 'verify') {
     const awaiting = state.loop.next_action === 'await-verifier-result';
     const supervisor = Boolean(state.children_contract_hash);
-    const checkTemplate = {
-      id: '<check-id>',
-      name: '<check-name>',
-      executable: '<executable>',
-      argv: [],
-      cwdRef: '.',
-      timeoutMs: 120000,
-      repeatable: true,
-    };
+    const checkTemplate = nativeCheckPlanTemplate();
     if (!awaiting && options.retryCheckIds && options.retryCheckIds.length > 0) {
       return {
         ...base,
@@ -1073,7 +1248,17 @@ export function nativePortableContinuation(
                   verifierExecutionRef: options.verifierExecutionRef ?? '<from verifierDispatch>',
                 },
               ]
-            : { kind: 'dispatch-verifier', checks: supervisor ? [checkTemplate] : [] },
+            : {
+                kind: 'dispatch-verifier',
+                checks: options.verificationCheckPlans
+                  ? options.verificationCheckPlans.map((plan) => ({
+                      ...plan,
+                      argv: [...plan.argv],
+                    }))
+                  : supervisor
+                    ? [checkTemplate]
+                    : [],
+              },
         },
       ]),
       runnerAction: runner(awaiting ? 'await-verifier' : 'dispatch-verifier'),
@@ -1101,6 +1286,24 @@ export function nativePortableContinuation(
     }
     if (archiveMode === 'preview') {
       if (options.archiveBlockers && options.archiveBlockers.length > 0) {
+        const reportRepair = nativePortableArchiveRepairAlternatives(
+          state,
+          options.archiveBlockers,
+        )[0];
+        if (
+          reportRepair &&
+          options.archiveBlockers.every((blocker) => isVerificationReportBlocker(blocker))
+        ) {
+          return {
+            ...base,
+            disposition: 'continue',
+            action: 'repair',
+            commandArgs: reportRepair.commandArgs,
+            requiredInputs: [],
+            inputOptions: [],
+            runnerAction: runner('none'),
+          };
+        }
         return {
           ...base,
           disposition: 'blocked',
@@ -1108,6 +1311,10 @@ export function nativePortableContinuation(
           commandArgs: null,
           requiredInputs: ['archive-blocker-resolution'],
           inputOptions: [],
+          commandAlternatives: nativePortableArchiveRepairAlternatives(
+            state,
+            options.archiveBlockers,
+          ),
           runnerAction: runner('none'),
         };
       }

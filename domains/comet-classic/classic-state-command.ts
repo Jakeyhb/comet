@@ -1,10 +1,12 @@
 import { spawnSync } from 'child_process';
 import path from 'path';
 import { Document, parseDocument } from 'yaml';
+import { samePath } from '../../platform/paths/git-worktree.js';
 import type { CliOutputEnvelope } from '../workflow-contract/output-envelope.js';
 import type { ClassicCommandHandler, ClassicCommandResult } from './classic-cli.js';
 import {
   clearCurrentChange,
+  clearCurrentChangeIf,
   resolveCurrentChange,
   selectCurrentChange,
 } from './classic-current-change.js';
@@ -75,6 +77,7 @@ import {
   readClassicCheckpoint,
   writeClassicCheckpoint,
   readClassicDelivery,
+  reauthorizeClassicDelivery,
   writeClassicDelivery,
   invalidateClassicDelivery,
 } from './classic-progress.js';
@@ -419,6 +422,8 @@ function gitOutput(args: string[]): string | null {
   const result = spawnSync('git', args, {
     cwd: classicCommandProjectRoot(),
     encoding: 'utf8',
+    timeout: 30_000,
+    windowsHide: true,
   });
   return result.status === 0 ? result.stdout.trim() : null;
 }
@@ -825,14 +830,27 @@ async function applyTransitionEvent(
       unknownKeys: projection.unknownKeys,
     });
   }
-  await appendClassicStateEvent(directory, {
-    change: name,
-    event,
-    source: 'comet-state',
-    from: classic,
-    to: result.classic,
-    effects: result.effects,
-  });
+  try {
+    await appendClassicStateEvent(directory, {
+      change: name,
+      event,
+      source: 'comet-state',
+      from: classic,
+      to: result.classic,
+      effects: result.effects,
+    });
+  } catch (error) {
+    // The transition itself already committed (phase + epoch are on disk). A
+    // failing audit-log append must not flip the command to failure, which
+    // would make callers retry an already-applied transition.
+    output.stderr.push(
+      red(
+        `[WARN] transition ${event} applied but the state event log append failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      ),
+    );
+  }
 
   for (const effect of result.effects) {
     output.stderr.push(green(`[SET] ${wireField(effect.field)}=${wireValue(effect.to)}`));
@@ -871,6 +889,22 @@ async function transitionLocked(output: CommandOutput, name: string, event: stri
     return;
   } else if (event === 'verify-fail') {
     await requirePhase(name, 'verify');
+    // Soft guard against agent loops: each verify-fail costs a full rebuild
+    // and re-verification cycle on the next build-complete. After three
+    // failures the transition still succeeds only with an explicit ack, so a
+    // mechanical retry loop hits a decision point instead of burning cycles.
+    const verifyFailures = Number((await readField(name, 'verify_failures')) ?? 0);
+    if (
+      Number.isFinite(verifyFailures) &&
+      verifyFailures >= 3 &&
+      process.env.COMET_ACK_VERIFY_FAILURES !== '1'
+    ) {
+      fail(
+        `ERROR: '${name}' has already failed verification ${verifyFailures} times\n` +
+          '  Repeated verify-fail transitions cost a full build + verification cycle each.\n' +
+          '  Fix the reported failures, or set COMET_ACK_VERIFY_FAILURES=1 to accept another round deliberately.',
+      );
+    }
   } else if (event === 'archive-confirm') {
     await requirePhase(name, 'archive');
     if ((await readField(name, 'verify_result')) !== 'pass') {
@@ -960,7 +994,7 @@ async function next(output: CommandOutput, name: string): Promise<void> {
     output.stdout.push(
       complete
         ? 'NEXT: done'
-        : 'NEXT: delivery\nSKILL: comet-archive\nInspect authorized delivery and actual results; do not archive again.',
+        : `NEXT: delivery\nSKILL: comet-archive\nInspect authorized delivery and actual results; do not archive again. If the target branch or remote must change after Archive, record a new authorization with: comet state delivery ${name} --reauthorize --file <json>.`,
     );
     return;
   }
@@ -1129,25 +1163,36 @@ async function progressCommand(
   kind: 'checkpoint' | 'delivery',
   args: string[],
 ) {
+  const reauthorize = kind === 'delivery' && args[1] === '--reauthorize';
+  const inputIndex = reauthorize ? 3 : 2;
   if (
     args.length !== 1 &&
     !(args.length === 3 && args[1] === '--file') &&
+    !(reauthorize && args.length === 4 && args[2] === '--file') &&
     !(kind === 'delivery' && args.length === 2 && args[1] === '--verify')
   )
     fail(
-      `Usage: comet state ${kind} <change-name> [--file <json>${kind === 'delivery' ? ' | --verify' : ''}]`,
+      `Usage: comet state ${kind} <change-name> [--file <json>${kind === 'delivery' ? ' | --verify | --reauthorize --file <json>' : ''}]`,
     );
   validateChangeName(args[0]);
   const { directory, file } = await stateFile(args[0]);
   const root = classicCommandProjectRoot();
-  const write = args[1] === '--file';
+  const write = args[1] === '--file' || reauthorize;
+  if (write && kind === 'delivery') {
+    const inputPath = path.isAbsolute(args[inputIndex])
+      ? path.resolve(args[inputIndex])
+      : path.resolve(root, args[inputIndex]);
+    if (samePath(inputPath, path.resolve(path.join(directory, '.comet', 'delivery.json'))))
+      fail(
+        'ERROR: delivery input file collides with the Runtime record path <change-dir>/.comet/delivery.json; save the input outside the change directory',
+      );
+  }
   const operation = async () => {
     const state = sparseClassicState((await readDocument(file)).toJS() as Record<string, unknown>);
     const input = write
       ? JSON.parse(
-          await readClassicProjectFile(root, args[2], {
+          await readClassicProjectFile(root, args[inputIndex], {
             label: 'Classic progress input',
-            maxBytes: 64 * 1024,
           }),
         )
       : null;
@@ -1162,7 +1207,9 @@ async function progressCommand(
         : await readClassicCheckpoint(root, directory, source);
     } else {
       output.data = write
-        ? await writeClassicDelivery(root, directory, input, state)
+        ? reauthorize
+          ? await reauthorizeClassicDelivery(root, directory, input, state)
+          : await writeClassicDelivery(root, directory, input, state)
         : await readClassicDelivery(root, directory, { verifyRemote: args[1] === '--verify' });
     }
     output.stdout.push(
@@ -1171,16 +1218,27 @@ async function progressCommand(
   };
   if (write) {
     await assertStateCommandWritable('set');
-    const binding = await resolveBranchBinding(directory, {
-      heal: false,
-      cwd: classicCommandInvocationCwd(),
-    });
-    if (binding.status === 'drift' || binding.status === 'unbound-detached')
-      fail(
-        'ERROR: progress update requires the bound branch; inspect the workspace before retrying',
-      );
+    if (!reauthorize) {
+      const binding = await resolveBranchBinding(directory, {
+        heal: false,
+        cwd: classicCommandInvocationCwd(),
+      });
+      if (binding.status === 'drift' || binding.status === 'unbound-detached')
+        fail(
+          'ERROR: progress update requires the bound branch; inspect the workspace before retrying',
+        );
+    }
     await withClassicStateLock(directory, operation);
   } else await operation();
+  if (
+    kind === 'delivery' &&
+    ['complete', 'local-verified'].includes(
+      (output.data as { verification?: { status?: string } } | undefined)?.verification?.status ??
+        '',
+    )
+  ) {
+    await clearCurrentChangeIf(root, args[0]);
+  }
 }
 
 async function check(
@@ -1541,7 +1599,11 @@ async function recover(
   const workflow = classic.workflow;
   const locale = classicLocale(classic.language);
   const evidenceScopes = projection.run
-    ? await recoverCommandChecks(classicCommandProjectRoot(), directory, projection.run)
+    ? await recoverCommandChecks(classicCommandProjectRoot(), directory, projection.run, {
+        // Archive trajectories are sealed evidence. Recovery may inspect their
+        // exact plans but must never append a new invalidation event to them.
+        persistInvalidation: !classic.archived,
+      })
     : { build: 'rerun-required', verify: 'rerun-required' };
   const checkpoint = path.join(directory, '.comet', 'subagent-progress.md');
   const context = await classicRecoveryContext(
@@ -1549,6 +1611,7 @@ async function recover(
     directory,
     classic,
     details,
+    projection.run ?? null,
   );
   output.data = {
     ...context,
@@ -1765,6 +1828,22 @@ async function selectChange(output: CommandOutput, name: string): Promise<void> 
   validateChangeName(name);
   try {
     const requestedRoot = classicCommandProjectRoot();
+    // Fast path: when the recorded selection already routes this change to this
+    // workspace and its directory is present, the per-worktree enumeration is
+    // pure overhead — selecting again only rewrites the same selection.
+    const resolution = await resolveCurrentChange(requestedRoot);
+    if (resolution.status === 'selected' && resolution.selection.change === name) {
+      const selection = await selectCurrentChange(requestedRoot, name);
+      const change = await resolveClassicChangeDirectory(name, requestedRoot);
+      const state = await readClassicState(change.directory, { migrate: false });
+      const bound = state.classic?.boundBranch ?? null;
+      output.stderr.push(
+        green(
+          `[SELECTED] current change: ${selection.change}${bound ? ` (branch: ${bound})` : ''}`,
+        ),
+      );
+      return;
+    }
     const workspace = await resolveClassicWorkspace({ projectRoot: requestedRoot, name });
     const selection = await selectCurrentChange(workspace.projectRoot, name);
     const change = await resolveClassicChangeDirectory(name, workspace.projectRoot);
@@ -1974,11 +2053,18 @@ export const classicStateCommand: ClassicCommandHandler = withProjectContext(
       }
       if (options.json && ['init', 'set', 'transition', 'select'].includes(subcommand)) {
         const { directory } = await stateFile(rest[0]);
-        const state = (await readClassicState(directory, { migrate: false })).classic;
+        const updated = await readClassicState(directory, { migrate: false });
+        const state = updated.classic;
         if (state)
           output.data = {
             ...(output.data && typeof output.data === 'object' ? output.data : {}),
-            ...(await classicRecoveryContext(classicCommandProjectRoot(), directory, state)),
+            ...(await classicRecoveryContext(
+              classicCommandProjectRoot(),
+              directory,
+              state,
+              false,
+              updated.run ?? null,
+            )),
             change: rest[0],
             phase: state.phase,
             configuration: state,

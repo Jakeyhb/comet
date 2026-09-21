@@ -304,10 +304,24 @@ export interface ProjectKnowledgeDashboardDiagnostic {
   readonly message: string;
 }
 
+export interface ProjectMemoryDashboardSummary {
+  readonly directory: string;
+  readonly total: number;
+  readonly entries: readonly import('./project-memory.js').ProjectMemoryEntrySummary[];
+  readonly applicationCount: number;
+  readonly lastApplication?: AgentContextApplicationRecord;
+  readonly applicationHistory?: readonly AgentContextApplicationRecord[];
+}
+
 export interface ProjectKnowledgeDashboardSnapshot {
   readonly provider: WorkflowKnowledgeProvider;
   readonly configured: boolean;
   readonly remote?: ProjectKnowledgeDashboardRemoteSummary;
+  readonly projectMemory?: ProjectMemoryDashboardSummary;
+  readonly localLimits: {
+    readonly maxFileMb: number;
+    readonly maxTotalMb: number;
+  };
   readonly local?: {
     readonly available: boolean;
     readonly repositoryId: string;

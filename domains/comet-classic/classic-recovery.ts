@@ -1,4 +1,5 @@
 import path from 'node:path';
+import type { RunState } from '../engine/types.js';
 import type { ClassicState } from './classic-state.js';
 import { assertClassicLayoutReadable } from './classic-layout.js';
 import { classicProjectTargetExists, readClassicProjectFile } from './classic-protected-path.js';
@@ -6,6 +7,7 @@ import {
   classicTaskRevision,
   inspectClassicPlanTasks,
   parseClassicTasks,
+  type ClassicTask,
 } from './classic-tasks.js';
 import { readClassicCheckpoint, readClassicDelivery } from './classic-progress.js';
 import { inspectClassicPlanReadiness } from './classic-plan-readiness.js';
@@ -27,9 +29,15 @@ export async function classicRecoveryContext(
   directory: string,
   state: ClassicState,
   details = false,
+  run?: RunState | null,
 ) {
   const paths = await assertClassicLayoutReadable(root);
-  const projection = await readClassicState(directory, { migrate: false });
+  // Callers that just read the projection hand over its run part; only the
+  // sparse-document callers pay the extra read here.
+  const projection =
+    run === undefined
+      ? await readClassicState(directory, { migrate: false })
+      : { classic: state, run: run ?? null };
   const taskFile = path.join(directory, 'tasks.md');
   const taskFileExists = await classicProjectTargetExists(root, taskFile, {
     label: 'Classic task authority',
@@ -38,7 +46,15 @@ export async function classicRecoveryContext(
   const source = taskFileExists
     ? await readClassicProjectFile(root, taskFile, { label: 'Classic recovery task authority' })
     : '';
-  const tasks = parseClassicTasks(source);
+  // A single malformed task line must not take down the whole recovery
+  // context; treating it as no readable tasks keeps recovery usable while the
+  // guard's tasks.md check reports the exact line.
+  let tasks: ClassicTask[];
+  try {
+    tasks = parseClassicTasks(source);
+  } catch {
+    tasks = [];
+  }
   const next = tasks.find((task) => !task.completed) ?? null;
   const planExists = Boolean(
     state.plan &&

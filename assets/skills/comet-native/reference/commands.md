@@ -30,6 +30,25 @@ After actually using an item, obtain its identifier from JSON `applications[].ap
 
 If verification, compilation, or linting fails, address the error and rerun. At task completion, still call `comet task <project-root> --task "<original user request>" --complete --workflow <workflow> --change <change-id> --learning-check submitted|no-observation|not-run --json` to record completion. An unavailable command, empty result, or failed automatic retrieval does not block the task. On platforms without Hooks, this Skill calls the same interfaces; `comet memory context` is a compatibility entry only.
 
+## User Hook writes
+
+The Comet Hook Router only checks write targets; it does not replace or invoke a project's other Hooks. Writes outside the project are allowed without Comet attribution. When a user Hook writes shared project files during Shape, Verify, or Archive, configure a dedicated directory in `.comet/config.yaml`:
+
+```yaml
+hook:
+  allow_paths:
+    - .my-hook-output
+    - docs/team-notes
+```
+
+Paths are project-relative directories; the directory and its descendants are allowed, and the setting is shared by Native and Classic. Explicitly configured paths do not require a current change selection when several changes are active. `.comet/config.yaml` is also a permitted control write.
+
+`.comet/`, `native.artifact_root/comet/`, and Classic workflow artifact roots remain workflow-owned and cannot be bypassed through `allow_paths`. If one Hook event contains multiple targets, every non-allowlisted target still goes through phase checks; keep user Hook output in a dedicated directory.
+
+Native formal artifacts may be created only after `comet native new <name> --json` registers the change. Runtime initializes the brief; edit the corresponding files using `artifacts.briefPath`, `artifacts.specsDir`, and the other returned paths. A rejection names the reason, wrong target, correct target, and next action: run the supplied CLI command or correct the original target and retry. Do not search other directories for same-named files or classify custom Hook and ordinary development files as Comet-owned.
+
+When the user explicitly wants to revoke a capability association, first run `comet native status <change> --json`, then use `data.stateVersion` from that latest response in `comet native spec disassociate <change> --expected-state-version <data.stateVersion> --expected-action disassociate-capability`, and follow the new continuation. For any other association-file write intent, query status without guessing revocation; do not remove the file manually.
+
 ## Filling command inputs
 
 Read this section before first filling a Runtime template or returning a result through `returnAction`.
@@ -40,7 +59,7 @@ Options in the same `exclusiveGroup` within `inputOptions` are mutually exclusiv
 
 Supervisor children work in the task package's `projectRoot`. Return results through the controller directory, command, and template specified by `returnAction`.
 
-After copying Runner input, you may validate its JSON structure with `comet native next <change> --runner-input <file> --validate-only --json`. This does not write state or start checks. Actual submission must still use the state version, task identifiers, and arguments in the current `continuation`.
+Submit directly once the template is filled completely; Runtime validates the input on submission, so no pre-check pass is needed. Use `comet native next <change> --runner-input <file> --validate-only --json` only when a submission was rejected and you need to distinguish a JSON structure error from a business validation error; it does not write workflow state (comet-state.yaml) or start checks. Actual submission must still use the state version, task identifiers, and arguments in the current `continuation`.
 
 ## Builder handoff
 
@@ -49,6 +68,14 @@ Read this section before submitting `builder-handoff`.
 An ordinary change or Supervisor parent does not need an additional read-only review before Verify. If a separate read-only review already exists, the Runtime template accepts optional `review.status=passed`, `review.summary`, and `review.reviewer_execution_ref`. The review execution identifier must differ from the Builder's.
 
 The Builder handoff must describe this iteration's changes, acceptance items addressed, development checks actually run and not run, and known limitations. An earlier review cannot replace the formal Verifier, which still independently assesses every acceptance item.
+
+During development, prefer focused checks that give fast feedback on the current change. At handoff, put the final check plan in `builder-handoff.verification_checks` instead of running the same complete plan directly in the Builder first. Runtime freezes the candidate, executes the plan, and returns `runtimeCheckExecution.disposition`:
+
+- `executed`: Runtime ran the plan in this action. After every check passes, Runtime enters Verify and prefills the same plan in the next `dispatch-verifier` action.
+- A failed check, or an interrupted nonrepeatable check: Runtime returns the change to Build; repair the implementation and submit a new Builder handoff.
+- An interrupted repeatable check: retry only the checks named by the latest `retry-checks` template.
+
+Use `verification_checks` only for commands Runtime can safely manage on the current candidate. Leave external-service checks, one-time operations, and steps that cannot be safely retried for the Verifier to assess under their existing execution constraints. `builder-handoff.checks` continues to report development checks the Builder did or did not run; it never becomes formal Runtime check evidence.
 
 Runtime saves the summary in `comet-state.yaml`, not a separate file; it does not mean acceptance has passed. Submit it once; Runtime passes necessary summaries to the Verifier.
 
@@ -73,22 +100,24 @@ Pass any `recoveryContext` unchanged too; it contains the latest recovery or use
 
 When Runtime requests `dispatch-verifier`:
 
-1. Fill `inputOptions.template` with the tests and checks needed for this candidate, for Runtime to execute. A Runtime check receipt records the result and its candidate, workspace, and input associations. Successful checks are reusable on the same candidate, workspace, and machine when inputs are unchanged and receipts are complete.
+1. Prefer submitting the final check plan through Builder handoff `verification_checks`; if it was not submitted there, add it to the `dispatch-verifier` `inputOptions.template`. Runtime evidence binds the result to the candidate, workspace, machine, command, inputs, and tool environment. After handoff checks pass, execute Runtime's prefilled `dispatch-verifier` unchanged. When the binding is unchanged, Runtime returns `runtimeCheckExecution.disposition=reused` and does not execute the same plan again; a changed plan or binding is executed again. Ordinary Builder logs cannot replace this evidence.
 2. After interrupted checks, retry only the repeatable checks listed by the latest `continuation` action `retry-checks`. Do not treat assertion failures or nonrepeatable checks as environment failures to retry automatically.
-3. Read `verifierDispatch` for workspace and check-record locations, `scopeIds`, acceptance count, brief/Spec references, detail pagination arguments, optional review summary, and check results. The package does not inline every acceptance text; use pagination to read every scenario covered by `scopeIds`.
-4. Immediately launch a new read-only Verifier subagent through the platform's native capability. Pass directories, check-record locations, and any `recoveryContext` unchanged. If subagents are unavailable, a separate Agent session from the Builder is allowed only when the user selected multi-session coordination and the platform can manage independent sessions. Otherwise report Verifier unavailability as specified below and follow the latest `continuation`.
+3. Read `verifierDispatch` for workspace and check-record locations, `scopeIds`, `scopeCount`, total acceptance count, brief/Spec references, detail pagination arguments, optional review summary, and check results. The package does not inline every acceptance text; use pagination to read every scenario covered by `scopeIds`.
+4. Immediately launch a new read-only Verifier subagent through the platform's native capability. Pass directories, check-record locations, and any `recoveryContext` unchanged. If the launch call is rejected or fails, handle it as `verifier-execution-error` immediately; the dispatch is complete only after the platform accepts the launch. If subagents are unavailable, a separate Agent session from the Builder is allowed only when the user selected multi-session coordination and the platform can manage independent sessions. Otherwise report Verifier unavailability as specified below and follow the latest `continuation`.
 
 `dispatch-verifier` registers the attempt and returns its package and attempt identifier. It does not start an independent service or process, and requires no service address or callback. Verifier results must return this package's `candidateId` and `verifierExecutionRef` unchanged. Runtime rejects late results for older candidates or Verifier tasks.
 
+While waiting, use `status` and read `localExecution.verifierStartup`: `unconfirmed` means only the dispatch record exists and the Verifier has not yet contacted Runtime; `confirmed` means the Verifier reported startup or already added checks. When unconfirmed and the subagent is unresponsive, verify the dispatch actually succeeded. A missing receipt alone is not an execution failure; recording an error still follows the conditions under "Independent acceptance and results" below.
+
 ### Independent acceptance and results
 
-The Verifier remains read-only throughout. First read the scenarios identified by current `scopeIds`, the brief, complete target Specs, actual implementation, and Runtime check results. Confirm that recorded checks match the current candidate, workspace, and inputs and cover all acceptance items. Add only missing or invalidated checks through `inputOptions.template` for Runtime to execute. Independently assess every acceptance item regardless of check reuse.
+The Verifier remains read-only throughout. Its first Runtime action is the `verifier-started` startup receipt (`candidateId` and `verifierExecutionRef` copied unchanged from the package; repeated submission has no side effect). It then reads the scenarios identified by current `scopeIds`, the brief, complete target Specs, actual implementation, and Runtime check results. Confirm that recorded checks match the current candidate, workspace, and inputs and cover the current scope. Add only missing or invalidated checks through `inputOptions.template` for Runtime to execute. Independently assess every acceptance item in `scopeIds` regardless of check reuse.
 
 Read the Builder handoff last, as investigation leads. The Builder provides only implementation locations, acceptance IDs and references, check-record locations, known limitations, and relevant file locations. Read log bodies on demand.
 
 A wait-tool timeout means keep waiting for the same Verifier. Record an execution error and retry only after the platform confirms execution failure, an execution timeout, a lost task, or completion without a usable result.
 
-For `verifier-response`, mark each scenario in current `scopeIds` exactly once as `passed`, `failed`, or `blocked`. Give a concrete reason for failed or blocked items so the next Build can address them.
+For `verifier-response`, submit this result shape: The response lists only the current `scopeIds` and marks each scenario exactly once as `passed`, `failed`, or `blocked`. Give a concrete reason for failed or blocked items. Runtime filters a known superset only when the extra criteria already passed and still report `passed`; nonexistent IDs, duplicates, missing scope IDs, and out-of-scope `failed` or `blocked` results remain invalid.
 
 After submission of a repaired implementation, Runtime retains still-valid check receipts and a new formal Verifier assesses every scenario in one round. Once all pass, wait directly for user acceptance. Do not automatically clear results and add another identical full verification round.
 
@@ -114,9 +143,9 @@ Read before dispatching, receiving results, or integrating. Read [filling comman
 
 ### Dispatch and task identifiers
 
-One confirmed Supervisor Shape authorizes every child within confirmed scope; do not ask for that scope again. Execute only actions returned in Runtime's `continuation`, rereading `readyChildren` after each task completes. Each child must progress through `active → verified → integrated`. The Supervisor parent then verifies every acceptance item in the integration worktree.
+One confirmed Supervisor Shape authorizes every child within confirmed scope; do not ask for that scope again. Execute only actions returned in Runtime's `continuation`, rereading `readyChildren` after each task completes. Each child must progress through `active → verified → integrated`; a failed verification, a recorded lost-Verifier failure, or a contract revision touching an existing candidate moves the child to `needs-reverify`, and Runtime redispatches its Verifier automatically on the next `next` call (counted as blocked in `childSummary`). The Supervisor parent then verifies every acceptance item in the integration worktree.
 
-When handling `childSummary`, do not run the Supervisor Change Builder. Handle only ready children listed in `readyChildren` and Supervisor coordination actions. Read details only when a child's complete state is needed.
+When handling `childSummary`, do not run the Supervisor Change Builder. Handle only ready children listed in `readyChildren` and Supervisor coordination actions. When tasks are in flight, `readyChildren` lists those in-flight tasks; once capacity frees, the next `next` call dispatches remaining ready children automatically. Read details only when a child's complete state is needed.
 
 For each child, Runtime returns its worktree, the integration branch's current commit, role, task package, and `runId`. Builder and Verifier results must carry the current `runId`; Runtime rejects duplicate or obsolete task results. After interrupted child checks, retry only repeatable checks for this candidate listed in the latest template's `retry_check_ids`; do not repeat successful checks.
 
@@ -129,13 +158,13 @@ Each dispatch must identify the role, task package, worktree, baseline commit, `
 - While waiting for external input, read [external input and monitoring](recovery.md#external-input-and-monitoring). Silence in chat does not pause monitoring. Keep only monitors that still have runnable work or external state to check, and explain blockers and recovery conditions promptly.
 - In Codex, when user-visible independent sessions can be managed, create one for each ready child instead of using only subagents within the current session. Use the existing project when creating a session; do not let Codex create another worktree. The new session must first enter Runtime's child worktree, and all subsequent file and Git operations stay there. Save session information, wait on or read sessions to monitor progress, and send follow-up instructions when correction or added context is needed.
 - In Claude Code, create a Claude Code Agent Team when available in an interactive session. The current session coordinates; assign each ready child to a clearly named team member. Members enter Runtime's child worktree. Add only Runtime-ready children to the team task list; Runtime remains authoritative for readiness and completion. Members must not create another Claude Code Agent Team, integrate the parent branch directly, or expand scope. Continue reading messages and task state and provide timely guidance.
-- If Codex independent sessions or a Claude Code Agent Team are unavailable, or original sessions or teams are missing after recovery, reread Runtime state, explain the reason, and automatically switch to a subagent under `multi-session`; do not ask for the coordination mode again. Prepare undispatched children from the latest `readyChildren`. A dispatched task whose session is lost is not complete: submit `supervisor-cancel` with its current `runId`, obtain a new package and `runId` from the latest `continuation`, then dispatch to a subagent. Runtime rejects late results from the old execution. If subagents are also unavailable, report the actual execution blocker; do not automatically switch to single-session progression.
+- If Codex independent sessions or a Claude Code Agent Team are unavailable, or original sessions or teams are missing after recovery, reread Runtime state, explain the reason, and automatically switch to a subagent under `multi-session`; do not ask for the coordination mode again. Prepare undispatched children from the latest `readyChildren`. A dispatched task whose session is lost is not complete. When session information (including all `runId` values) is unavailable, run `next --summary` first: the recovery path's response carries complete task packages (runId, worktree, and base commit) for every in-flight task. Then submit `supervisor-cancel` with each lost task's current `runId`, obtain a new package and `runId` from the latest `continuation`, and dispatch to a subagent. Runtime rejects late results from the old execution. If subagents are also unavailable, report the actual execution blocker; do not automatically switch to single-session progression.
 
 ### Final Supervisor verification
 
 Once every child is `integrated`, immediately follow Runtime's `parentAdvance` and tell the user the Supervisor Change is entering final Verify. Do not require another “continue.” Final verification covers every acceptance item in the integration worktree.
 
-On failure, retain conflicting files and blockers. Do not reopen archived or `integrated` children. Follow `repair-child`: add the actual failed Spec acceptance text to v2 `acceptance_index`, append a uniquely named repair child, reconfirm Shape, then continue.
+On failure, retain conflicting files and blockers. Do not reopen archived or `integrated` children. Follow `repair-child`: add the actual failed Spec acceptance text to v2 `acceptance_index`, and append a uniquely named repair child. Then run `comet native next <parent> --summary "<note>"` — the children-contract change makes Runtime return the change to Shape; reconfirm and continue.
 
 Do not modify the target branch before final delivery. Final Archive, workspace finishing, merge, push, and PR creation each still require the relevant user authorization.
 
@@ -151,7 +180,7 @@ The child Verifier submits checks and acceptance results as follows:
 4. Save external report content snapshots through `materials`. Ordinary file paths and verbal reports are investigation leads, not formal check results.
 5. Submit `supervisor-verifier-result`: `verdict` is `pass`, `fail`, or `blocked`; `evidence` contains `summary`, `checks` (informal notes), `receiptRef`, and `acceptance` (each item `{id, result, reason}`). Every task-package acceptance ID must occur exactly once, and the overall verdict must agree with item results. Runtime receipts are authoritative for formal checks. For fail or blocked, `receiptRef` may be null. Correct omissions and contradictions using the actual error; never invent passed items.
 
-Use `supervisor-integrate` without `runId`. Its `checks` must be a nonempty executable Runtime plan with `repeatable: true`, not a declaration that checks passed. After interruption, use only `retry_check_ids` for this candidate. Runtime merges child commits into the integration workspace and runs the checks; it records `integrated` only when all pass. The Supervisor parent still performs final verification of every acceptance item after children pass.
+Use `supervisor-integrate` without `runId`. When integration reports a Git conflict, Runtime preserves the scene in the integration worktree: resolve and commit there, then rerun `supervisor-integrate` to resume; do not handle it on the parent branch by hand. Its `checks` must be a nonempty executable Runtime plan with `repeatable: true`, not a declaration that checks passed. After interruption, use only `retry_check_ids` for this candidate. Runtime merges child commits into the integration workspace and runs the checks; it records `integrated` only when all pass. The Supervisor parent still performs final verification of every acceptance item after children pass.
 
 Runtime can validate saved check records and their candidate, workspace, machine, and input associations. The execution platform still owns write-permission isolation for ordinary external files.
 
@@ -175,10 +204,10 @@ comet native <group> <command> --help
 - `workspace` / `preparation`: the actual working directory and change-creation result.
 - `stateVersion` / `loop`: current state version and acceptance-loop progress.
 - `acceptance` / `childSummary` / `readyChildren` / `supervisor` / `details.nextPageArgs`: acceptance counts, child counts, ready children, integration-branch and current task-package summaries, and the next detail-page command.
-- `verifierDispatch`: workspace and evidence locations, current `scopeIds`, count, content references, detail pagination arguments, review summary, and check results for independent Verifier dispatch. Pass any `recoveryContext` directly as the latest recovery or user-provided information.
+- `verifierDispatch`: workspace and evidence locations, current `scopeIds`, `scopeCount`, total acceptance count, content references, detail pagination arguments, review summary, and check results for independent Verifier dispatch. Pass any `recoveryContext` directly as the latest recovery or user-provided information.
 - `workspaceFinishResult` / `recoveryArgs`: post-Archive workspace result and recovery commands.
 
-At Archive-ready, first execute continuation's `archive --dry-run`. If an isolated workspace has no selected finish action, use the complete matching `--dry-run --finish` command in `commandAlternatives`. Do not append `--finish` yourself or execute `--confirmed` directly. The dry-run checks both archive content and the branches and files involved in Git finishing. On `ready: false`, address `blockers` and the complete `workspaceFinishBlockers[].paths` list from that same response; do not add a `status` query or manually commit change state/verification files. Only on `ready: true` execute the single returned `archive --confirmed` command.
+At Archive-ready, first execute continuation's `archive --dry-run`. If an isolated workspace has no selected finish action, wait for the user, then either run `comet native archive <change-name> --confirmed --finish <chosen mode>` in one step (Runtime records the choice and revalidates inside the transaction; no second dry-run is needed) or use the matching `--dry-run --finish` command in `commandAlternatives` for a preview. Do not append other arguments yourself. The dry-run checks both archive content and the branches and files involved in Git finishing. On `ready: false`, address `blockers` and the complete `workspaceFinishBlockers[].paths` list from that same response; do not add a `status` query or manually commit change state/verification files. Only on `ready: true` execute the single returned `archive --confirmed` command.
 
 Angle brackets in templates mark values to fill. `await-user` means wait for the user's decision before running advancement commands. If `commandArgs` is `null` and `commandAlternatives` is present, obtain the decision first, then execute the selected alternative's complete `commandArgs`, retaining `--expected-state-version` and `--expected-action`. If stale state or a mismatched action rejects the command, reread the latest `continuation` and follow current state; do not construct commands without state guards. `localExecution: absent` means this machine has no currently running execution, not that the change is damaged.
 
@@ -207,7 +236,7 @@ Use `spec sync` only to correct local Markdown link targets in confirmed target 
 - Runtime records before/after content and reasons, retains unaffected verdicts, and returns to Build to reverify affected content.
 - If the process stops before state is saved, recovery detects the mismatch between Specs and saved state and returns to Shape. Unsaved corrections cannot count as confirmed results.
 
-For a lost Verifier, recover through ordinary `next --summary`. Runtime returns interrupted work to a state that can be verified again; do not wait forever on the old Verifier task.
+For a lost Verifier, recover through ordinary `next --summary`. Runtime returns recovery guidance (await-user) and does not change state automatically; record `verifier-execution-error` as directed before Runtime returns interrupted work to a verifiable boundary. Do not wait forever on the old Verifier task and do not rerun `next` in a loop.
 
 When locating state across worktrees, Runtime checks active and archive records. It uses the archived state only when change-creation information and committed Git history prove that the archived record supersedes the active one. Handle conflicts from actual records; a matching name or higher version alone does not prove completion.
 

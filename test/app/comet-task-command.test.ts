@@ -109,6 +109,48 @@ describe('ordinary Comet task host', () => {
     ).toBe('no-observation');
   });
 
+  it('warns on stderr when a submitted learning check has no matching observation', async () => {
+    const { cometTaskCommand } = await import('../../app/commands/comet-task.js');
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const observeWarnings = () =>
+      error.mock.calls.filter(([message]) => String(message).includes('comet memory observe'));
+    try {
+      recordCometWorkflowResult.mockResolvedValueOnce({ submissionVerified: false });
+      const first = await cometTaskCommand('D:/repo', {
+        task: '完成变更',
+        complete: true,
+        workflow: 'native',
+        change: 'change-learning-warning',
+        learningCheck: 'submitted',
+        json: true,
+      });
+      expect(observeWarnings()).toHaveLength(1);
+      expect(first.projectMemory).toMatchObject({
+        count: expect.any(Number),
+        reminder: expect.stringContaining('comet knowledge remember'),
+      });
+      expect(
+        error.mock.calls.some(([message]) => String(message).includes('Project memory:')),
+      ).toBe(true);
+
+      recordCometWorkflowResult.mockResolvedValueOnce({ submissionVerified: true });
+      await cometTaskCommand('D:/repo', {
+        task: '完成变更',
+        complete: true,
+        workflow: 'native',
+        change: 'change-learning-warning',
+        learningCheck: 'submitted',
+        json: true,
+      });
+      expect(observeWarnings()).toHaveLength(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('"learningCheckVerified": true'));
+    } finally {
+      error.mockRestore();
+      log.mockRestore();
+    }
+  });
+
   it('uses the shared progressive expansion and application outcome interfaces', async () => {
     expandCometPluginContext.mockResolvedValue({
       id: 'knowledge-1',
