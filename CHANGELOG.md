@@ -2,6 +2,18 @@
 
 All notable changes to @rpamis/comet will be documented in this file.
 
+## What's Changed [0.4.3] - 2026-09-22
+
+### Changed
+
+- **Workflow CLI performance**: Batch Classic check path hashing and skip recursive submodule probing when a repository has no tracked gitlinks, reducing measured Classic check medians by 48.0–59.1% and Native initial check median by 28.5% while preserving evidence and reuse validation. See the [performance comparison](docs/research/2026-09-22-workflow-cli-performance-results.md).
+
+### Fixed
+
+- **Project Knowledge index recovery**: Repair orphaned or missing FTS rows, preserve the last usable projection when reads, writes, discovery, or incremental budgets fail, and let explicit rebuilds process the full corpus without exposing an empty index (#444).
+- **Project Memory completion guidance**: Restore bilingual Classic, Native, hotfix, and tweak instructions that save verified reusable project experience with `comet knowledge remember` while keeping personal preferences in Personal Memory. Copy-mode updates can also replace retired Native bundles behind managed legacy junctions so installed Skills receive the corrected guidance.
+- **Windows daemon routing**: Start read-only daemons outside the invoking process tree so IDE terminals and Job Object hosts can finish without waiting for the daemon lifetime. Automatic routing now prewarms the daemon while the first command runs directly, then reuses the warm Runtime for later commands, with direct execution retained when startup is unavailable (#448).
+
 ## What's Changed [0.4.2] - 2026-09-21
 
 ### Added

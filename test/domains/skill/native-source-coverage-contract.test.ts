@@ -9,6 +9,10 @@ async function readNativeAsset(root: string, relativePath: string): Promise<stri
   return fs.readFile(path.join(root, relativePath), 'utf8');
 }
 
+async function readAsset(relativePath: string): Promise<string> {
+  return fs.readFile(path.resolve('assets', relativePath), 'utf8');
+}
+
 async function readChineseSourceCoverage(): Promise<string> {
   const skill = await readNativeAsset(nativeZhRoot, 'SKILL.md');
   const clarification = await readNativeAsset(nativeZhRoot, 'reference/clarification.md');
@@ -122,6 +126,65 @@ describe('Native 中文源文档完整覆盖契约', () => {
     const superseded = rows.find((row) => row[5] === 'superseded');
     expect(superseded?.slice(3, 5)).toEqual(['—', '—']);
     expect(superseded?.[6]).toContain('替代');
+  });
+});
+
+describe('Native 中文记忆接入契约', () => {
+  it('明确区分项目记忆写入和个人记忆学习检查', async () => {
+    const skill = await readNativeAsset(nativeZhRoot, 'SKILL.md');
+    const commands = await readNativeAsset(nativeZhRoot, 'reference/commands.md');
+
+    expect(skill).toContain('项目记忆');
+    expect(skill).toContain('comet knowledge remember');
+    expect(skill).toContain('个人记忆');
+    expect(commands).toContain('## 项目记忆');
+    expect(commands).toContain('comet knowledge remember <project-root>');
+    expect(commands).toContain('同一标题默认更新');
+    expect(commands).toContain('项目记忆索引会随任务上下文注入');
+    expect(commands).toContain('任务摘要、一次性命令输出和未验证的猜测不得写入项目记忆');
+    expect(commands).toContain('--learning-check submitted|no-observation|not-run');
+  });
+});
+
+describe('Classic 中文记忆接入契约', () => {
+  it('在主入口和命令参考中说明项目经验写入', async () => {
+    const skill = await readAsset('skills-zh/comet-classic/SKILL.md');
+    const scripts = await readAsset('skills-zh/comet-classic/reference/scripts.md');
+
+    expect(skill).toContain('项目经验与个人偏好分开保存');
+    expect(skill).toContain('comet knowledge remember');
+    expect(scripts).toContain('comet knowledge remember <project-root>');
+  });
+});
+
+describe('English memory integration contract', () => {
+  it('keeps project-memory writes separate from Personal Memory learning checks', async () => {
+    const nativeSkill = await readAsset('skills/comet-native/SKILL.md');
+    const nativeCommands = await readAsset('skills/comet-native/reference/commands.md');
+    const classicSkill = await readAsset('skills/comet-classic/SKILL.md');
+    const classicScripts = await readAsset('skills/comet-classic/reference/scripts.md');
+    const hotfix = await readAsset('skills/comet-hotfix/SKILL.md');
+    const tweak = await readAsset('skills/comet-tweak/SKILL.md');
+
+    expect(nativeSkill).toContain(
+      'Project experience and personal preferences are stored separately',
+    );
+    expect(nativeSkill).toContain('comet knowledge remember');
+    expect(nativeCommands).toContain('## Project memory');
+    expect(nativeCommands).toContain('comet knowledge remember <project-root>');
+    expect(nativeCommands).toContain('The same title updates the existing entry');
+    expect(nativeCommands).toContain('The project memory index is injected with task context');
+    expect(nativeCommands).toContain(
+      'Never save task summaries, one-off command output, or unverified guesses',
+    );
+    expect(nativeCommands).toContain('--learning-check submitted|no-observation|not-run');
+    expect(classicSkill).toContain(
+      'Project experience and personal preferences are stored separately',
+    );
+    expect(classicSkill).toContain('comet knowledge remember');
+    expect(classicScripts).toContain('comet knowledge remember <project-root>');
+    expect(hotfix).toContain('comet knowledge remember <project-root>');
+    expect(tweak).toContain('comet knowledge remember <project-root>');
   });
 });
 

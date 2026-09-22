@@ -6,10 +6,13 @@ import path from 'node:path';
 import { describe, expect, test, vi } from 'vitest';
 import {
   discoverProjectKnowledgeCorpus,
+  discoverProjectKnowledgeCorpusSnapshot,
   LocalProjectKnowledgeProvider,
+  ProjectKnowledgeIndexStore,
   RemoteProjectKnowledgeProvider,
   createProjectKnowledgeDashboardSnapshot,
   createProjectKnowledgeModule,
+  createProjectKnowledgeProvider,
   createProjectKnowledgeQuery,
   createUserProjectKnowledgeRecord,
   ensureProjectKnowledgeReady,
@@ -1113,6 +1116,108 @@ describe('project knowledge configuration', () => {
 });
 
 describe('project knowledge corpus and local provider', () => {
+  test('marks corpus discovery incomplete when the file limit truncates results', async () => {
+    const root = await tempProject();
+    try {
+      await fs.mkdir(path.join(root, '.comet'), { recursive: true });
+      await fs.writeFile(
+        path.join(root, '.comet', 'config.yaml'),
+        'schema: comet.project.v1\ndefault_workflow: native\nnative:\n  artifact_root: docs\n',
+      );
+      const specs = path.join(root, 'docs/comet/specs');
+      await fs.mkdir(specs, { recursive: true });
+      await Promise.all(
+        Array.from({ length: 513 }, (_, index) =>
+          fs.writeFile(path.join(specs, `${String(index).padStart(3, '0')}.md`), `# ${index}\n`),
+        ),
+      );
+
+      const snapshot = await discoverProjectKnowledgeCorpusSnapshot({ projectRoot: root });
+
+      expect(snapshot.documents).toHaveLength(512);
+      expect(snapshot.complete).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('marks corpus discovery incomplete when a Classic state file cannot be inspected', async () => {
+    const root = await tempProject();
+    const archiveRoot = path.join(root, 'docs/openspec/changes/archive');
+    const statePath = path.join(archiveRoot, '2026-08-01-broken/.comet.yaml');
+    try {
+      await fs.mkdir(path.dirname(statePath), { recursive: true });
+      await fs.mkdir(path.join(root, '.comet'), { recursive: true });
+      await fs.writeFile(
+        path.join(root, '.comet', 'config.yaml'),
+        'schema: comet.project.v1\ndefault_workflow: classic\nclassic:\n  artifact_layout: docs\n',
+      );
+      await fs.writeFile(statePath, 'verification_report: docs/superpowers/reports/report.md\n');
+      const realLstat = fs.lstat;
+      const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation((target, options) => {
+        if (String(target) === statePath)
+          return Promise.reject(Object.assign(new Error('permission denied'), { code: 'EACCES' }));
+        return realLstat(target, options);
+      });
+      try {
+        const diagnostics: Array<{ code: string; message: string }> = [];
+        const snapshot = await discoverProjectKnowledgeCorpusSnapshot({
+          projectRoot: root,
+          reportDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+        });
+
+        expect(snapshot.complete).toBe(false);
+        expect(diagnostics.some(({ code }) => code === 'corpus-read')).toBe(true);
+      } finally {
+        lstatSpy.mockRestore();
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('provider factory preserves indexed sources beyond an incomplete discovery result', async () => {
+    const root = await tempProject();
+    const cacheRoot = path.join(root, '.cache');
+    let provider: LocalProjectKnowledgeProvider | undefined;
+    try {
+      await fs.mkdir(path.join(root, '.comet'), { recursive: true });
+      await fs.writeFile(
+        path.join(root, '.comet', 'config.yaml'),
+        'schema: comet.project.v1\ndefault_workflow: native\nnative:\n  artifact_root: docs\n',
+      );
+      const specs = path.join(root, 'docs/comet/specs');
+      await fs.mkdir(specs, { recursive: true });
+      await Promise.all(
+        Array.from({ length: 513 }, (_, index) =>
+          fs.writeFile(path.join(specs, `${String(index).padStart(3, '0')}.md`), `# ${index}\n`),
+        ),
+      );
+      const omittedSource = 'docs/comet/specs/512.md';
+      const seeded = new ProjectKnowledgeIndexStore({ projectRoot: root, cacheRoot });
+      await seeded.syncCorpus([
+        {
+          absolutePath: path.join(root, ...omittedSource.split('/')),
+          source: omittedSource,
+          kind: 'native-spec',
+        },
+      ]);
+      seeded.close();
+
+      const created = await createProjectKnowledgeProvider({ projectRoot: root, cacheRoot });
+      if (!(created instanceof LocalProjectKnowledgeProvider))
+        throw new Error('local provider expected');
+      provider = created;
+      await provider.apply({ kind: 'refresh', projectId: 'incomplete-discovery' });
+
+      const status = await provider.indexStatus();
+      expect(status?.sources.map((source) => source.source)).toContain(omittedSource);
+    } finally {
+      provider?.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('discovers documents through a project ancestor alias without admitting external links', async () => {
     const temporaryRoot = await tempProject();
     let provider: LocalProjectKnowledgeProvider | undefined;

@@ -55,6 +55,10 @@ export interface ProjectKnowledgeIndexSyncResult {
   readonly status: ProjectKnowledgeIndexStatus;
 }
 
+export interface ProjectKnowledgeIndexSyncOptions {
+  readonly complete?: boolean;
+}
+
 interface ParsedSection {
   readonly anchor: string;
   readonly title: string;
@@ -91,6 +95,16 @@ function countValue(value: unknown): number {
   return typeof value === 'number' ? value : typeof value === 'bigint' ? Number(value) : 0;
 }
 
+function isSqliteLockError(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown };
+  if (candidate.code === 'SQLITE_BUSY' || candidate.code === 'SQLITE_LOCKED') return true;
+  return (
+    candidate.code === 'ERR_SQLITE_ERROR' &&
+    typeof candidate.message === 'string' &&
+    /(?:database|table|schema) is locked/iu.test(candidate.message)
+  );
+}
+
 function metaMap(database: ProjectKnowledgeDatabase): Map<string, string> {
   const rows = database.prepare('SELECT key, value FROM pk_meta').all() as Array<{
     key: string;
@@ -105,6 +119,32 @@ function setMeta(database: ProjectKnowledgeDatabase, key: string, value: string)
       'INSERT INTO pk_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
     )
     .run(key, value);
+}
+
+function repairFtsProjection(database: ProjectKnowledgeDatabase): void {
+  database.exec('BEGIN IMMEDIATE;');
+  try {
+    database
+      .prepare('DELETE FROM pk_fts_terms WHERE rowid NOT IN (SELECT id FROM pk_sections)')
+      .run();
+    database
+      .prepare('DELETE FROM pk_fts_trigram WHERE rowid NOT IN (SELECT id FROM pk_sections)')
+      .run();
+    database
+      .prepare(
+        'INSERT INTO pk_fts_terms(rowid, workspace_id, source, title, heading_path, body, lexical_terms) SELECT section.id, section.workspace_id, section.source, section.title, section.heading_path, section.body, section.lexical_terms FROM pk_sections AS section WHERE NOT EXISTS (SELECT 1 FROM pk_fts_terms AS fts WHERE fts.rowid = section.id)',
+      )
+      .run();
+    database
+      .prepare(
+        'INSERT INTO pk_fts_trigram(rowid, workspace_id, source, title, heading_path, body) SELECT section.id, section.workspace_id, section.source, section.title, section.heading_path, section.body FROM pk_sections AS section WHERE NOT EXISTS (SELECT 1 FROM pk_fts_trigram AS fts WHERE fts.rowid = section.id)',
+      )
+      .run();
+    database.exec('COMMIT;');
+  } catch (error) {
+    database.exec('ROLLBACK;');
+    throw error;
+  }
 }
 
 function quoteFts(value: string): string {
@@ -271,9 +311,19 @@ export class ProjectKnowledgeIndexStore {
       setMeta(database, 'schema', INDEX_SCHEMA);
       setMeta(database, 'repositoryId', this.repositoryId);
       setMeta(database, 'tokenizer', 'unicode61+trigram');
+      repairFtsProjection(database);
       database.prepare("SELECT rowid FROM pk_fts_terms WHERE pk_fts_terms MATCH 'probe'").all();
       this.database = database;
     } catch (error) {
+      if (isSqliteLockError(error)) {
+        database?.close();
+        this.reportDiagnostic?.({
+          code: 'index-unavailable',
+          message:
+            'Project knowledge section index is temporarily locked; authoritative records were retained.',
+        });
+        throw error;
+      }
       let projectionRecovered = false;
       if (database) {
         try {
@@ -323,8 +373,18 @@ export class ProjectKnowledgeIndexStore {
 
   async syncCorpus(
     corpus: readonly ProjectKnowledgeDocument[],
+    options: ProjectKnowledgeIndexSyncOptions = {},
   ): Promise<ProjectKnowledgeIndexSyncResult> {
-    const deadline = Date.now() + MAX_SYNC_MS;
+    return this.syncCorpusInternal(corpus, {
+      complete: options.complete !== false,
+      deadline: Date.now() + MAX_SYNC_MS,
+    });
+  }
+
+  private async syncCorpusInternal(
+    corpus: readonly ProjectKnowledgeDocument[],
+    options: { readonly complete: boolean; readonly deadline?: number; readonly force?: boolean },
+  ): Promise<ProjectKnowledgeIndexSyncResult> {
     await this.open();
     const database = this.requireDatabase();
     const known = new Map(
@@ -342,15 +402,12 @@ export class ProjectKnowledgeIndexStore {
       ).map((entry) => [entry.source, entry]),
     );
     const corpusSources = new Set(corpus.map((document) => document.source));
-    for (const source of known.keys()) {
-      if (!corpusSources.has(source)) this.removeSource(database, this.workspaceId, source);
-    }
     const changedSources: ProjectKnowledgeDocument[] = [];
     const refreshedSources: ProjectKnowledgeDocument[] = [];
     this.lastSyncReadBytes = 0;
     for (let index = 0; index < corpus.length; index += 1) {
       const document = corpus[index];
-      if (Date.now() > deadline) {
+      if (options.deadline !== undefined && Date.now() > options.deadline) {
         this.reportDiagnostic?.({
           code: 'index-budget',
           message: '未进入检索：索引刷新超过时间预算，尚未处理的语料当前不会参与召回。',
@@ -362,8 +419,13 @@ export class ProjectKnowledgeIndexStore {
       try {
         stat = await fs.lstat(document.absolutePath);
       } catch {
-        if (known.has(document.source))
-          this.removeSource(database, this.workspaceId, document.source);
+        changedSources.push(document);
+        if (known.has(document.source)) {
+          this.reportDiagnostic?.({
+            code: 'index-source',
+            message: `未进入检索：${document.source} 在索引时发生变化或无法读取，已保留之前的可用索引。`,
+          });
+        }
         continue;
       }
       const previous = known.get(document.source);
@@ -375,13 +437,21 @@ export class ProjectKnowledgeIndexStore {
           { label: document.source },
         );
         this.lastSyncReadBytes += read.bytes.length;
-        if (Date.now() > deadline) throw new Error('index refresh exceeded time budget');
+        if (options.deadline !== undefined && Date.now() > options.deadline) {
+          this.reportDiagnostic?.({
+            code: 'index-budget',
+            message: '未进入检索：索引刷新超过时间预算，尚未处理的语料当前不会参与召回。',
+          });
+          changedSources.push(...corpus.slice(index));
+          break;
+        }
         const afterRead = await fs.lstat(document.absolutePath);
         if (afterRead.size !== read.stat.size || afterRead.mtimeMs !== read.stat.mtimeMs) {
           throw new Error('source changed while it was being indexed');
         }
         const digest = contentDigest(read.bytes);
         if (
+          !options.force &&
           previous &&
           previous.size === stat.size &&
           previous.modified_at === stat.mtimeMs &&
@@ -393,30 +463,44 @@ export class ProjectKnowledgeIndexStore {
           document.source,
           read.bytes.toString('utf8'),
         );
-        if (Date.now() > deadline) throw new Error('index refresh exceeded time budget');
-        this.applySourceDelta(
-          database,
-          document,
-          Number(read.stat.size),
-          Number(read.stat.mtimeMs),
-          digest,
-          sections,
-        );
+        if (options.deadline !== undefined && Date.now() > options.deadline) {
+          this.reportDiagnostic?.({
+            code: 'index-budget',
+            message: '未进入检索：索引刷新超过时间预算，尚未处理的语料当前不会参与召回。',
+          });
+          changedSources.push(...corpus.slice(index));
+          break;
+        }
+        try {
+          this.applySourceDelta(
+            database,
+            document,
+            Number(read.stat.size),
+            Number(read.stat.mtimeMs),
+            digest,
+            sections,
+            options.force === true,
+          );
+        } catch {
+          changedSources.push(document);
+          this.reportDiagnostic?.({
+            code: 'index-write',
+            message: `未进入检索：${document.source} 的索引写入失败，已保留之前的可用索引。`,
+          });
+          continue;
+        }
         refreshedSources.push(document);
       } catch {
-        // A failed refresh must not leave the previous projection searchable.
-        if (previous) {
-          try {
-            this.removeSource(database, this.workspaceId, document.source);
-          } catch {
-            // Preserve the original bounded diagnostic below.
-          }
-        }
         changedSources.push(document);
         this.reportDiagnostic?.({
           code: 'index-source',
-          message: `未进入检索：${document.source} 在索引时发生变化或无法读取，当前不会参与召回。`,
+          message: `未进入检索：${document.source} 在索引时发生变化或无法读取，已保留之前的可用索引。`,
         });
+      }
+    }
+    if (options.complete && changedSources.length === 0) {
+      for (const source of known.keys()) {
+        if (!corpusSources.has(source)) this.removeSource(database, this.workspaceId, source);
       }
     }
     return { changedSources, refreshedSources, status: this.status() };
@@ -563,10 +647,7 @@ export class ProjectKnowledgeIndexStore {
   }
 
   async rebuild(corpus: readonly ProjectKnowledgeDocument[]): Promise<ProjectKnowledgeIndexStatus> {
-    await this.open();
-    const database = this.requireDatabase();
-    this.removeWorkspace(database);
-    return (await this.syncCorpus(corpus)).status;
+    return (await this.syncCorpusInternal(corpus, { complete: true, force: true })).status;
   }
 
   private applySourceDelta(
@@ -576,6 +657,7 @@ export class ProjectKnowledgeIndexStore {
     modifiedAt: number,
     digest: string,
     sections: readonly ParsedSection[],
+    force = false,
   ): void {
     const now = new Date().toISOString();
     database.exec('BEGIN IMMEDIATE;');
@@ -618,7 +700,7 @@ export class ProjectKnowledgeIndexStore {
           previous.heading_path === section.headingPath &&
           previous.body === section.body &&
           previous.lexical_terms === section.lexicalTerms;
-        if (unchanged) continue;
+        if (unchanged && !force) continue;
         let id: number;
         if (previous) {
           id = previous.id;
@@ -627,8 +709,6 @@ export class ProjectKnowledgeIndexStore {
               'UPDATE pk_sections SET title = ?, heading_path = ?, body = ?, lexical_terms = ?, updated_at = ? WHERE id = ?',
             )
             .run(section.title, section.headingPath, section.body, section.lexicalTerms, now, id);
-          database.prepare('DELETE FROM pk_fts_terms WHERE rowid = ?').run(id);
-          database.prepare('DELETE FROM pk_fts_trigram WHERE rowid = ?').run(id);
         } else {
           const result = database
             .prepare(
@@ -646,6 +726,8 @@ export class ProjectKnowledgeIndexStore {
             );
           id = Number(result.lastInsertRowid);
         }
+        database.prepare('DELETE FROM pk_fts_terms WHERE rowid = ?').run(id);
+        database.prepare('DELETE FROM pk_fts_trigram WHERE rowid = ?').run(id);
         database
           .prepare(
             'INSERT INTO pk_fts_terms(rowid, workspace_id, source, title, heading_path, body, lexical_terms) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -703,25 +785,6 @@ export class ProjectKnowledgeIndexStore {
         .prepare('DELETE FROM pk_sources WHERE workspace_id = ? AND source = ?')
         .run(workspaceId, source);
       setMeta(database, 'updatedAt', new Date().toISOString());
-      database.exec('COMMIT;');
-    } catch (error) {
-      database.exec('ROLLBACK;');
-      throw error;
-    }
-  }
-
-  private removeWorkspace(database: ProjectKnowledgeDatabase): void {
-    const rows = database
-      .prepare('SELECT id FROM pk_sections WHERE workspace_id = ?')
-      .all(this.workspaceId) as Array<{ id: number }>;
-    database.exec('BEGIN IMMEDIATE;');
-    try {
-      for (const { id } of rows) {
-        database.prepare('DELETE FROM pk_fts_terms WHERE rowid = ?').run(id);
-        database.prepare('DELETE FROM pk_fts_trigram WHERE rowid = ?').run(id);
-      }
-      database.prepare('DELETE FROM pk_sections WHERE workspace_id = ?').run(this.workspaceId);
-      database.prepare('DELETE FROM pk_sources WHERE workspace_id = ?').run(this.workspaceId);
       database.exec('COMMIT;');
     } catch (error) {
       database.exec('ROLLBACK;');
