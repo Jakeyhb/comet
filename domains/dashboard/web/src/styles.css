@@ -8979,6 +8979,16 @@ body {
   border-right: 1px solid var(--color-border-soft);
 }
 
+.dashboard-project-memory .dashboard-memory-registry-toolbar,
+.dashboard-project-memory .dashboard-memory-table-head,
+.dashboard-project-memory-foot {
+  flex: 0 0 auto;
+}
+
+.dashboard-project-memory .dashboard-memory-table-body {
+  flex: 1 1 auto;
+}
+
 .dashboard-project-memory .dashboard-memory-table-head,
 .dashboard-project-memory-row.dashboard-memory-table-row {
   grid-template-columns: minmax(0, 1fr) 88px 100px 56px;

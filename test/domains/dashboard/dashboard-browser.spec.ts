@@ -4718,5 +4718,8 @@ test('scrolls a long project memory list inside the knowledge page', async ({ pa
         return box ? box.y + box.height : Number.POSITIVE_INFINITY;
       })
       .toBeLessThanOrEqual(viewport.height);
+    await expect
+      .poll(() => memoryFoot.evaluate((element) => element.scrollHeight <= element.clientHeight))
+      .toBe(true);
   }
 });
