@@ -4708,10 +4708,25 @@ test('scrolls a long project memory list inside the knowledge page', async ({ pa
     await expect
       .poll(() => memoryRows.evaluate((element) => element.scrollHeight > element.clientHeight))
       .toBe(true);
+    await memoryRows.evaluate((element) => {
+      element.scrollTop = 0;
+    });
     await memoryRows.hover();
     await page.mouse.wheel(0, 10000);
     await expect.poll(() => memoryRows.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
-    await expect(memoryList.getByText('项目记忆 24', { exact: true })).toBeVisible();
+    const lastRow = memoryList.getByText('项目记忆 24', { exact: true });
+    await expect
+      .poll(async () => {
+        const [rowBox, bodyBox] = await Promise.all([
+          lastRow.boundingBox(),
+          memoryRows.boundingBox(),
+        ]);
+        if (!rowBox || !bodyBox) return false;
+        return (
+          rowBox.y >= bodyBox.y - 1 && rowBox.y + rowBox.height <= bodyBox.y + bodyBox.height + 1
+        );
+      })
+      .toBe(true);
     await expect
       .poll(async () => {
         const box = await memoryFoot.boundingBox();
