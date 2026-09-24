@@ -286,8 +286,14 @@ describe('dashboard web source contracts', () => {
       /\.dashboard-tool-page-knowledge\s*\{[\s\S]*?display: flex;[\s\S]*?height: 100%;[\s\S]*?flex-direction: column;/,
     );
     expect(styles).toMatch(
-      /\.dashboard-knowledge-registry,[\s\S]*?\.dashboard-knowledge-query-view,[\s\S]*?\.dashboard-project-memory\s*\{[\s\S]*?min-height: 0;[\s\S]*?height: auto;[\s\S]*?flex: 1 1 auto;/,
+      /\.dashboard-knowledge-registry,[\s\S]*?\.dashboard-knowledge-query-view\s*\{[\s\S]*?min-height: 0;[\s\S]*?height: auto;[\s\S]*?flex: 1 1 auto;/,
     );
+    const projectMemoryBase = styles.indexOf('.dashboard-project-memory {\n  display: grid;');
+    const projectMemoryWide = styles.search(
+      /@media \(min-width: 1181px\)\s*\{\s*\.dashboard-project-memory\s*\{\s*min-height: 0;\s*height: auto;\s*flex: 1 1 auto;/,
+    );
+    expect(projectMemoryBase).toBeGreaterThan(-1);
+    expect(projectMemoryWide).toBeGreaterThan(projectMemoryBase);
     expect(styles).toMatch(
       /\.dashboard-project-memory > \.dashboard-memory-registry,[\s\S]*?\.dashboard-project-memory > \.dashboard-memory-inspector\s*\{[\s\S]*?min-height: 0;/,
     );

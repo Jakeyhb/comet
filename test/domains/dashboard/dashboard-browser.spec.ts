@@ -4698,9 +4698,11 @@ test('scrolls a long project memory list inside the knowledge page', async ({ pa
   await expect(memoryList).toContainText('项目记忆 1');
   await expect(memoryList).toContainText('24 条');
 
+  const memoryFoot = memoryList.locator('.dashboard-project-memory-foot');
   for (const viewport of [
     { width: 1600, height: 900 },
     { width: 1280, height: 720 },
+    { width: 1280, height: 640 },
   ]) {
     await page.setViewportSize(viewport);
     await expect
@@ -4710,5 +4712,11 @@ test('scrolls a long project memory list inside the knowledge page', async ({ pa
     await page.mouse.wheel(0, 10000);
     await expect.poll(() => memoryRows.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
     await expect(memoryList.getByText('项目记忆 24', { exact: true })).toBeVisible();
+    await expect
+      .poll(async () => {
+        const box = await memoryFoot.boundingBox();
+        return box ? box.y + box.height : Number.POSITIVE_INFINITY;
+      })
+      .toBeLessThanOrEqual(viewport.height);
   }
 });
