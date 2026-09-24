@@ -286,7 +286,10 @@ describe('dashboard web source contracts', () => {
       /\.dashboard-tool-page-knowledge\s*\{[\s\S]*?display: flex;[\s\S]*?height: 100%;[\s\S]*?flex-direction: column;/,
     );
     expect(styles).toMatch(
-      /\.dashboard-knowledge-registry,[\s\S]*?\.dashboard-knowledge-query-view\s*\{[\s\S]*?min-height: 0;[\s\S]*?height: auto;[\s\S]*?flex: 1 1 auto;/,
+      /\.dashboard-knowledge-registry,[\s\S]*?\.dashboard-knowledge-query-view,[\s\S]*?\.dashboard-project-memory\s*\{[\s\S]*?min-height: 0;[\s\S]*?height: auto;[\s\S]*?flex: 1 1 auto;/,
+    );
+    expect(styles).toMatch(
+      /\.dashboard-project-memory > \.dashboard-memory-registry,[\s\S]*?\.dashboard-project-memory > \.dashboard-memory-inspector\s*\{[\s\S]*?min-height: 0;/,
     );
     expect(styles).toContain('clamp(300px, 24vw, 390px)');
     expect(styles).toContain('--dashboard-plugin-body-size: 14px');

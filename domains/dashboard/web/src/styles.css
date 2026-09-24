@@ -7182,7 +7182,8 @@ body {
 
   .dashboard-knowledge-registry,
   .dashboard-knowledge-single-view,
-  .dashboard-knowledge-query-view {
+  .dashboard-knowledge-query-view,
+  .dashboard-project-memory {
     min-height: 0;
     height: auto;
     flex: 1 1 auto;
@@ -8968,6 +8969,11 @@ body {
   min-height: clamp(560px, calc(100dvh - 244px), 760px);
   overflow: hidden;
   background: var(--color-bg);
+}
+
+.dashboard-project-memory > .dashboard-memory-registry,
+.dashboard-project-memory > .dashboard-memory-inspector {
+  min-height: 0;
 }
 
 .dashboard-project-memory > .dashboard-memory-registry {
