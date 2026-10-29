@@ -2,6 +2,12 @@
 
 All notable changes to @rpamis/comet will be documented in this file.
 
+## What's Changed [0.5.2] - 2026-10-29
+
+### Added
+
+- **MiniMax Code support**: Install, detect, update, diagnose, and uninstall project- or user-scoped Comet Skills under `.minimax/skills`, including Classic dependency integration. Project instructions use `AGENTS.md`; platform-specific Rules and Hooks are not installed ([#518](https://github.com/rpamis/comet/issues/518)).
+
 ## What's Changed [0.5.1] - 2026-10-23
 
 ### Changed
