@@ -6,6 +6,7 @@ All notable changes to @rpamis/comet will be documented in this file.
 
 ### Fixed
 
+- **UTF-8 BOM check receipts**: Accept successful Native checks for unchanged JavaScript source with a UTF-8 BOM while preserving the original file bytes and candidate-drift safeguards.
 - **Native Shape target Spec changes**: Before Shape is confirmed, replace a previously declared target Spec with a different capability's target Spec or a formal remove entry and prepare confirmation again, instead of being forced to restore the unwanted file or delete the formal Spec. An exemption alone still cannot hide a missing declared Spec, and confirmed target Specs remain required after Shape ([#516](https://github.com/rpamis/comet/issues/516)).
 
 ## What's Changed [0.5.1] - 2026-10-23
