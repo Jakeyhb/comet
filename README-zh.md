@@ -276,7 +276,7 @@ Comet Eval的自动化双Agent架构能够在线上与LangSmith/LangFuse环境�
 | MimoCode           | `.mimocode/`  | CoStrict      | `.cospec/`   |
 | Grok               | `.grok/`      | Prime Agent   | `.prime/agent/` |
 | Oh My Pi           | `.omp/`       | DeepSeek Harness | `.dsh/` |
-| [MiniMax Code](docs/operations/minimax-code.zh.md) | `.minimax/` | | |
+| MiniMax Code       | `.minimax/`   |               |              |
 
 </details>
 
